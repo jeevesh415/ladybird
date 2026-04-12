@@ -19,7 +19,6 @@
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/PerformanceTimeline/PerformanceEntry.h>
 #include <LibWeb/PerformanceTimeline/PerformanceEntryTuple.h>
-#include <LibWeb/ServiceWorker/CacheStorage.h>
 #include <LibWeb/WebSockets/WebSocket.h>
 
 namespace Web::HTML {
@@ -74,6 +73,8 @@ public:
     void register_event_source(Badge<EventSource>, GC::Ref<EventSource>);
     void unregister_event_source(Badge<EventSource>, GC::Ref<EventSource>);
     void forcibly_close_all_event_sources();
+
+    void close_all_idb_connections();
 
     void register_web_socket(Badge<WebSockets::WebSocket>, GC::Ref<WebSockets::WebSocket>);
     void unregister_web_socket(Badge<WebSockets::WebSocket>, GC::Ref<WebSockets::WebSocket>);

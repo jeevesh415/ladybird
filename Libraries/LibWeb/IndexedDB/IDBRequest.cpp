@@ -25,8 +25,8 @@ IDBRequest::~IDBRequest() = default;
 IDBRequest::IDBRequest(JS::Realm& realm, IDBRequestSource source)
     : EventTarget(realm)
     , m_source(source)
+    , m_uuid(Crypto::generate_random_uuid())
 {
-    m_uuid = MUST(Crypto::generate_random_uuid());
 }
 
 void IDBRequest::initialize(JS::Realm& realm)
@@ -51,6 +51,13 @@ void IDBRequest::visit_edges(Visitor& visitor)
         [&](auto const& object) { visitor.visit(object); });
 
     visitor.visit(m_error);
+}
+
+DOM::EventTarget* IDBRequest::get_parent(DOM::Event const&)
+{
+    // https://w3c.github.io/IndexedDB/#request-construct
+    // A request’s get the parent algorithm returns the request’s transaction.
+    return m_transaction.ptr();
 }
 
 // https://w3c.github.io/IndexedDB/#dom-idbrequest-onsuccess

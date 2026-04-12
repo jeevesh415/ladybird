@@ -32,7 +32,7 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
         });
     }
 
-    if (browser_options.debug_helper_process == process_type)
+    if (browser_options.debug_helper_processes.contains_slow(process_type))
         arguments.append("--wait-for-debugger"sv);
 
     for (auto [i, path] : enumerate(candidate_server_paths)) {
@@ -123,9 +123,7 @@ static ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_proc
         arguments.append("--collect-garbage-on-every-allocation"sv);
     if (web_content_options.paint_viewport_scrollbars == PaintViewportScrollbars::No)
         arguments.append("--disable-scrollbar-painting"sv);
-
-    // Propogate this process-wide setting to the child process also.
-    if (URL::file_scheme_urls_have_tuple_origins())
+    if (web_content_options.file_scheme_urls_have_tuple_origins == FileSchemeUrlsHaveTupleOrigins::Yes)
         arguments.append("--tuple-file-origins"sv);
 
     if (auto const maybe_echo_server_port = web_content_options.echo_server_port; maybe_echo_server_port.has_value()) {
@@ -176,6 +174,8 @@ ErrorOr<NonnullRefPtr<Web::HTML::WebWorkerClient>> launch_web_worker_process(Web
         arguments.append("--expose-experimental-interfaces"sv);
     if (web_content_options.enable_http_memory_cache == WebView::EnableMemoryHTTPCache::Yes)
         arguments.append("--enable-http-memory-cache"sv);
+    if (web_content_options.file_scheme_urls_have_tuple_origins == FileSchemeUrlsHaveTupleOrigins::Yes)
+        arguments.append("--tuple-file-origins"sv);
 
     arguments.append("--type"sv);
     switch (type) {
@@ -192,9 +192,10 @@ ErrorOr<NonnullRefPtr<Web::HTML::WebWorkerClient>> launch_web_worker_process(Web
         VERIFY_NOT_REACHED();
     }
 
-    // Propogate this process-wide setting to the child process also.
-    if (URL::file_scheme_urls_have_tuple_origins())
-        arguments.append("--tuple-file-origins"sv);
+    if (auto server = mach_server_name(); server.has_value()) {
+        arguments.append("--mach-server-name"sv);
+        arguments.append(server.value());
+    }
 
     return launch_server_process<Web::HTML::WebWorkerClient>("WebWorker"sv, move(arguments));
 }

@@ -46,6 +46,7 @@ public:
         TransportHandle remote_handle;
     };
     static ErrorOr<Paired> create_paired();
+    static ErrorOr<NonnullOwnPtr<TransportSocket>> from_socket(NonnullOwnPtr<Core::LocalSocket> socket);
 
     explicit TransportSocket(NonnullOwnPtr<Core::LocalSocket> socket);
     ~TransportSocket();
@@ -103,6 +104,7 @@ private:
     RefPtr<Threading::Thread> m_io_thread;
     RefPtr<SendQueue> m_send_queue;
     Atomic<IOThreadState> m_io_thread_state { IOThreadState::Running };
+    Atomic<bool> m_is_being_transferred { false };
     Atomic<bool> m_peer_eof { false };
     ByteBuffer m_unprocessed_bytes;
     Queue<Attachment> m_unprocessed_attachments;

@@ -37,9 +37,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ast::{
-    BindingPattern, CompiledRegex, Expression, ExpressionKind, FunctionParameter, FunctionTable,
-    Identifier, PrivateIdentifier, ProgramData, ScopeData, SourceRange, Statement, StatementKind,
-    Utf16String,
+    BindingPattern, Expression, ExpressionKind, FunctionParameter, FunctionTable, Identifier,
+    PrivateIdentifier, ProgramData, ScopeData, SharedUtf16String, SourceRange, Statement,
+    StatementKind, Utf16String,
 };
 use crate::lexer::{Lexer, ch};
 use crate::scope_collector::{ScopeCollector, ScopeCollectorState};
@@ -195,6 +195,10 @@ pub(crate) struct ParserFlags {
     pub string_legacy_octal_escape_sequence_in_scope: bool,
     pub in_class_field_initializer: bool,
     pub in_class_static_init_block: bool,
+    /// True inside non-arrow function bodies and class static init blocks.
+    /// Arrow functions inherit this flag rather than setting it, since they
+    /// don't have their own `new.target` binding.
+    pub new_target_is_valid: bool,
     pub function_might_need_arguments_object: bool,
     pub previous_token_was_period: bool,
     /// Set during property key parsing to suppress eval/arguments check.
@@ -203,22 +207,12 @@ pub(crate) struct ParserFlags {
     pub in_property_key_context: bool,
 }
 
-/// A regex literal whose compilation is deferred until after parsing.
-pub struct DeferredRegex {
-    pub compiled_regex: Rc<CompiledRegex>,
-    pub pattern: Vec<u16>,
-    pub flags: Vec<u16>,
-    pub line: u32,
-    pub column: u32,
-}
-
 /// Snapshot of parser state for speculative parsing (backtracking).
 struct SavedState {
     token: Token,
     errors_len: usize,
     flags: ParserFlags,
     scope_collector_state: ScopeCollectorState,
-    deferred_regexes_len: usize,
 }
 
 /// The main JavaScript parser.
@@ -262,7 +256,7 @@ pub struct Parser<'a> {
     /// Caller drains this after calling parse_binding_pattern.
     /// Each entry is (name, identifier) — allows scope analysis to annotate
     /// binding pattern identifiers with local variable info.
-    pub(crate) pattern_bound_names: Vec<(Utf16String, Rc<Identifier>)>,
+    pub(crate) pattern_bound_names: Vec<(SharedUtf16String, Rc<Identifier>)>,
 
     /// Set during synthesize_binding_pattern to allow MemberExpressions as binding targets.
     allow_member_expressions: bool,
@@ -291,6 +285,7 @@ pub struct Parser<'a> {
     pub(crate) for_loop_declaration_count: usize,
     pub(crate) for_loop_declaration_has_init: bool,
     pub(crate) for_loop_declaration_is_var: bool,
+    pub(crate) for_loop_declaration_is_pattern: bool,
 
     pub scope_collector: ScopeCollector,
 
@@ -305,9 +300,6 @@ pub struct Parser<'a> {
     /// `(a=(b=(c=0)))` where each failed arrow attempt would otherwise
     /// re-attempt inner positions during grouping expression re-parse.
     arrow_function_failed_positions: HashSet<usize>,
-
-    /// Regex literals whose compilation is deferred until after parsing.
-    deferred_regexes: Vec<DeferredRegex>,
 }
 
 impl<'a> Parser<'a> {
@@ -351,11 +343,11 @@ impl<'a> Parser<'a> {
             for_loop_declaration_count: 0,
             for_loop_declaration_has_init: false,
             for_loop_declaration_is_var: false,
+            for_loop_declaration_is_pattern: false,
             scope_collector: ScopeCollector::new(),
             exported_names: HashSet::new(),
             function_table: FunctionTable::new(),
             arrow_function_failed_positions: HashSet::new(),
-            deferred_regexes: Vec::new(),
         }
     }
 
@@ -379,9 +371,19 @@ impl<'a> Parser<'a> {
     pub(crate) fn make_identifier(
         &self,
         start: Position,
-        name: impl Into<Utf16String>,
+        name: impl Into<SharedUtf16String>,
     ) -> Rc<Identifier> {
         Rc::new(Identifier::new(self.range_from(start), name.into()))
+    }
+
+    pub(crate) fn token_identifier_name(&self, token: &Token) -> SharedUtf16String {
+        if let Some(value) = &token.shared_identifier_value {
+            value.clone()
+        } else if let Some(value) = &token.identifier_value {
+            SharedUtf16String::from(value.clone())
+        } else {
+            SharedUtf16String::from(self.token_value(token))
+        }
     }
 
     pub(crate) fn register_function_parameters_with_scope(
@@ -405,7 +407,7 @@ impl<'a> Parser<'a> {
                         info_index += 1;
                         (pi.name.clone(), pi.is_rest, pi.is_from_pattern)
                     } else {
-                        (id.name.clone(), parameter.is_rest, false)
+                        (id.name.to_utf16_string(), parameter.is_rest, false)
                     };
                     entries.push(ParameterEntry {
                         name,
@@ -679,30 +681,6 @@ impl<'a> Parser<'a> {
         self.syntax_error(&msg);
     }
 
-    /// Take the deferred regex literals collected during parsing.
-    /// The caller is responsible for compiling them (on the main thread).
-    pub(crate) fn take_deferred_regexes(&mut self) -> Vec<DeferredRegex> {
-        std::mem::take(&mut self.deferred_regexes)
-    }
-
-    /// Batch-compile deferred regex literals. On error, returns the errors.
-    pub(crate) fn compile_deferred_regexes(deferred: Vec<DeferredRegex>) -> Vec<ParseError> {
-        let mut errors = Vec::new();
-        for d in deferred {
-            match crate::bytecode::ffi::compile_regex(&d.pattern, &d.flags) {
-                Ok(handle) => d.compiled_regex.set(handle),
-                Err(msg) => {
-                    errors.push(ParseError {
-                        message: msg,
-                        line: d.line,
-                        column: d.column,
-                    });
-                }
-            }
-        }
-        errors
-    }
-
     pub(crate) fn validate_regex_flags(&mut self, flags: &[u16]) {
         let valid_flags: &[u16] = &[
             ch(b'd'),
@@ -762,7 +740,6 @@ impl<'a> Parser<'a> {
             errors_len: self.errors.len(),
             flags: self.flags,
             scope_collector_state: self.scope_collector.save_state(),
-            deferred_regexes_len: self.deferred_regexes.len(),
         });
     }
 
@@ -770,7 +747,6 @@ impl<'a> Parser<'a> {
         let state = self.saved_states.pop().expect("No saved state to restore");
         self.current_token = state.token;
         self.errors.truncate(state.errors_len);
-        self.deferred_regexes.truncate(state.deferred_regexes_len);
         self.flags = state.flags;
         self.scope_collector.load_state(state.scope_collector_state);
         self.lexer.load_state();
@@ -853,6 +829,13 @@ impl<'a> Parser<'a> {
                 ));
             }
         }
+        // 'await' is not allowed as a binding identifier in class static
+        // init blocks or module code.
+        if name == utf16!("await")
+            && (self.flags.in_class_static_init_block || self.program_type == ProgramType::Module)
+        {
+            self.syntax_error("'await' is not allowed as an identifier in this context");
+        }
     }
 
     /// Check for duplicate parameter names in arrow functions.
@@ -898,6 +881,9 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn token_value<'b>(&'b self, token: &'b Token) -> &'b [u16] {
+        if let Some(ref value) = token.shared_identifier_value {
+            return value.as_slice();
+        }
         if let Some(ref value) = token.identifier_value {
             return value;
         }
@@ -962,7 +948,7 @@ impl<'a> Parser<'a> {
         strict_mode: bool,
     ) -> bool {
         match &expression.inner {
-            ExpressionKind::Identifier(_) | ExpressionKind::Member { .. } => true,
+            ExpressionKind::Identifier(_) | ExpressionKind::Member(_) => true,
             // CallExpression: In strict mode, call expressions are always ~invalid~ as
             // assignment targets. In non-strict mode, they are ~web-compat~ (runtime error).
             // NewExpression is always ~invalid~.
@@ -984,11 +970,11 @@ impl<'a> Parser<'a> {
     }
 
     fn is_member_expression(expression: &Expression) -> bool {
-        matches!(&expression.inner, ExpressionKind::Member { .. })
+        matches!(&expression.inner, ExpressionKind::Member(_))
     }
 
     fn is_update_expression(expression: &Expression) -> bool {
-        matches!(&expression.inner, ExpressionKind::Update { .. })
+        matches!(&expression.inner, ExpressionKind::Update(_))
     }
 
     // === Main entry point ===
@@ -1005,12 +991,12 @@ impl<'a> Parser<'a> {
             self.scope_collector.close_scope();
             self.statement(
                 start,
-                StatementKind::Program(ProgramData {
+                StatementKind::Program(Box::new(ProgramData {
                     scope,
                     program_type: ProgramType::Script,
                     is_strict_mode: is_strict,
                     has_top_level_await: false,
-                }),
+                })),
             )
         } else {
             let (children, has_top_level_await) = self.parse_module();
@@ -1019,12 +1005,12 @@ impl<'a> Parser<'a> {
             self.scope_collector.close_scope();
             self.statement(
                 start,
-                StatementKind::Program(ProgramData {
+                StatementKind::Program(Box::new(ProgramData {
                     scope,
                     program_type: ProgramType::Module,
                     is_strict_mode: true,
                     has_top_level_await,
-                }),
+                })),
             )
         }
     }
@@ -1106,51 +1092,7 @@ impl<'a> Parser<'a> {
         // Collect all declared names at module level.
         let mut declared_names: HashSet<Utf16String> = HashSet::new();
         for child in children {
-            match &child.inner {
-                StatementKind::VariableDeclaration { declarations, .. } => {
-                    for decl in declarations {
-                        collect_binding_names(&decl.target, &mut declared_names);
-                    }
-                }
-                StatementKind::FunctionDeclaration {
-                    name: Some(name), ..
-                } => {
-                    declared_names.insert(name.name.clone());
-                }
-                StatementKind::ClassDeclaration(data) => {
-                    if let Some(ref name) = data.name {
-                        declared_names.insert(name.name.clone());
-                    }
-                }
-                StatementKind::Import(data) => {
-                    for entry in &data.entries {
-                        declared_names.insert(entry.local_name.clone());
-                    }
-                }
-                StatementKind::Export(data) => {
-                    if let Some(ref statement) = data.statement {
-                        match &statement.inner {
-                            StatementKind::VariableDeclaration { declarations, .. } => {
-                                for decl in declarations {
-                                    collect_binding_names(&decl.target, &mut declared_names);
-                                }
-                            }
-                            StatementKind::FunctionDeclaration {
-                                name: Some(name), ..
-                            } => {
-                                declared_names.insert(name.name.clone());
-                            }
-                            StatementKind::ClassDeclaration(class_data) => {
-                                if let Some(ref name) = class_data.name {
-                                    declared_names.insert(name.name.clone());
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
+            collect_module_declared_names(child, &mut declared_names);
         }
 
         // Check each export's local bindings.
@@ -1419,7 +1361,7 @@ fn collect_binding_names(
 ) {
     match target {
         crate::ast::VariableDeclaratorTarget::Identifier(identifier) => {
-            names.insert(identifier.name.clone());
+            names.insert(identifier.name.to_utf16_string());
         }
         crate::ast::VariableDeclaratorTarget::BindingPattern(pattern) => {
             collect_binding_pattern_names(pattern, names);
@@ -1436,7 +1378,7 @@ fn collect_binding_pattern_names(
         if let Some(ref alias) = entry.alias {
             match alias {
                 crate::ast::BindingEntryAlias::Identifier(identifier) => {
-                    names.insert(identifier.name.clone());
+                    names.insert(identifier.name.to_utf16_string());
                 }
                 crate::ast::BindingEntryAlias::BindingPattern(nested) => {
                     collect_binding_pattern_names(nested, names);
@@ -1444,8 +1386,117 @@ fn collect_binding_pattern_names(
                 crate::ast::BindingEntryAlias::MemberExpression(_) => {}
             }
         } else if let Some(crate::ast::BindingEntryName::Identifier(identifier)) = &entry.name {
-            names.insert(identifier.name.clone());
+            names.insert(identifier.name.to_utf16_string());
         }
+    }
+}
+
+/// Collect all names declared by a top-level module statement.
+/// This includes lexical declarations (let/const), function/class declarations, imports,
+/// and also `var` declarations which hoist to module scope even when nested inside
+/// blocks, loops, if/else, etc.
+fn collect_module_declared_names(
+    statement: &crate::ast::Statement,
+    names: &mut HashSet<Utf16String>,
+) {
+    use crate::ast::*;
+    match &statement.inner {
+        StatementKind::VariableDeclaration(data) => {
+            // All top-level declarations (var, let, const) are module-scoped.
+            for decl in &data.declarations {
+                collect_binding_names(&decl.target, names);
+            }
+        }
+        StatementKind::FunctionDeclaration(data) => {
+            if let Some(ref name) = data.name {
+                names.insert(name.name.to_utf16_string());
+            }
+        }
+        StatementKind::ClassDeclaration(data) => {
+            if let Some(ref name) = data.name {
+                names.insert(name.name.to_utf16_string());
+            }
+        }
+        StatementKind::Import(data) => {
+            for entry in &data.entries {
+                names.insert(entry.local_name.clone());
+            }
+        }
+        StatementKind::Export(data) => {
+            if let Some(ref stmt) = data.statement {
+                collect_module_declared_names(stmt, names);
+            }
+        }
+        // For any other statement, recurse to find hoisted var declarations.
+        _ => {
+            collect_var_declared_names(statement, names);
+        }
+    }
+}
+
+/// Recursively collect `var` declaration names from nested statements.
+/// `var` declarations are hoisted to the enclosing function/module scope,
+/// so we must walk into blocks, loops, if/else, switch, try/catch, etc.
+/// We do NOT walk into function bodies since `var` does not hoist out of functions.
+fn collect_var_declared_names(statement: &crate::ast::Statement, names: &mut HashSet<Utf16String>) {
+    use crate::ast::*;
+    match &statement.inner {
+        StatementKind::VariableDeclaration(data) if matches!(data.kind, DeclarationKind::Var) => {
+            for decl in &data.declarations {
+                collect_binding_names(&decl.target, names);
+            }
+        }
+        StatementKind::Block(scope) => {
+            for child in &scope.borrow().children {
+                collect_var_declared_names(child, names);
+            }
+        }
+        StatementKind::If(data) => {
+            collect_var_declared_names(&data.consequent, names);
+            if let Some(ref alt) = data.alternate {
+                collect_var_declared_names(alt, names);
+            }
+        }
+        StatementKind::While(data) | StatementKind::DoWhile(data) => {
+            collect_var_declared_names(&data.body, names);
+        }
+        StatementKind::With(data) => {
+            collect_var_declared_names(&data.body, names);
+        }
+        StatementKind::For(data) => {
+            if let Some(ForInit::Declaration(ref decl)) = data.init {
+                collect_var_declared_names(decl, names);
+            }
+            collect_var_declared_names(&data.body, names);
+        }
+        StatementKind::ForInOf(data) => {
+            if let ForInOfLhs::Declaration(ref decl) = data.lhs {
+                collect_var_declared_names(decl, names);
+            }
+            collect_var_declared_names(&data.body, names);
+        }
+        StatementKind::Switch(data) => {
+            for case in &data.cases {
+                for child in &case.scope.borrow().children {
+                    collect_var_declared_names(child, names);
+                }
+            }
+        }
+        StatementKind::Try(data) => {
+            collect_var_declared_names(&data.block, names);
+            if let Some(ref handler) = data.handler {
+                collect_var_declared_names(&handler.body, names);
+            }
+            if let Some(ref finalizer) = data.finalizer {
+                collect_var_declared_names(finalizer, names);
+            }
+        }
+        StatementKind::Labelled(data) => {
+            collect_var_declared_names(&data.item, names);
+        }
+        // Don't recurse into functions (var doesn't hoist out of functions).
+        // Don't recurse into let/const (they are block-scoped, not hoisted).
+        _ => {}
     }
 }
 

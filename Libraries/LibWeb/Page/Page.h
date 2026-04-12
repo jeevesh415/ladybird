@@ -20,6 +20,7 @@
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/ShareableBitmap.h>
+#include <LibGfx/SharedImage.h>
 #include <LibGfx/Size.h>
 #include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Forward.h>
@@ -440,7 +441,7 @@ public:
     virtual void page_did_request_activate_tab() { }
     virtual void page_did_close_top_level_traversable() { }
     virtual void page_did_update_navigation_buttons_state([[maybe_unused]] bool back_enabled, [[maybe_unused]] bool forward_enabled) { }
-    virtual void page_did_allocate_backing_stores([[maybe_unused]] i32 front_bitmap_id, [[maybe_unused]] Gfx::ShareableBitmap front_bitmap, [[maybe_unused]] i32 back_bitmap_id, [[maybe_unused]] Gfx::ShareableBitmap back_bitmap) { }
+    virtual void page_did_allocate_backing_stores([[maybe_unused]] i32 front_bitmap_id, [[maybe_unused]] Gfx::SharedImage front_backing_store, [[maybe_unused]] i32 back_bitmap_id, [[maybe_unused]] Gfx::SharedImage back_backing_store) { }
 
     virtual void request_file(FileRequest) = 0;
 
@@ -468,6 +469,7 @@ public:
     virtual void page_did_receive_network_response_headers([[maybe_unused]] u64 request_id, [[maybe_unused]] u32 status_code, [[maybe_unused]] Optional<String> reason_phrase, [[maybe_unused]] Vector<HTTP::Header> const& response_headers) { }
     virtual void page_did_receive_network_response_body([[maybe_unused]] u64 request_id, [[maybe_unused]] ReadonlyBytes data) { }
     virtual void page_did_finish_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] u64 body_size, [[maybe_unused]] Requests::RequestTimingInfo const& timing_info, [[maybe_unused]] Optional<Requests::NetworkError> const& network_error) { }
+    virtual void page_did_report_worker_exception([[maybe_unused]] String const& message, [[maybe_unused]] String const& filename, [[maybe_unused]] u32 lineno, [[maybe_unused]] u32 colno) { }
 
     struct WorkerAgentResponse {
         IPC::TransportHandle worker_handle;

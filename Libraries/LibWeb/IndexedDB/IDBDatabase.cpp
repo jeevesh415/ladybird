@@ -21,13 +21,25 @@ IDBDatabase::IDBDatabase(JS::Realm& realm, Database& db)
     : EventTarget(realm)
     , m_name(db.name())
     , m_associated_database(db)
+    , m_uuid(Crypto::generate_random_uuid())
 {
-    m_uuid = MUST(Crypto::generate_random_uuid());
     db.associate(*this);
     m_object_store_set = Vector<GC::Ref<ObjectStore>> { db.object_stores() };
 }
 
 IDBDatabase::~IDBDatabase() = default;
+
+void IDBDatabase::finalize()
+{
+    Base::finalize();
+
+    m_associated_database->dissociate(*this);
+    heap().enqueue_post_gc_task([database = GC::Weak(m_associated_database)] {
+        if (!database)
+            return;
+        database->check_pending_connection_wait();
+    });
+}
 
 GC::Ref<IDBDatabase> IDBDatabase::create(JS::Realm& realm, Database& db)
 {
@@ -118,7 +130,10 @@ WebIDL::ExceptionOr<GC::Ref<IDBObjectStore>> IDBDatabase::create_object_store(St
         return WebIDL::TransactionInactiveError::create(realm, "Transaction is not active while creating object store"_utf16);
 
     // 4. Let keyPath be options’s keyPath member if it is not undefined or null, or null otherwise.
-    auto key_path = options.key_path;
+    auto const& nullable_key_path = options.key_path;
+    Optional<KeyPath> key_path;
+    if (!nullable_key_path.has<Empty>())
+        key_path = nullable_key_path.downcast<String, Vector<String>>();
 
     // 5. If keyPath is not null and is not a valid key path, throw a "SyntaxError" DOMException.
     if (key_path.has_value() && !is_valid_key_path(key_path.value()))
@@ -146,8 +161,12 @@ WebIDL::ExceptionOr<GC::Ref<IDBObjectStore>> IDBDatabase::create_object_store(St
     // AD-HOC: Add newly created object store to this's object store set.
     add_to_object_store_set(object_store);
 
+    // AD-HOC: Set up a mutation log for this store and log its creation for potential revert on abort.
+    transaction->set_up_mutation_log_for_new_store(object_store);
+
     // 10. Return a new object store handle associated with store and transaction.
-    return IDBObjectStore::create(realm, object_store, *transaction);
+    transaction->add_to_scope(object_store);
+    return transaction->get_or_create_object_store_handle(object_store);
 }
 
 // https://w3c.github.io/IndexedDB/#dom-idbdatabase-objectstorenames
@@ -187,12 +206,21 @@ WebIDL::ExceptionOr<void> IDBDatabase::delete_object_store(String const& name)
     // 5. Remove store from this's object store set.
     this->remove_from_object_store_set(*store);
 
-    // FIXME: 6. If there is an object store handle associated with store and transaction, remove all entries from its index set.
+    // NB: Upgrade transactions' scope is always the entire database. Since we removed this store from the database,
+    //     it no longer belongs in the scope.
+    transaction->remove_from_scope(*store);
+
+    // 6. If there is an object store handle associated with store and transaction, remove all entries from its index set.
+    if (auto handle = transaction->object_store_handle_for(*store))
+        handle->index_set().clear();
 
     // AD-HOC: Mark the store and its indexes as deleted so that stale handles throw InvalidStateError.
     store->set_deleted(true);
     for (auto const& [_, index] : store->index_set())
         index->set_deleted(true);
+
+    // AD-HOC: Log the deletion for potential revert on abort.
+    store->mutation_log()->note_object_store_deleted();
 
     // 7. Destroy store.
     database->remove_object_store(*store);
@@ -334,8 +362,11 @@ void IDBDatabase::block_on_conflicting_transactions(GC::Ref<IDBTransaction> tran
         blocking.append(other);
     }
 
-    if (blocking.is_empty())
+    if (blocking.is_empty()) {
+        if (!transaction->is_readonly())
+            transaction->set_up_mutation_logs();
         return;
+    }
 
     transaction->request_list().block_execution();
     wait_for_transactions_to_finish(blocking, GC::create_function(realm().heap(), [transaction] {
@@ -355,6 +386,8 @@ void IDBDatabase::block_on_conflicting_transactions(GC::Ref<IDBTransaction> tran
             commit_a_transaction(transaction->realm(), transaction);
             return;
         }
+        if (!transaction->is_readonly())
+            transaction->set_up_mutation_logs();
         transaction->request_list().unblock_execution();
     }));
 }

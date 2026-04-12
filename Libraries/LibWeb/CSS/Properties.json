@@ -3627,12 +3627,14 @@
   "position-anchor": {
     "animation-type": "discrete",
     "inherited": false,
-    "initial": "auto",
+    "initial": "normal",
     "requires-computation": "never",
     "valid-types": [
       "dashed-ident"
     ],
     "valid-identifiers": [
+      "normal",
+      "none",
       "auto"
     ]
   },
@@ -4094,6 +4096,16 @@
     "requires-computation": "never",
     "valid-types": [
       "text-decoration-line"
+    ]
+  },
+  "text-decoration-skip-ink": {
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-types": [
+      "text-decoration-skip-ink"
     ]
   },
   "text-decoration-style": {
@@ -4680,7 +4692,6 @@
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "auto",
-    "needs-layout-node-for-resolved-value": true,
     "requires-computation": "cascaded-value",
     "valid-types": [
       "integer [-∞,∞]"

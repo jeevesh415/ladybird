@@ -18,15 +18,6 @@ namespace WebView {
 
 HashTable<WebContentClient*> WebContentClient::s_clients;
 
-Optional<ViewImplementation&> WebContentClient::view_for_pid_and_page_id(pid_t pid, u64 page_id)
-{
-    for (auto* client : s_clients) {
-        if (client->m_process_handle.pid == pid)
-            return client->view_for_page_id(page_id);
-    }
-    return {};
-}
-
 WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, ViewImplementation& view)
     : IPC::ConnectionToServer<WebContentClientEndpoint, WebContentServerEndpoint>(*this, move(transport))
 {
@@ -532,10 +523,8 @@ void WebContentClient::did_change_favicon(u64 page_id, Gfx::ShareableBitmap favi
         return;
     }
 
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
-        if (view->on_favicon_change)
-            view->on_favicon_change(*favicon.bitmap());
-    }
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->set_favicon({}, *favicon.bitmap());
 }
 
 void WebContentClient::did_request_document_cookie_version_index(u64 page_id, i64 document_id, String domain)
@@ -778,10 +767,10 @@ void WebContentClient::did_update_navigation_buttons_state(u64 page_id, bool bac
         view->did_update_navigation_buttons_state({}, back_enabled, forward_enabled);
 }
 
-void WebContentClient::did_allocate_backing_stores(u64 page_id, i32 front_bitmap_id, Gfx::ShareableBitmap front_bitmap, i32 back_bitmap_id, Gfx::ShareableBitmap back_bitmap)
+void WebContentClient::did_allocate_backing_stores(u64 page_id, i32 front_bitmap_id, Gfx::SharedImage front_backing_store, i32 back_bitmap_id, Gfx::SharedImage back_backing_store)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_allocate_backing_stores({}, front_bitmap_id, front_bitmap, back_bitmap_id, back_bitmap);
+        view->did_allocate_backing_stores({}, front_bitmap_id, move(front_backing_store), back_bitmap_id, move(back_backing_store));
 }
 
 Messages::WebContentClient::RequestWorkerAgentResponse WebContentClient::request_worker_agent(u64 page_id, Web::Bindings::AgentType worker_type)

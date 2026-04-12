@@ -9,16 +9,16 @@
 #include <AK/HashTable.h>
 #include <AK/TemporaryChange.h>
 #include <LibGC/RootHashMap.h>
-#include <LibJS/AST.h>
 #include <LibJS/Bytecode/AsmInterpreter/AsmInterpreter.h>
 #include <LibJS/Bytecode/BasicBlock.h>
+#include <LibJS/Bytecode/Builtins.h>
 #include <LibJS/Bytecode/FormatOperand.h>
-#include <LibJS/Bytecode/Generator.h>
 #include <LibJS/Bytecode/Instruction.h>
 #include <LibJS/Bytecode/Interpreter.h>
 #include <LibJS/Bytecode/Label.h>
 #include <LibJS/Bytecode/Op.h>
 #include <LibJS/Bytecode/PropertyAccess.h>
+#include <LibJS/Bytecode/PropertyNameIterator.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Accessor.h>
@@ -32,7 +32,6 @@
 #include <LibJS/Runtime/ECMAScriptFunctionObject.h>
 #include <LibJS/Runtime/Environment.h>
 #include <LibJS/Runtime/FunctionEnvironment.h>
-#include <LibJS/Runtime/GeneratorResult.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/GlobalObject.h>
 #include <LibJS/Runtime/Iterator.h>
@@ -43,6 +42,7 @@
 #include <LibJS/Runtime/Realm.h>
 #include <LibJS/Runtime/Reference.h>
 #include <LibJS/Runtime/RegExpObject.h>
+#include <LibJS/Runtime/StringConstructor.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibJS/Runtime/ValueInlines.h>
@@ -95,10 +95,13 @@ Interpreter::~Interpreter() = default;
 
 ALWAYS_INLINE Value Interpreter::do_yield(Value value, Optional<Label> continuation)
 {
-    // FIXME: If we get a pointer, which is not accurately representable as a double
-    //        will cause this to explode
-    auto continuation_value = continuation.has_value() ? Value(continuation->address()) : js_null();
-    return vm().heap().allocate<GeneratorResult>(value, continuation_value, false).ptr();
+    auto& context = running_execution_context();
+    if (continuation.has_value())
+        context.yield_continuation = continuation->address();
+    else
+        context.yield_continuation = ExecutionContext::no_yield_continuation;
+    context.yield_is_await = false;
+    return value;
 }
 
 // 16.1.6 ScriptEvaluation ( scriptRecord ), https://tc39.es/ecma262/#sec-runtime-semantics-scriptevaluation
@@ -117,27 +120,20 @@ ThrowCompletionOr<Value> Interpreter::run(Script& script_record, GC::Ptr<Environ
 
     // 11. Let script be scriptRecord.[[ECMAScriptCode]].
     GC::Ptr<Executable> executable = script_record.cached_executable();
-    if (!executable && result.type() == Completion::Type::Normal) {
-        executable = JS::Bytecode::Generator::generate_from_ast_node(vm, *script_record.parse_node(), {});
-        if (executable) {
-            script_record.cache_executable(*executable);
-            script_record.drop_ast();
-        }
-    }
     if (executable && g_dump_bytecode)
         executable->dump();
 
     u32 registers_and_locals_count = 0;
-    u32 constants_count = 0;
+    ReadonlySpan<Value> constants;
     if (executable) {
         registers_and_locals_count = executable->registers_and_locals_count;
-        constants_count = executable->constants.size();
+        constants = executable->constants;
     }
 
     // 2. Let scriptContext be a new ECMAScript code execution context.
     auto& stack = vm.interpreter_stack();
     auto* stack_mark = stack.top();
-    auto* script_context = stack.allocate(registers_and_locals_count, constants_count, 0);
+    auto* script_context = stack.allocate(registers_and_locals_count, constants, 0);
     if (!script_context) [[unlikely]]
         return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
     ScopeGuard deallocate_guard = [&stack, stack_mark] { stack.deallocate(stack_mark); };
@@ -170,7 +166,7 @@ ThrowCompletionOr<Value> Interpreter::run(Script& script_record, GC::Ptr<Environ
     // 13. If result.[[Type]] is normal, then
     if (executable && result.type() == Completion::Type::Normal) {
         // a. Set result to Completion(Evaluation of script).
-        result = run_executable(*script_context, *executable, {}, {});
+        result = run_executable(*script_context, *executable, 0, {});
 
         // b. If result is a normal completion and result.[[Value]] is empty, then
         if (result.type() == Completion::Type::Normal && result.value().is_special_empty_value()) {
@@ -263,10 +259,9 @@ ExecutionContext* Interpreter::push_inline_frame(
 
     u32 insn_argument_count = arguments.size();
     size_t registers_and_locals_count = callee_executable.registers_and_locals_count;
-    size_t constants_count = callee_executable.constants.size();
     size_t argument_count = max(insn_argument_count, static_cast<u32>(callee_function.formal_parameter_count()));
 
-    auto* callee_context = stack.allocate(registers_and_locals_count, constants_count, argument_count);
+    auto* callee_context = stack.allocate(registers_and_locals_count, callee_executable.constants, argument_count);
     if (!callee_context) [[unlikely]]
         return nullptr;
 
@@ -316,14 +311,8 @@ ExecutionContext* Interpreter::push_inline_frame(
     //     in cross-realm calls (e.g. iframe <-> parent).
     callee_context->executable = callee_executable;
 
-    // Copy constants (memcpy avoids aliasing issues with the scalar loop).
-    auto* values = callee_context->registers_and_constants_and_locals_and_arguments();
-    if (auto count = callee_executable.constants.size())
-        memcpy(values + callee_executable.registers_and_locals_count,
-            callee_executable.constants.data(),
-            count * sizeof(Value));
-
     // Set this value register.
+    auto* values = callee_context->registers_and_constants_and_locals_and_arguments();
     values[Register::this_value().index()] = callee_context->this_value.value_or(js_special_empty_value());
 
     return callee_context;
@@ -649,7 +638,10 @@ void Interpreter::run_bytecode(size_t entry_point)
             DISPATCH_NEXT(Call);
         }
 
-            HANDLE_INSTRUCTION(CallBuiltin);
+#define HANDLE_CALL_BUILTIN_INSTRUCTION(name, ...) \
+    HANDLE_INSTRUCTION(CallBuiltin##name);
+            JS_ENUMERATE_BUILTINS(HANDLE_CALL_BUILTIN_INSTRUCTION)
+#undef HANDLE_CALL_BUILTIN_INSTRUCTION
 
         handle_CallConstruct: {
             auto& instruction = *reinterpret_cast<Op::CallConstruct const*>(&bytecode[program_counter]);
@@ -721,6 +713,7 @@ void Interpreter::run_bytecode(size_t entry_point)
             HANDLE_INSTRUCTION(IteratorClose);
             HANDLE_INSTRUCTION(IteratorNext);
             HANDLE_INSTRUCTION(IteratorNextUnpack);
+            HANDLE_INSTRUCTION(ObjectPropertyIteratorNext);
             HANDLE_INSTRUCTION(IteratorToArray);
             HANDLE_INSTRUCTION_WITHOUT_EXCEPTION_CHECK(LeavePrivateEnvironment);
             HANDLE_INSTRUCTION(LeftShift);
@@ -830,7 +823,7 @@ DeclarativeEnvironment& Interpreter::global_declarative_environment()
     return realm().global_declarative_environment();
 }
 
-ThrowCompletionOr<Value> Interpreter::run_executable(ExecutionContext& context, Executable& executable, Optional<size_t> entry_point)
+ThrowCompletionOr<Value> Interpreter::run_executable(ExecutionContext& context, Executable& executable, u32 entry_point)
 {
     dbgln_if(JS_BYTECODE_DEBUG, "Bytecode::Interpreter will run unit {}", &executable);
 
@@ -849,18 +842,12 @@ ThrowCompletionOr<Value> Interpreter::run_executable(ExecutionContext& context, 
     if (reg(Register::this_value()).is_special_empty_value())
         reg(Register::this_value()) = context.this_value.value_or(js_special_empty_value());
 
-    // NB: Layout is [registers | locals | constants | arguments], so constants start after registers+locals.
-    auto* values = context.registers_and_constants_and_locals_and_arguments();
-    if (auto count = executable.constants.size())
-        memcpy(values + executable.registers_and_locals_count,
-            executable.constants.data(),
-            count * sizeof(Value));
-
-    run_bytecode(entry_point.value_or(0));
+    run_bytecode(entry_point);
 
     dbgln_if(JS_BYTECODE_DEBUG, "Bytecode::Interpreter did run unit {}", context.executable);
 
     if constexpr (JS_BYTECODE_DEBUG) {
+        auto* values = context.registers_and_constants_and_locals_and_arguments();
         for (size_t i = 0; i < executable.number_of_registers; ++i) {
             String value_string;
             if (values[i].is_special_empty_value())
@@ -885,30 +872,6 @@ void Interpreter::catch_exception(Operand dst)
 {
     set(dst, reg(Register::exception()));
     reg(Register::exception()) = js_special_empty_value();
-}
-
-GC::Ref<Bytecode::Executable> compile(VM& vm, ASTNode const& node, FunctionKind kind, Utf16FlyString const& name)
-{
-    auto bytecode_executable = Bytecode::Generator::generate_from_ast_node(vm, node, kind);
-    bytecode_executable->name = name;
-
-    if (Bytecode::g_dump_bytecode)
-        bytecode_executable->dump();
-
-    return bytecode_executable;
-}
-
-GC::Ref<Bytecode::Executable> compile(VM& vm, GC::Ref<SharedFunctionInstanceData const> shared_function_instance_data, BuiltinAbstractOperationsEnabled builtin_abstract_operations_enabled)
-{
-    auto const& name = shared_function_instance_data->m_name;
-
-    auto bytecode_executable = Bytecode::Generator::generate_from_function(vm, shared_function_instance_data, builtin_abstract_operations_enabled);
-    bytecode_executable->name = name;
-
-    if (Bytecode::g_dump_bytecode)
-        bytecode_executable->dump();
-
-    return bytecode_executable;
 }
 
 // NOTE: This function assumes that the index is valid within the TypedArray,
@@ -1179,7 +1142,7 @@ inline Value new_function(Interpreter& interpreter, u32 shared_function_data_ind
 
     if (home_object.has_value()) {
         auto home_object_value = interpreter.get(home_object.value());
-        function->set_home_object(&home_object_value.as_object());
+        function->make_method(home_object_value.as_object());
     }
 
     return function;
@@ -1355,7 +1318,7 @@ inline ThrowCompletionOr<CalleeAndThis> get_callee_and_this_from_environment(Int
 }
 
 // 13.2.7.3 Runtime Semantics: Evaluation, https://tc39.es/ecma262/#sec-regular-expression-literals-runtime-semantics-evaluation
-inline Value new_regexp(VM& vm, Regex<ECMA262> const& regex, Utf16String pattern, Utf16String flags)
+inline Value new_regexp(VM& vm, Utf16String pattern, Utf16String flags)
 {
     // 1. Let pattern be CodePointsToString(BodyText of RegularExpressionLiteral).
     // 2. Let flags be CodePointsToString(FlagText of RegularExpressionLiteral).
@@ -1363,7 +1326,7 @@ inline Value new_regexp(VM& vm, Regex<ECMA262> const& regex, Utf16String pattern
     // 3. Return ! RegExpCreate(pattern, flags).
     auto& realm = *vm.current_realm();
     // NOTE: We bypass RegExpCreate and subsequently RegExpAlloc as an optimization to use the already parsed values.
-    auto regexp_object = RegExpObject::create(realm, regex, move(pattern), move(flags));
+    auto regexp_object = RegExpObject::create(realm, move(pattern), move(flags));
     // RegExpAlloc has these two steps from the 'Legacy RegExp features' proposal.
     regexp_object->set_realm(realm);
     // We don't need to check 'If SameValue(newTarget, thisRealm.[[Intrinsics]].[[%RegExp%]]) is true'
@@ -1454,7 +1417,7 @@ inline ThrowCompletionOr<void> append(VM& vm, Value lhs, Value rhs, bool is_spre
     //                 d. Append nextArg to precedingArgs.
 
     // Note: We know from codegen, that lhs is a plain array with only indexed properties
-    auto& lhs_array = lhs.as_array();
+    auto& lhs_array = lhs.as_array_exotic_object();
     auto lhs_size = lhs_array.indexed_array_like_size();
 
     if (is_spread) {
@@ -1472,65 +1435,180 @@ inline ThrowCompletionOr<void> append(VM& vm, Value lhs, Value rhs, bool is_spre
     return {};
 }
 
-class JS_API PropertyNameIterator final
-    : public Object
-    , public BuiltinIterator {
-    JS_OBJECT(PropertyNameIterator, Object);
-    GC_DECLARE_ALLOCATOR(PropertyNameIterator);
-
-public:
-    virtual ~PropertyNameIterator() override = default;
-
-    BuiltinIterator* as_builtin_iterator_if_next_is_not_redefined(Value) override { return this; }
-    ThrowCompletionOr<void> next(VM& vm, bool& done, Value& value) override
-    {
-        while (true) {
-            if (m_iterator == m_properties.end()) {
-                done = true;
-                return {};
-            }
-
-            auto const& entry = *m_iterator;
-            ScopeGuard remove_first = [&] { ++m_iterator; };
-
-            // If the property is deleted, don't include it (invariant no. 2)
-            if (!TRY(m_object->has_property(entry)))
-                continue;
-
-            done = false;
-            value = entry.to_value(vm);
-            return {};
-        }
-    }
-
-private:
-    PropertyNameIterator(JS::Realm& realm, GC::Ref<Object> object, Vector<PropertyKey> properties)
-        : Object(realm, nullptr)
-        , m_object(object)
-        , m_properties(move(properties))
-        , m_iterator(m_properties.begin())
-    {
-    }
-
-    virtual void visit_edges(Visitor& visitor) override
-    {
-        Base::visit_edges(visitor);
-        visitor.visit(m_object);
-        for (auto& key : m_properties)
-            key.visit_edges(visitor);
-        if (!m_iterator.is_end())
-            m_iterator->visit_edges(visitor);
-    }
-
-    GC::Ref<Object> m_object;
-    Vector<PropertyKey> m_properties;
-    decltype(m_properties.begin()) m_iterator;
+struct FastPropertyNameIteratorData {
+    Vector<PropertyKey> properties;
+    PropertyNameIterator::FastPath fast_path { PropertyNameIterator::FastPath::None };
+    u32 indexed_property_count { 0 };
+    bool receiver_has_magical_length_property { false };
+    GC::Ptr<Shape> shape;
+    GC::Ptr<PrototypeChainValidity> prototype_chain_validity;
 };
 
-GC_DEFINE_ALLOCATOR(PropertyNameIterator);
+static bool shape_has_enumerable_string_property(Shape const& shape)
+{
+    for (auto const& [property_key, metadata] : shape.property_table()) {
+        if (property_key.is_string() && metadata.attributes.is_enumerable())
+            return true;
+    }
+    return false;
+}
+
+static bool property_name_iterator_fast_path_is_still_eligible(Object& object, PropertyNameIterator::FastPath fast_path, u32 indexed_property_count)
+{
+    Object const* object_to_check = &object;
+    bool is_receiver = true;
+
+    while (object_to_check) {
+        if (!object_to_check->eligible_for_own_property_enumeration_fast_path())
+            return false;
+
+        if (is_receiver) {
+            if (fast_path == PropertyNameIterator::FastPath::PackedIndexed) {
+                if (object_to_check->indexed_storage_kind() != IndexedStorageKind::Packed)
+                    return false;
+                if (object_to_check->indexed_array_like_size() != indexed_property_count)
+                    return false;
+            } else if (object_to_check->indexed_array_like_size() != 0) {
+                return false;
+            }
+        } else if (object_to_check->indexed_array_like_size() != 0) {
+            return false;
+        }
+
+        object_to_check = object_to_check->prototype();
+        is_receiver = false;
+    }
+
+    return true;
+}
+
+static bool object_property_iterator_cache_matches(Object& object, ObjectPropertyIteratorCacheData const& cache)
+{
+    // A cache entry represents the fully flattened key snapshot for one bytecode
+    // site. Reusing it is only valid while the receiver still has the same local
+    // state and the prototype chain validity token says nothing above it changed.
+    if (object.has_magical_length_property() != cache.receiver_has_magical_length_property())
+        return false;
+
+    auto& shape = object.shape();
+    if (&shape != cache.shape())
+        return false;
+
+    if (shape.is_dictionary() && shape.dictionary_generation() != cache.shape_dictionary_generation())
+        return false;
+
+    if (cache.prototype_chain_validity() && !cache.prototype_chain_validity()->is_valid())
+        return false;
+
+    return property_name_iterator_fast_path_is_still_eligible(object, cache.fast_path(), cache.indexed_property_count());
+}
+
+static ThrowCompletionOr<Optional<FastPropertyNameIteratorData>> try_get_fast_property_name_iterator_data(Object& object)
+{
+    auto& vm = object.vm();
+    FastPropertyNameIteratorData result {};
+    result.fast_path = PropertyNameIterator::FastPath::PlainNamed;
+    result.receiver_has_magical_length_property = object.has_magical_length_property();
+    result.shape = &object.shape();
+
+    HashTable<GC::Ref<Object>> seen_objects;
+    size_t estimated_properties_count = 0;
+    bool prototype_chain_has_enumerable_named_properties = false;
+    for (auto object_to_check = GC::Ptr { &object }; object_to_check && !seen_objects.contains(*object_to_check); object_to_check = TRY(object_to_check->internal_get_prototype_of())) {
+        seen_objects.set(*object_to_check);
+        if (!object_to_check->eligible_for_own_property_enumeration_fast_path())
+            return Optional<FastPropertyNameIteratorData> {};
+        if (&object == object_to_check.ptr()) {
+            if (object_to_check->indexed_array_like_size() != 0) {
+                if (object_to_check->indexed_storage_kind() != IndexedStorageKind::Packed)
+                    return Optional<FastPropertyNameIteratorData> {};
+                result.fast_path = PropertyNameIterator::FastPath::PackedIndexed;
+                result.indexed_property_count = object_to_check->indexed_array_like_size();
+            } else {
+                result.fast_path = PropertyNameIterator::FastPath::PlainNamed;
+            }
+        } else if (object_to_check->indexed_array_like_size() != 0) {
+            // The fast path only knows how to synthesize a packed indexed prefix
+            // for the receiver itself. As soon as indexed properties appear in
+            // the prototype chain, we fall back to the generic enumeration path.
+            return Optional<FastPropertyNameIteratorData> {};
+        } else if (!prototype_chain_has_enumerable_named_properties) {
+            prototype_chain_has_enumerable_named_properties = shape_has_enumerable_string_property(object_to_check->shape());
+        }
+        estimated_properties_count += object_to_check->shape().property_count();
+    }
+    seen_objects.clear_with_capacity();
+
+    if (auto* prototype = object.shape().prototype()) {
+        result.prototype_chain_validity = prototype->shape().prototype_chain_validity();
+        if (!result.prototype_chain_validity)
+            return Optional<FastPropertyNameIteratorData> {};
+    }
+
+    if (!prototype_chain_has_enumerable_named_properties) {
+        // Common case: only the receiver contributes enumerable string keys, so
+        // we can copy them straight from the shape without any shadowing work.
+        result.properties.ensure_capacity(object.shape().property_count());
+        for (auto const& [property_key, metadata] : object.shape().property_table()) {
+            if (property_key.is_string() && metadata.attributes.is_enumerable())
+                result.properties.append(property_key);
+        }
+        return result;
+    }
+
+    result.properties.ensure_capacity(estimated_properties_count);
+
+    HashTable<PropertyKey> seen_non_enumerable_properties;
+    Optional<HashTable<PropertyKey>> seen_properties;
+    auto ensure_seen_properties = [&] {
+        if (seen_properties.has_value())
+            return;
+        // Prototype shadowing ignores enumerability, so once we start looking
+        // above the receiver we need an explicit visited set for names we have
+        // already decided to expose from lower objects.
+        seen_properties = HashTable<PropertyKey> {};
+        seen_properties->ensure_capacity(result.properties.size());
+        for (auto const& property : result.properties)
+            seen_properties->set(property);
+    };
+
+    bool in_prototype_chain = false;
+    for (auto object_to_check = GC::Ptr { &object }; object_to_check && !seen_objects.contains(*object_to_check); object_to_check = TRY(object_to_check->internal_get_prototype_of())) {
+        seen_objects.set(*object_to_check);
+
+        // Arrays keep a non-enumerable magical `length` property outside the shape
+        // table, but it still shadows enumerable `length` properties higher up the
+        // prototype chain during for-in.
+        if (object_to_check->has_magical_length_property())
+            seen_non_enumerable_properties.set(vm.names.length);
+
+        for (auto const& [property_key, metadata] : object_to_check->shape().property_table()) {
+            if (!property_key.is_string())
+                continue;
+
+            bool enumerable = metadata.attributes.is_enumerable();
+            if (!enumerable)
+                seen_non_enumerable_properties.set(property_key);
+            if (in_prototype_chain && enumerable) {
+                if (seen_non_enumerable_properties.contains(property_key))
+                    continue;
+                ensure_seen_properties();
+                if (seen_properties->contains(property_key))
+                    continue;
+            }
+            if (enumerable)
+                result.properties.append(property_key);
+            if (seen_properties.has_value())
+                seen_properties->set(property_key);
+        }
+        in_prototype_chain = true;
+    }
+
+    return result;
+}
 
 // 14.7.5.9 EnumerateObjectProperties ( O ), https://tc39.es/ecma262/#sec-enumerate-object-properties
-inline ThrowCompletionOr<IteratorRecordImpl> get_object_property_iterator(Interpreter& interpreter, Value value)
+inline ThrowCompletionOr<GC::Ref<PropertyNameIterator>> get_object_property_iterator(Interpreter& interpreter, Value value, ObjectPropertyIteratorCache* cache = nullptr)
 {
     // While the spec does provide an algorithm, it allows us to implement it ourselves so long as we meet the following invariants:
     //    1- Returned property keys do not include keys that are Symbols
@@ -1550,6 +1628,43 @@ inline ThrowCompletionOr<IteratorRecordImpl> get_object_property_iterator(Interp
     auto object = TRY(value.to_object(vm));
     // Note: While the spec doesn't explicitly require these to be ordered, it says that the values should be retrieved via OwnPropertyKeys,
     //       so we just keep the order consistent anyway.
+
+    if (cache && cache->data) {
+        if (object_property_iterator_cache_matches(*object, *cache->data)) {
+            if (cache->reusable_property_name_iterator) {
+                // We keep one iterator object per bytecode site alive so hot
+                // loops can recycle it without allocating a new cell each time.
+                auto& iterator = static_cast<PropertyNameIterator&>(*cache->reusable_property_name_iterator);
+                cache->reusable_property_name_iterator = nullptr;
+                iterator.reset_with_cache_data(object, *cache->data, cache);
+                return iterator;
+            }
+
+            return PropertyNameIterator::create(interpreter.realm(), object, *cache->data, cache);
+        }
+    }
+
+    if (auto fast_iterator_data = TRY(try_get_fast_property_name_iterator_data(*object)); fast_iterator_data.has_value()) {
+        VERIFY(fast_iterator_data->shape);
+        auto cache_data = vm.heap().allocate<ObjectPropertyIteratorCacheData>(
+            vm,
+            move(fast_iterator_data->properties),
+            fast_iterator_data->fast_path,
+            fast_iterator_data->indexed_property_count,
+            fast_iterator_data->receiver_has_magical_length_property,
+            *fast_iterator_data->shape,
+            fast_iterator_data->prototype_chain_validity);
+        if (cache)
+            cache->data = cache_data;
+        if (cache && cache->reusable_property_name_iterator) {
+            auto& iterator = static_cast<PropertyNameIterator&>(*cache->reusable_property_name_iterator);
+            cache->reusable_property_name_iterator = nullptr;
+            iterator.reset_with_cache_data(object, cache_data, cache);
+            return iterator;
+        }
+
+        return PropertyNameIterator::create(interpreter.realm(), object, cache_data, cache);
+    }
 
     size_t estimated_properties_count = 0;
     HashTable<GC::Ref<Object>> seen_objects;
@@ -1596,8 +1711,7 @@ inline ThrowCompletionOr<IteratorRecordImpl> get_object_property_iterator(Interp
         in_prototype_chain = true;
     }
 
-    auto iterator = interpreter.realm().create<PropertyNameIterator>(interpreter.realm(), object, move(properties));
-    return IteratorRecordImpl { .done = false, .iterator = iterator, .next_method = js_undefined() };
+    return PropertyNameIterator::create(interpreter.realm(), object, move(properties));
 }
 
 ByteString Instruction::to_byte_string(Bytecode::Executable const& executable) const
@@ -2125,7 +2239,8 @@ void CacheObjectShape::execute_impl(Bytecode::Interpreter& interpreter) const
     auto& cache = *bit_cast<ObjectShapeCache*>(m_cache);
     if (!cache.shape) {
         auto& object = interpreter.get(m_object).as_object();
-        cache.shape = &object.shape();
+        if (!object.shape().is_dictionary())
+            cache.shape = &object.shape();
     }
 }
 
@@ -2168,7 +2283,6 @@ void NewRegExp::execute_impl(Bytecode::Interpreter& interpreter) const
     interpreter.set(dst(),
         new_regexp(
             interpreter.vm(),
-            interpreter.current_executable().regex_table->get(m_regex_index),
             interpreter.current_executable().get_string(m_source_index),
             interpreter.current_executable().get_string(m_flags_index)));
 }
@@ -2703,51 +2817,6 @@ void SetLexicalEnvironment::execute_impl(Bytecode::Interpreter& interpreter) con
     interpreter.running_execution_context().lexical_environment = &as<Environment>(interpreter.get(m_environment).as_cell());
 }
 
-static ThrowCompletionOr<Value> dispatch_builtin_call(Bytecode::Interpreter& interpreter, Bytecode::Builtin builtin, ReadonlySpan<Operand> arguments)
-{
-    switch (builtin) {
-    case Builtin::MathAbs:
-        return TRY(MathObject::abs_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathLog:
-        return TRY(MathObject::log_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathPow:
-        return TRY(MathObject::pow_impl(interpreter.vm(), interpreter.get(arguments.data()[0]), interpreter.get(arguments.data()[1])));
-    case Builtin::MathExp:
-        return TRY(MathObject::exp_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathCeil:
-        return TRY(MathObject::ceil_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathFloor:
-        return TRY(MathObject::floor_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathImul:
-        return TRY(MathObject::imul_impl(interpreter.vm(), interpreter.get(arguments.data()[0]), interpreter.get(arguments.data()[1])));
-    case Builtin::MathRandom:
-        return MathObject::random_impl();
-    case Builtin::MathRound:
-        return TRY(MathObject::round_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathSqrt:
-        return TRY(MathObject::sqrt_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathSin:
-        return TRY(MathObject::sin_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathCos:
-        return TRY(MathObject::cos_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::MathTan:
-        return TRY(MathObject::tan_impl(interpreter.vm(), interpreter.get(arguments.data()[0])));
-    case Builtin::RegExpPrototypeExec:
-    case Builtin::RegExpPrototypeReplace:
-    case Builtin::RegExpPrototypeSplit:
-    case Builtin::ArrayIteratorPrototypeNext:
-    case Builtin::MapIteratorPrototypeNext:
-    case Builtin::SetIteratorPrototypeNext:
-    case Builtin::StringIteratorPrototypeNext:
-        VERIFY_NOT_REACHED();
-    case Builtin::OrdinaryHasInstance:
-        VERIFY_NOT_REACHED();
-    case Bytecode::Builtin::__Count:
-        VERIFY_NOT_REACHED();
-    }
-    VERIFY_NOT_REACHED();
-}
-
 template<CallType call_type>
 NEVER_INLINE static ThrowCompletionOr<void> execute_call(
     Bytecode::Interpreter& interpreter,
@@ -2764,13 +2833,13 @@ NEVER_INLINE static ThrowCompletionOr<void> execute_call(
     auto& function = callee.as_function();
 
     size_t registers_and_locals_count = 0;
-    size_t constants_count = 0;
+    ReadonlySpan<Value> constants;
     size_t argument_count = arguments.size();
-    function.get_stack_frame_size(registers_and_locals_count, constants_count, argument_count);
+    function.get_stack_frame_info(registers_and_locals_count, constants, argument_count);
 
     auto& stack = vm.interpreter_stack();
     auto* stack_mark = stack.top();
-    auto* callee_context = stack.allocate(registers_and_locals_count, constants_count, max(arguments.size(), argument_count));
+    auto* callee_context = stack.allocate(registers_and_locals_count, constants, max(arguments.size(), argument_count));
     if (!callee_context) [[unlikely]]
         return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
     ScopeGuard deallocate_guard = [&stack, stack_mark] { stack.deallocate(stack_mark); };
@@ -2812,17 +2881,102 @@ ThrowCompletionOr<void> CallDirectEval::execute_impl(Bytecode::Interpreter& inte
     return execute_call<CallType::DirectEval>(interpreter, interpreter.get(m_callee), interpreter.get(m_this_value), { m_arguments, m_argument_count }, m_dst, m_expression_string, strict());
 }
 
-ThrowCompletionOr<void> CallBuiltin::execute_impl(Bytecode::Interpreter& interpreter) const
+template<Builtin builtin, typename Callback>
+ALWAYS_INLINE static ThrowCompletionOr<void> execute_specialized_builtin_call(
+    Bytecode::Interpreter& interpreter,
+    Operand callee_operand,
+    Operand this_value_operand,
+    ReadonlySpan<Operand> arguments,
+    Operand dst,
+    Optional<StringTableIndex> const expression_string,
+    Strict strict,
+    Callback callback)
 {
-    auto callee = interpreter.get(m_callee);
-
-    if (callee.is_function() && callee.as_function().builtin() == m_builtin) [[likely]] {
-        interpreter.set(dst(), TRY(dispatch_builtin_call(interpreter, m_builtin, { m_arguments, m_argument_count })));
+    auto callee = interpreter.get(callee_operand);
+    if (callee.is_function() && callee.as_function().builtin() == builtin) [[likely]] {
+        interpreter.set(dst, TRY(callback(arguments)));
         return {};
     }
-
-    return execute_call<CallType::Call>(interpreter, callee, interpreter.get(m_this_value), { m_arguments, m_argument_count }, m_dst, m_expression_string, strict());
+    return execute_call<CallType::Call>(interpreter, callee, interpreter.get(this_value_operand), arguments, dst, expression_string, strict);
 }
+
+#define JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(name, implementation)                                                                                                                                                 \
+    ThrowCompletionOr<void> CallBuiltin##name::execute_impl(Bytecode::Interpreter& interpreter) const                                                                                                                   \
+    {                                                                                                                                                                                                                   \
+        Operand arguments[] { m_argument };                                                                                                                                                                             \
+        return execute_specialized_builtin_call<Builtin::name>(interpreter, m_callee, m_this_value, arguments, m_dst, m_expression_string, strict(), [&](ReadonlySpan<Operand> arguments) -> ThrowCompletionOr<Value> { \
+            return implementation(interpreter.vm(), interpreter.get(arguments[0]));                                                                                                                                     \
+        });                                                                                                                                                                                                             \
+    }
+
+#define JS_DEFINE_BINARY_BUILTIN_CALL_EXECUTE_IMPL(name, implementation)                                                                                                                                                \
+    ThrowCompletionOr<void> CallBuiltin##name::execute_impl(Bytecode::Interpreter& interpreter) const                                                                                                                   \
+    {                                                                                                                                                                                                                   \
+        Operand arguments[] { m_argument0, m_argument1 };                                                                                                                                                               \
+        return execute_specialized_builtin_call<Builtin::name>(interpreter, m_callee, m_this_value, arguments, m_dst, m_expression_string, strict(), [&](ReadonlySpan<Operand> arguments) -> ThrowCompletionOr<Value> { \
+            return implementation(interpreter.vm(), interpreter.get(arguments[0]), interpreter.get(arguments[1]));                                                                                                      \
+        });                                                                                                                                                                                                             \
+    }
+
+#define JS_DEFINE_NULLARY_BUILTIN_CALL_EXECUTE_IMPL(name, implementation)                                                                                                                              \
+    ThrowCompletionOr<void> CallBuiltin##name::execute_impl(Bytecode::Interpreter& interpreter) const                                                                                                  \
+    {                                                                                                                                                                                                  \
+        return execute_specialized_builtin_call<Builtin::name>(interpreter, m_callee, m_this_value, {}, m_dst, m_expression_string, strict(), [&](ReadonlySpan<Operand>) -> ThrowCompletionOr<Value> { \
+            return implementation();                                                                                                                                                                   \
+        });                                                                                                                                                                                            \
+    }
+
+#define JS_DEFINE_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(name, ...)                                                                                                \
+    ThrowCompletionOr<void> CallBuiltin##name::execute_impl(Bytecode::Interpreter& interpreter) const                                                         \
+    {                                                                                                                                                         \
+        return execute_call<CallType::Call>(interpreter, interpreter.get(m_callee), interpreter.get(m_this_value), {}, m_dst, m_expression_string, strict()); \
+    }
+
+#define JS_DEFINE_UNARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(name, ...)                                                                                                 \
+    ThrowCompletionOr<void> CallBuiltin##name::execute_impl(Bytecode::Interpreter& interpreter) const                                                                \
+    {                                                                                                                                                                \
+        Operand arguments[] { m_argument };                                                                                                                          \
+        return execute_call<CallType::Call>(interpreter, interpreter.get(m_callee), interpreter.get(m_this_value), arguments, m_dst, m_expression_string, strict()); \
+    }
+
+#define JS_DEFINE_BINARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(name, ...)                                                                                                \
+    ThrowCompletionOr<void> CallBuiltin##name::execute_impl(Bytecode::Interpreter& interpreter) const                                                                \
+    {                                                                                                                                                                \
+        Operand arguments[] { m_argument0, m_argument1 };                                                                                                            \
+        return execute_call<CallType::Call>(interpreter, interpreter.get(m_callee), interpreter.get(m_this_value), arguments, m_dst, m_expression_string, strict()); \
+    }
+
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathAbs, MathObject::abs_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathLog, MathObject::log_impl)
+JS_DEFINE_BINARY_BUILTIN_CALL_EXECUTE_IMPL(MathPow, MathObject::pow_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathExp, MathObject::exp_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathCeil, MathObject::ceil_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathFloor, MathObject::floor_impl)
+JS_DEFINE_BINARY_BUILTIN_CALL_EXECUTE_IMPL(MathImul, MathObject::imul_impl)
+JS_DEFINE_NULLARY_BUILTIN_CALL_EXECUTE_IMPL(MathRandom, MathObject::random_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathRound, MathObject::round_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathSqrt, MathObject::sqrt_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathSin, MathObject::sin_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathCos, MathObject::cos_impl)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(MathTan, MathObject::tan_impl)
+JS_DEFINE_UNARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(RegExpPrototypeExec)
+JS_DEFINE_BINARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(RegExpPrototypeReplace)
+JS_DEFINE_BINARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(RegExpPrototypeSplit)
+JS_DEFINE_UNARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(OrdinaryHasInstance)
+JS_DEFINE_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(ArrayIteratorPrototypeNext)
+JS_DEFINE_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(MapIteratorPrototypeNext)
+JS_DEFINE_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(SetIteratorPrototypeNext)
+JS_DEFINE_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(StringIteratorPrototypeNext)
+JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL(StringFromCharCode, StringConstructor::from_char_code_impl)
+JS_DEFINE_UNARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(StringPrototypeCharCodeAt)
+JS_DEFINE_UNARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL(StringPrototypeCharAt)
+
+#undef JS_DEFINE_BINARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL
+#undef JS_DEFINE_UNARY_GENERIC_BUILTIN_CALL_EXECUTE_IMPL
+#undef JS_DEFINE_GENERIC_BUILTIN_CALL_EXECUTE_IMPL
+#undef JS_DEFINE_NULLARY_BUILTIN_CALL_EXECUTE_IMPL
+#undef JS_DEFINE_BINARY_BUILTIN_CALL_EXECUTE_IMPL
+#undef JS_DEFINE_UNARY_BUILTIN_CALL_EXECUTE_IMPL
 
 template<CallType call_type>
 NEVER_INLINE static ThrowCompletionOr<void> call_with_argument_array(
@@ -2839,17 +2993,17 @@ NEVER_INLINE static ThrowCompletionOr<void> call_with_argument_array(
     auto& vm = interpreter.vm();
     auto& function = callee.as_function();
 
-    auto& argument_array = arguments.as_array();
+    auto& argument_array = arguments.as_array_exotic_object();
     auto argument_array_length = argument_array.indexed_array_like_size();
 
     size_t argument_count = argument_array_length;
     size_t registers_and_locals_count = 0;
-    size_t constants_count = 0;
-    function.get_stack_frame_size(registers_and_locals_count, constants_count, argument_count);
+    ReadonlySpan<Value> constants;
+    function.get_stack_frame_info(registers_and_locals_count, constants, argument_count);
 
     auto& stack = vm.interpreter_stack();
     auto* stack_mark = stack.top();
-    auto* callee_context = stack.allocate(registers_and_locals_count, constants_count, max(argument_array_length, argument_count));
+    auto* callee_context = stack.allocate(registers_and_locals_count, constants, max(argument_array_length, argument_count));
     if (!callee_context) [[unlikely]]
         return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
     ScopeGuard deallocate_guard = [&stack, stack_mark] { stack.deallocate(stack_mark); };
@@ -2918,7 +3072,7 @@ ThrowCompletionOr<void> SuperCallWithArgumentArray::execute_impl(Bytecode::Inter
     auto& function = static_cast<FunctionObject&>(*func);
 
     // 4. Let argList be ? ArgumentListEvaluation of Arguments.
-    auto& argument_array = interpreter.get(m_arguments).as_array();
+    auto& argument_array = interpreter.get(m_arguments).as_array_exotic_object();
     size_t argument_array_length = 0;
 
     if (m_is_synthetic) {
@@ -2929,12 +3083,12 @@ ThrowCompletionOr<void> SuperCallWithArgumentArray::execute_impl(Bytecode::Inter
 
     size_t argument_count = argument_array_length;
     size_t registers_and_locals_count = 0;
-    size_t constants_count = 0;
-    function.get_stack_frame_size(registers_and_locals_count, constants_count, argument_count);
+    ReadonlySpan<Value> constants;
+    function.get_stack_frame_info(registers_and_locals_count, constants, argument_count);
 
     auto& stack = vm.interpreter_stack();
     auto* stack_mark = stack.top();
-    auto* callee_context = stack.allocate(registers_and_locals_count, constants_count, max(argument_array_length, argument_count));
+    auto* callee_context = stack.allocate(registers_and_locals_count, constants, max(argument_array_length, argument_count));
     if (!callee_context) [[unlikely]]
         return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
     ScopeGuard deallocate_guard = [&stack, stack_mark] { stack.deallocate(stack_mark); };
@@ -3122,11 +3276,10 @@ void Yield::execute_impl(Bytecode::Interpreter& interpreter) const
 void Await::execute_impl(Bytecode::Interpreter& interpreter) const
 {
     auto yielded_value = interpreter.get(m_argument).is_special_empty_value() ? js_undefined() : interpreter.get(m_argument);
-    // FIXME: If we get a pointer, which is not accurately representable as a double
-    //        will cause this to explode
-    auto continuation_value = Value(m_continuation_label.address());
-    auto result = interpreter.vm().heap().allocate<GeneratorResult>(yielded_value, continuation_value, true);
-    interpreter.do_return(result);
+    auto& context = interpreter.running_execution_context();
+    context.yield_continuation = m_continuation_label.address();
+    context.yield_is_await = true;
+    interpreter.do_return(yielded_value);
 }
 
 ThrowCompletionOr<void> GetByValue::execute_impl(Bytecode::Interpreter& interpreter) const
@@ -3197,10 +3350,8 @@ ThrowCompletionOr<void> GetMethod::execute_impl(Bytecode::Interpreter& interpret
 
 NEVER_INLINE ThrowCompletionOr<void> GetObjectPropertyIterator::execute_impl(Bytecode::Interpreter& interpreter) const
 {
-    auto iterator_record = TRY(get_object_property_iterator(interpreter, interpreter.get(m_object)));
-    interpreter.set(m_dst_iterator_object, iterator_record.iterator);
-    interpreter.set(m_dst_iterator_next, iterator_record.next_method);
-    interpreter.set(m_dst_iterator_done, Value(iterator_record.done));
+    auto* cache = bit_cast<ObjectPropertyIteratorCache*>(m_cache);
+    interpreter.set(m_dst_iterator, TRY(get_object_property_iterator(interpreter, interpreter.get(m_object), cache)));
     return {};
 }
 
@@ -3247,6 +3398,18 @@ ThrowCompletionOr<void> IteratorNextUnpack::execute_impl(Bytecode::Interpreter& 
     auto& iteration_result = iteration_result_or_done.get<IterationResult>();
     interpreter.set(m_dst_done, TRY(iteration_result.done));
     interpreter.set(m_dst_value, TRY(iteration_result.value));
+    return {};
+}
+
+ThrowCompletionOr<void> ObjectPropertyIteratorNext::execute_impl(Bytecode::Interpreter& interpreter) const
+{
+    auto& iterator = static_cast<PropertyNameIterator&>(interpreter.get(m_iterator_object).as_object());
+    Value value;
+    bool done = false;
+    TRY(iterator.next(interpreter.vm(), done, value));
+    interpreter.set(m_dst_done, Value(done));
+    if (!done)
+        interpreter.set(m_dst_value, value);
     return {};
 }
 

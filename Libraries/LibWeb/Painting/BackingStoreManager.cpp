@@ -5,30 +5,16 @@
  */
 
 #include <LibCore/Timer.h>
-#include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
+#include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SkiaBackendContext.h>
 #include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/Painting/BackingStoreManager.h>
 #include <WebContent/PageClient.h>
 
-#ifdef AK_OS_MACOS
-#    include <LibCore/IOSurface.h>
-#    include <LibCore/MachPort.h>
-#    include <LibCore/Platform/MachMessageTypes.h>
-#endif
-
 namespace Web::Painting {
 
 GC_DEFINE_ALLOCATOR(BackingStoreManager);
-
-#ifdef AK_OS_MACOS
-static Optional<Core::MachPort> s_browser_mach_port;
-void BackingStoreManager::set_browser_mach_port(Core::MachPort&& port)
-{
-    s_browser_mach_port = move(port);
-}
-#endif
 
 BackingStoreManager::BackingStoreManager(HTML::Navigable& navigable)
     : m_navigable(navigable)
@@ -55,91 +41,46 @@ void BackingStoreManager::reallocate_backing_stores(Gfx::IntSize size)
 
     RefPtr<Gfx::PaintingSurface> front_store;
     RefPtr<Gfx::PaintingSurface> back_store;
-
-#ifdef AK_OS_MACOS
-    if (skia_backend_context && s_browser_mach_port.has_value()) {
-        auto back_iosurface = Core::IOSurfaceHandle::create(size.width(), size.height());
-        auto back_iosurface_port = back_iosurface.create_mach_port();
-
-        auto front_iosurface = Core::IOSurfaceHandle::create(size.width(), size.height());
-        auto front_iosurface_port = front_iosurface.create_mach_port();
-
-        m_front_bitmap_id = m_next_bitmap_id++;
-        m_back_bitmap_id = m_next_bitmap_id++;
-
-        auto& page_client = m_navigable->top_level_traversable()->page().client();
-
-        Core::Platform::BackingStoreMetadata metadata;
-        metadata.page_id = page_client.id();
-        metadata.front_backing_store_id = m_front_bitmap_id;
-        metadata.back_backing_store_id = m_back_bitmap_id;
-
-        Core::Platform::MessageWithBackingStores message;
-
-        message.header.msgh_remote_port = s_browser_mach_port->port();
-        message.header.msgh_local_port = MACH_PORT_NULL;
-        message.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
-        message.header.msgh_size = sizeof(message);
-        message.header.msgh_id = Core::Platform::BACKING_STORE_IOSURFACES_MESSAGE_ID;
-
-        message.body.msgh_descriptor_count = 2;
-
-        message.front_descriptor.name = front_iosurface_port.release();
-        message.front_descriptor.disposition = MACH_MSG_TYPE_MOVE_SEND;
-        message.front_descriptor.type = MACH_MSG_PORT_DESCRIPTOR;
-
-        message.back_descriptor.name = back_iosurface_port.release();
-        message.back_descriptor.disposition = MACH_MSG_TYPE_MOVE_SEND;
-        message.back_descriptor.type = MACH_MSG_PORT_DESCRIPTOR;
-
-        message.metadata = metadata;
-
-        mach_msg_timeout_t const timeout = 100; // milliseconds
-        auto const send_result = mach_msg(&message.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, message.header.msgh_size, 0, MACH_PORT_NULL, timeout, MACH_PORT_NULL);
-        if (send_result != KERN_SUCCESS) {
-            dbgln("Failed to send message to server: {}", mach_error_string(send_result));
-            VERIFY_NOT_REACHED();
-        }
-
-        front_store = Gfx::PaintingSurface::create_from_iosurface(move(front_iosurface), *skia_backend_context);
-        back_store = Gfx::PaintingSurface::create_from_iosurface(move(back_iosurface), *skia_backend_context);
-
-        m_allocated_size = size;
-
-        m_navigable->rendering_thread().update_backing_stores(front_store, back_store, m_front_bitmap_id, m_back_bitmap_id);
-
-        return;
-    }
-#endif
+    auto front_buffer = Gfx::SharedImageBuffer::create(size);
+    auto back_buffer = Gfx::SharedImageBuffer::create(size);
 
     m_front_bitmap_id = m_next_bitmap_id++;
     m_back_bitmap_id = m_next_bitmap_id++;
 
-    auto front_bitmap = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, size).release_value();
-    auto back_bitmap = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, size).release_value();
+    if (m_navigable->is_top_level_traversable()) {
+        auto& page_client = m_navigable->top_level_traversable()->page().client();
+        page_client.page_did_allocate_backing_stores(m_front_bitmap_id, front_buffer.export_shared_image(), m_back_bitmap_id, back_buffer.export_shared_image());
+    }
 
-#ifdef USE_VULKAN
+#ifdef AK_OS_MACOS
+    if (skia_backend_context) {
+        front_store = Gfx::PaintingSurface::create_from_shared_image_buffer(front_buffer, *skia_backend_context);
+        back_store = Gfx::PaintingSurface::create_from_shared_image_buffer(back_buffer, *skia_backend_context);
+    } else {
+        front_store = Gfx::PaintingSurface::wrap_bitmap(*front_buffer.bitmap());
+        back_store = Gfx::PaintingSurface::wrap_bitmap(*back_buffer.bitmap());
+    }
+#else
+#    ifdef USE_VULKAN
     if (skia_backend_context) {
         front_store = Gfx::PaintingSurface::create_with_size(size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied);
-        front_store->on_flush = [front_bitmap](auto& surface) {
+        auto front_bitmap = front_buffer.bitmap();
+        front_store->on_flush = [front_bitmap = move(front_bitmap)](auto& surface) {
             surface.read_into_bitmap(*front_bitmap);
         };
         back_store = Gfx::PaintingSurface::create_with_size(size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied);
-        back_store->on_flush = [back_bitmap](auto& surface) {
+        auto back_bitmap = back_buffer.bitmap();
+        back_store->on_flush = [back_bitmap = move(back_bitmap)](auto& surface) {
             surface.read_into_bitmap(*back_bitmap);
         };
     }
-#endif
+#    endif
 
     if (!front_store)
-        front_store = Gfx::PaintingSurface::wrap_bitmap(*front_bitmap);
+        front_store = Gfx::PaintingSurface::wrap_bitmap(*front_buffer.bitmap());
     if (!back_store)
-        back_store = Gfx::PaintingSurface::wrap_bitmap(*back_bitmap);
-
-    if (m_navigable->is_top_level_traversable()) {
-        auto& page_client = m_navigable->top_level_traversable()->page().client();
-        page_client.page_did_allocate_backing_stores(m_front_bitmap_id, front_bitmap->to_shareable_bitmap(), m_back_bitmap_id, back_bitmap->to_shareable_bitmap());
-    }
+        back_store = Gfx::PaintingSurface::wrap_bitmap(*back_buffer.bitmap());
+#endif
 
     m_allocated_size = size;
 
@@ -148,7 +89,7 @@ void BackingStoreManager::reallocate_backing_stores(Gfx::IntSize size)
 
 void BackingStoreManager::resize_backing_stores_if_needed(WindowResizingInProgress window_resize_in_progress)
 {
-    if (!m_navigable->is_top_level_traversable() || m_navigable->is_svg_page())
+    if (m_navigable->is_svg_page())
         return;
 
     auto viewport_size = m_navigable->page().css_to_device_rect(m_navigable->viewport_rect()).size();
@@ -157,7 +98,7 @@ void BackingStoreManager::resize_backing_stores_if_needed(WindowResizingInProgre
 
     Web::DevicePixelSize minimum_needed_size;
     bool force_reallocate = false;
-    if (window_resize_in_progress == WindowResizingInProgress::Yes) {
+    if (window_resize_in_progress == WindowResizingInProgress::Yes && m_navigable->is_top_level_traversable()) {
         // Pad the minimum needed size so that we don't have to keep reallocating backing stores while the window is being resized.
         minimum_needed_size = { viewport_size.width() + 256, viewport_size.height() + 256 };
     } else {

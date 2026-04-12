@@ -5,13 +5,17 @@
  */
 
 #include <LibJS/Bytecode/AsmInterpreter/AsmInterpreter.h>
+#include <LibJS/Bytecode/Builtins.h>
 #include <LibJS/Bytecode/Instruction.h>
 #include <LibJS/Bytecode/Interpreter.h>
 #include <LibJS/Bytecode/Op.h>
 #include <LibJS/Bytecode/PropertyAccess.h>
+#include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/DeclarativeEnvironment.h>
 #include <LibJS/Runtime/ECMAScriptFunctionObject.h>
 #include <LibJS/Runtime/ModuleEnvironment.h>
+#include <LibJS/Runtime/PrimitiveString.h>
+#include <LibJS/Runtime/Reference.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibJS/Runtime/ValueInlines.h>
@@ -236,7 +240,12 @@ i64 asm_try_set_global_env_binding(Interpreter*, u32 pc);
 i64 asm_slow_path_get_global(Interpreter*, u32 pc);
 i64 asm_slow_path_set_global(Interpreter*, u32 pc);
 i64 asm_slow_path_call(Interpreter*, u32 pc);
-i64 asm_slow_path_call_builtin(Interpreter*, u32 pc);
+#define DECLARE_CALL_BUILTIN_SLOW_PATH(name, snake_case_name, ...) \
+    i64 asm_slow_path_call_builtin_##snake_case_name(Interpreter*, u32 pc);
+JS_ENUMERATE_BUILTINS(DECLARE_CALL_BUILTIN_SLOW_PATH)
+#undef DECLARE_CALL_BUILTIN_SLOW_PATH
+i64 asm_slow_path_get_object_property_iterator(Interpreter*, u32 pc);
+i64 asm_slow_path_object_property_iterator_next(Interpreter*, u32 pc);
 i64 asm_slow_path_call_construct(Interpreter*, u32 pc);
 i64 asm_slow_path_new_object(Interpreter*, u32 pc);
 i64 asm_slow_path_cache_object_shape(Interpreter*, u32 pc);
@@ -255,8 +264,12 @@ i64 asm_slow_path_unary_minus(Interpreter*, u32 pc);
 i64 asm_slow_path_postfix_decrement(Interpreter*, u32 pc);
 i64 asm_slow_path_to_int32(Interpreter*, u32 pc);
 i64 asm_slow_path_put_by_value(Interpreter*, u32 pc);
+i64 asm_try_put_by_value_holey_array(Interpreter*, u32 pc);
 u64 asm_helper_to_boolean(u64 encoded_value);
 u64 asm_helper_math_exp(u64 encoded_value);
+u64 asm_helper_empty_string(u64);
+u64 asm_helper_single_ascii_character_string(u64 encoded_value);
+u64 asm_helper_single_utf16_code_unit_string(u64 encoded_value);
 i64 asm_try_inline_call(Interpreter*, u32 pc);
 i64 asm_pop_inline_frame(Interpreter*, u32 pc);
 i64 asm_pop_inline_frame_end(Interpreter*, u32 pc);
@@ -411,6 +424,8 @@ i64 asm_fallback_handler(Interpreter* interp, u32 pc)
         return execute_throwing<Op::GetMethod>(*interp, pc);
     case Instruction::Type::GetObjectPropertyIterator:
         return execute_throwing<Op::GetObjectPropertyIterator>(*interp, pc);
+    case Instruction::Type::ObjectPropertyIteratorNext:
+        return execute_throwing<Op::ObjectPropertyIteratorNext>(*interp, pc);
     case Instruction::Type::HasPrivateId:
         return execute_throwing<Op::HasPrivateId>(*interp, pc);
     case Instruction::Type::ImportCall:
@@ -694,10 +709,23 @@ i64 asm_slow_path_call(Interpreter* interp, u32 pc)
     return slow_path_throwing<Op::Call>(*interp, pc);
 }
 
-i64 asm_slow_path_call_builtin(Interpreter* interp, u32 pc)
+i64 asm_slow_path_get_object_property_iterator(Interpreter* interp, u32 pc)
 {
-    return slow_path_throwing<Op::CallBuiltin>(*interp, pc);
+    return slow_path_throwing<Op::GetObjectPropertyIterator>(*interp, pc);
 }
+
+i64 asm_slow_path_object_property_iterator_next(Interpreter* interp, u32 pc)
+{
+    return slow_path_throwing<Op::ObjectPropertyIteratorNext>(*interp, pc);
+}
+
+#define DEFINE_CALL_BUILTIN_SLOW_PATH(name, snake_case_name, ...)                 \
+    i64 asm_slow_path_call_builtin_##snake_case_name(Interpreter* interp, u32 pc) \
+    {                                                                             \
+        return slow_path_throwing<Op::CallBuiltin##name>(*interp, pc);            \
+    }
+JS_ENUMERATE_BUILTINS(DEFINE_CALL_BUILTIN_SLOW_PATH)
+#undef DEFINE_CALL_BUILTIN_SLOW_PATH
 
 i64 asm_slow_path_call_construct(Interpreter* interp, u32 pc)
 {
@@ -791,6 +819,39 @@ i64 asm_slow_path_to_int32(Interpreter* interp, u32 pc)
 i64 asm_slow_path_put_by_value(Interpreter* interp, u32 pc)
 {
     return slow_path_throwing<Op::PutByValue>(*interp, pc);
+}
+
+i64 asm_try_put_by_value_holey_array(Interpreter* interp, u32 pc)
+{
+    auto* bytecode = interp->current_executable().bytecode.data();
+    auto& insn = *reinterpret_cast<Op::PutByValue const*>(&bytecode[pc]);
+
+    auto base = interp->get(insn.base());
+    if (!base.is_object()) [[unlikely]]
+        return 1;
+
+    auto property = interp->get(insn.property());
+    if (!property.is_non_negative_int32()) [[unlikely]]
+        return 1;
+
+    auto& object = base.as_object();
+    if (!is<JS::Array>(object)) [[unlikely]]
+        return 1;
+
+    auto& array = static_cast<JS::Array&>(object);
+    if (array.is_proxy_target()
+        || !array.default_prototype_chain_intact()
+        || !array.extensible()
+        || array.may_interfere_with_indexed_property_access()
+        || array.indexed_storage_kind() != IndexedStorageKind::Holey) [[unlikely]]
+        return 1;
+
+    auto index = static_cast<u32>(property.as_i32());
+    if (index >= array.indexed_array_like_size()) [[unlikely]]
+        return 1;
+
+    array.indexed_put(index, interp->get(insn.src()));
+    return 0;
 }
 
 // Try to inline a JS-to-JS call. Returns 0 on success (callee frame pushed),
@@ -1234,6 +1295,22 @@ u64 asm_helper_math_exp(u64 encoded_value)
 {
     auto value = bit_cast<Value>(encoded_value);
     return bit_cast<u64>(Value(::exp(value.as_double())));
+}
+
+u64 asm_helper_empty_string(u64)
+{
+    return bit_cast<u64>(Value(&Interpreter::vm().empty_string()));
+}
+
+u64 asm_helper_single_ascii_character_string(u64 encoded_value)
+{
+    return bit_cast<u64>(Value(&Interpreter::vm().single_ascii_character_string(static_cast<u8>(encoded_value))));
+}
+
+u64 asm_helper_single_utf16_code_unit_string(u64 encoded_value)
+{
+    char16_t code_unit = static_cast<char16_t>(encoded_value);
+    return bit_cast<u64>(Value(PrimitiveString::create(Interpreter::vm(), Utf16View(&code_unit, 1))));
 }
 
 } // extern "C"

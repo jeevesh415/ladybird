@@ -18,6 +18,7 @@
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleScope.h>
+#include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Page/Page.h>
 
@@ -94,9 +95,7 @@ void StyleScope::build_rule_cache()
     m_selector_insights = make<SelectorInsights>();
     m_style_invalidation_data = make<StyleInvalidationData>();
 
-    if (auto user_style_source = document().page().user_style(); user_style_source.has_value()) {
-        m_user_style_sheet = GC::make_root(parse_css_stylesheet(CSS::Parser::ParsingParams(document()), user_style_source.value()));
-    }
+    build_user_style_sheet_if_needed();
 
     build_qualified_layer_names_cache();
 
@@ -114,6 +113,7 @@ void StyleScope::build_rule_cache()
 
 void StyleScope::invalidate_rule_cache()
 {
+    document().invalidate_counter_style_cache();
     m_author_rule_cache = nullptr;
 
     // NOTE: We could be smarter about keeping the user rule cache, and style sheet.
@@ -128,6 +128,15 @@ void StyleScope::invalidate_rule_cache()
 
     m_pseudo_class_rule_cache = {};
     m_style_invalidation_data = nullptr;
+}
+
+void StyleScope::build_user_style_sheet_if_needed()
+{
+    if (m_user_style_sheet)
+        return;
+
+    if (auto user_style_source = document().page().user_style(); user_style_source.has_value())
+        m_user_style_sheet = GC::make_root(parse_css_stylesheet(CSS::Parser::ParsingParams(document()), user_style_source.value()));
 }
 
 void StyleScope::build_rule_cache_if_needed() const
@@ -187,8 +196,10 @@ void StyleScope::for_each_stylesheet(CascadeOrigin cascade_origin, Function<void
         callback(svg_stylesheet());
     }
     if (cascade_origin == CascadeOrigin::User) {
-        if (m_user_style_sheet)
-            callback(*m_user_style_sheet);
+        auto& style_scope = const_cast<StyleScope&>(*this);
+        style_scope.build_user_style_sheet_if_needed();
+        if (style_scope.m_user_style_sheet)
+            callback(*style_scope.m_user_style_sheet);
     }
     if (cascade_origin == CascadeOrigin::Author) {
         for_each_active_css_style_sheet(move(callback));
@@ -233,36 +244,27 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
 
             for (CSS::Selector const& selector : absolutized_selectors) {
                 MatchingRule matching_rule {
-                    scope_shadow_root,
-                    &rule,
-                    sheet,
-                    sheet.default_namespace(),
-                    selector,
-                    style_sheet_index,
-                    rule_index,
-                    selector.specificity(),
-                    cascade_origin,
-                    false,
+                    .shadow_root = scope_shadow_root,
+                    .rule = &rule,
+                    .sheet = sheet,
+                    .default_namespace = sheet.default_namespace(),
+                    .selector = selector,
+                    .style_sheet_index = style_sheet_index,
+                    .rule_index = rule_index,
+                    .specificity = selector.specificity(),
+                    .cascade_origin = cascade_origin,
+                    .contains_pseudo_element = selector.target_pseudo_element().has_value(),
+                    .slotted = selector.is_slotted(),
+                    .contains_part_pseudo_element = selector.has_part_pseudo_element(),
                 };
 
                 auto const& qualified_layer_name = matching_rule.qualified_layer_name();
                 auto& rule_cache = qualified_layer_name.is_empty() ? rule_caches.main : *rule_caches.by_layer.ensure(qualified_layer_name, [] { return make<RuleCache>(); });
 
-                bool contains_root_pseudo_class = false;
-                Optional<CSS::PseudoElement> pseudo_element;
-
                 collect_selector_insights(selector, insights);
 
+                bool contains_root_pseudo_class = false;
                 for (auto const& simple_selector : selector.compound_selectors().last().simple_selectors) {
-                    if (!matching_rule.contains_pseudo_element) {
-                        if (simple_selector.type == CSS::Selector::SimpleSelector::Type::PseudoElement) {
-                            matching_rule.contains_pseudo_element = true;
-                            // FIXME: This wrongly assumes there is only one pseudo-element per selector.
-                            pseudo_element = simple_selector.pseudo_element().type();
-                            matching_rule.slotted = pseudo_element == PseudoElement::Slotted;
-                            matching_rule.contains_part_pseudo_element = pseudo_element == PseudoElement::Part;
-                        }
-                    }
                     if (!contains_root_pseudo_class) {
                         if (simple_selector.type == CSS::Selector::SimpleSelector::Type::PseudoClass
                             && simple_selector.pseudo_class().type == CSS::PseudoClass::Root) {
@@ -282,7 +284,7 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                     }
                 }
 
-                rule_cache.add_rule(matching_rule, pseudo_element, contains_root_pseudo_class);
+                rule_cache.add_rule(matching_rule, selector.target_pseudo_element().map([](auto& it) { return it.type(); }), contains_root_pseudo_class);
             }
             ++rule_index;
         });
@@ -300,6 +302,23 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                 auto key = static_cast<u64>(keyframe.key().value() * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor);
                 auto const& keyframe_style = *keyframe.style();
                 for (auto const& it : keyframe_style.properties()) {
+                    if (it.property_id == PropertyID::AnimationTimingFunction) {
+                        // animation-timing-function is a list property, but inside @keyframes only
+                        // a single value is meaningful.
+                        NonnullRefPtr<StyleValue const> easing_value = it.value;
+                        if (easing_value->is_value_list()) {
+                            auto const& list = easing_value->as_value_list();
+                            if (list.size() > 0)
+                                easing_value = list.value_at(0, false);
+                            else
+                                continue;
+                        }
+                        if (easing_value->is_easing() || easing_value->is_keyword())
+                            resolved_keyframe.easing = EasingFunction::from_style_value(*easing_value);
+                        else
+                            resolved_keyframe.easing = easing_value;
+                        continue;
+                    }
                     if (it.property_id == PropertyID::AnimationComposition) {
                         auto composition_str = it.value->to_string(SerializationMode::Normal);
                         AnimationComposition composition = AnimationComposition::Replace;
@@ -320,7 +339,16 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                     });
                 }
 
-                keyframe_set->keyframes_by_key.insert(key, resolved_keyframe);
+                if (auto* existing_keyframe = keyframe_set->keyframes_by_key.find(key)) {
+                    for (auto& [property_id, value] : resolved_keyframe.properties)
+                        existing_keyframe->properties.set(property_id, move(value));
+                    if (resolved_keyframe.composite != Bindings::CompositeOperationOrAuto::Auto)
+                        existing_keyframe->composite = resolved_keyframe.composite;
+                    if (!resolved_keyframe.easing.has<Empty>())
+                        existing_keyframe->easing = move(resolved_keyframe.easing);
+                } else {
+                    keyframe_set->keyframes_by_key.insert(key, resolved_keyframe);
+                }
             }
 
             Animations::KeyframeEffect::generate_initial_and_final_frames(keyframe_set, animated_properties);
@@ -413,9 +441,12 @@ void StyleScope::build_qualified_layer_names_cache()
                 // Ignore everything else
             case CSSRule::Type::Style:
             case CSSRule::Type::Media:
+            case CSSRule::Type::Container:
             case CSSRule::Type::CounterStyle:
             case CSSRule::Type::FontFace:
             case CSSRule::Type::FontFeatureValues:
+            case CSSRule::Type::Function:
+            case CSSRule::Type::FunctionDeclarations:
             case CSSRule::Type::Keyframes:
             case CSSRule::Type::Keyframe:
             case CSSRule::Type::Margin:

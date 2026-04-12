@@ -40,7 +40,6 @@
     __JS_ENUMERATE(Promise, promise, PromisePrototype, PromiseConstructor, void)                                                               \
     __JS_ENUMERATE(RegExpObject, regexp, RegExpPrototype, RegExpConstructor, void)                                                             \
     __JS_ENUMERATE(Set, set, SetPrototype, SetConstructor, void)                                                                               \
-    __JS_ENUMERATE(ShadowRealm, shadow_realm, ShadowRealmPrototype, ShadowRealmConstructor, void)                                              \
     __JS_ENUMERATE(SharedArrayBuffer, shared_array_buffer, SharedArrayBufferPrototype, SharedArrayBufferConstructor, void)                     \
     __JS_ENUMERATE(StringObject, string, StringPrototype, StringConstructor, void)                                                             \
     __JS_ENUMERATE(SuppressedError, suppressed_error, SuppressedErrorPrototype, SuppressedErrorConstructor, void)                              \
@@ -163,7 +162,6 @@ enum class ThisBindingStatus : u8 {
     Uninitialized,
 };
 
-class ASTNode;
 class Accessor;
 class Agent;
 struct AsyncGeneratorRequest;
@@ -171,7 +169,6 @@ class BigInt;
 class BoundFunction;
 class BuiltinIterator;
 class Cell;
-class ClassExpression;
 struct ClassFieldDefinition;
 class Completion;
 class Console;
@@ -183,36 +180,25 @@ struct DisposableResource;
 class ECMAScriptFunctionObject;
 class Environment;
 class Error;
+class ErrorData;
 class ErrorType;
 struct ExecutionContext;
 struct ExportEntry;
-class ExportStatement;
-class Expression;
-class ForStatement;
 class FunctionEnvironment;
-class FunctionNode;
-struct FunctionParameter;
-class FunctionParameters;
 class GlobalEnvironment;
 class GlobalObject;
 struct GraphLoadingState;
 struct ImportEntry;
-class ImportStatement;
-class Identifier;
 class Intrinsics;
 class IteratorRecord;
-class MemberExpression;
-class MetaProperty;
 class ModuleEnvironment;
 class Module;
 struct ModuleRequest;
 class NativeFunction;
 class NativeJavaScriptBackedFunction;
 class ObjectEnvironment;
-class Parser;
 struct ParserError;
 class PrimitiveString;
-class Program;
 class PromiseCapability;
 class PromiseReaction;
 class PropertyAttributes;
@@ -220,11 +206,9 @@ class PropertyDescriptor;
 class PropertyKey;
 class Realm;
 class Reference;
-class ScopeNode;
 class Script;
 class Shape;
 class SharedFunctionInstanceData;
-class Statement;
 class StringOrSymbol;
 class SourceCode;
 struct SourceRange;

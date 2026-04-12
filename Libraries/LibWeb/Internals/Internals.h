@@ -41,6 +41,7 @@ public:
     WebIDL::ExceptionOr<String> set_time_zone(StringView time_zone);
 
     void gc();
+    GC::Ref<WebIDL::Promise> gc_async();
     JS::Object* hit_test(double x, double y);
 
     void send_text(HTML::HTMLElement&, String const&, WebIDL::UnsignedShort modifiers);
@@ -92,6 +93,7 @@ public:
     String dump_paintable_tree(GC::Ref<DOM::Node>);
     String dump_stacking_context_tree();
     String dump_gc_graph();
+    String dump_session_history();
 
     GC::Ptr<DOM::ShadowRoot> get_shadow_root(GC::Ref<DOM::Element>);
 

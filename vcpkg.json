@@ -113,6 +113,7 @@
       "name": "mman",
       "platform": "windows"
     },
+    "mimalloc",
     "openssl",
     {
       "name": "pthread",
@@ -310,6 +311,10 @@
       "version": "2.13.8#1"
     },
     {
+      "name": "mimalloc",
+      "version": "2.2.7"
+    },
+    {
       "name": "mman",
       "version": "git-f5ff813#5"
     },
@@ -347,7 +352,7 @@
     },
     {
       "name": "sqlite3",
-      "version": "3.50.4#0"
+      "version": "3.52.0#0"
     },
     {
       "name": "tiff",

@@ -511,6 +511,7 @@ if (!hasTestWaitClass()) {{
 }} else {{
     const observer = new MutationObserver(() => {{
         if (!hasTestWaitClass()) {{
+            observer.disconnect();
             internals.signalTestIsDone("PASS");
         }}
     }});
@@ -735,12 +736,9 @@ static void expand_test_with_variants(TestRunContext& context, size_t base_test_
     context.total_tests += variants.size() - 1;
 }
 
-static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url, int timeout_in_milliseconds)
+static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url)
 {
     auto test_index = test.index;
-    test.timeout_timer = Core::Timer::create_single_shot(timeout_in_milliseconds, [&view, test_index]() {
-        view.on_test_complete({ test_index, TestResult::Timeout });
-    });
 
     auto handle_completed_test = [&context, test_index, url]() -> ErrorOr<TestResult> {
         auto& test = context.tests[test_index];
@@ -912,14 +910,7 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
         };
     }
 
-    view.on_set_test_timeout = [&context, test_index, timeout_in_milliseconds](double milliseconds) {
-        auto& test = context.tests[test_index];
-        if (milliseconds > timeout_in_milliseconds)
-            test.timeout_timer->restart(AK::clamp_to<int>(milliseconds));
-    };
-
     view.load(url);
-    test.timeout_timer->start();
 }
 
 static ErrorOr<void> dump_screenshot_to_file(Gfx::Bitmap const& bitmap, StringView path)
@@ -958,12 +949,9 @@ static ErrorOr<void> write_screenshot_failure_results(Test& test, Gfx::Bitmap co
     return {};
 }
 
-static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url, int timeout_in_milliseconds)
+static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url)
 {
     auto test_index = test.index;
-    test.timeout_timer = Core::Timer::create_single_shot(timeout_in_milliseconds, [&view, test_index]() {
-        view.on_test_complete({ test_index, TestResult::Timeout });
-    });
 
     auto handle_completed_test = [&view, &context, test_index, url]() -> ErrorOr<TestResult> {
         auto& test = context.tests[test_index];
@@ -985,8 +973,24 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
             view.on_test_complete({ test_index, result.value() });
     };
 
-    view.on_load_finish = [&view](auto const&) {
-        view.run_javascript(wait_for_reftest_completion);
+    view.on_load_finish = [&view, &context, test_index, url](auto const& loaded_url) {
+        auto& test = context.tests[test_index];
+
+        // We don't want subframe loads to trigger this.
+        if (test.ref_test_expectation_url.has_value()) {
+            // Match against the expectation URL.
+            if (!test.ref_test_expectation_url->equals(loaded_url, URL::ExcludeFragment::Yes))
+                return;
+        } else {
+            // Match against the test URL.
+            if (!url.equals(loaded_url, URL::ExcludeFragment::Yes))
+                return;
+        }
+
+        if (!test.did_inject_js) {
+            test.did_inject_js = true;
+            view.run_javascript(wait_for_reftest_completion);
+        }
     };
 
     view.on_test_finish = [&view, &context, test_index, on_test_complete = move(on_test_complete)](auto const&) {
@@ -1056,25 +1060,18 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
             test.ref_test_expectation_type = RefTestExpectationType::Mismatch;
             reference_to_load = mismatch_references->at(0).as_string();
         }
-        view.load(URL::Parser::basic_parse(reference_to_load).release_value());
-    };
-
-    view.on_set_test_timeout = [&context, test_index, timeout_in_milliseconds](double milliseconds) {
-        auto& test = context.tests[test_index];
-        if (milliseconds > timeout_in_milliseconds)
-            test.timeout_timer->restart(AK::clamp_to<int>(milliseconds));
+        // Clear flag so we can inject the JS into the reference page.
+        test.ref_test_expectation_url = URL::Parser::basic_parse(reference_to_load).release_value();
+        test.did_inject_js = false;
+        view.load(test.ref_test_expectation_url.value());
     };
 
     view.load(url);
-    test.timeout_timer->start();
 }
 
-static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url, int timeout_in_milliseconds)
+static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url)
 {
     auto test_index = test.index;
-    test.timeout_timer = Core::Timer::create_single_shot(timeout_in_milliseconds, [&view, test_index]() {
-        view.on_test_complete({ test_index, TestResult::Timeout });
-    });
 
     auto handle_completed_test = [&context, test_index, url]() -> ErrorOr<TestResult> {
         auto& test = context.tests[test_index];
@@ -1133,8 +1130,16 @@ static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test
             view.on_test_complete({ test_index, result.value() });
     };
 
-    view.on_load_finish = [&view](auto const&) {
-        view.run_javascript(wait_for_reftest_completion);
+    view.on_load_finish = [&view, &context, test_index, url](auto const& loaded_url) {
+        // We don't want subframe loads to trigger this.
+        if (!url.equals(loaded_url, URL::ExcludeFragment::Yes))
+            return;
+
+        auto& test = context.tests[test_index];
+        if (!test.did_inject_js) {
+            test.did_inject_js = true;
+            view.run_javascript(wait_for_reftest_completion);
+        }
     };
 
     view.on_test_finish = [&view, &context, test_index, on_test_complete = move(on_test_complete)](auto const&) {
@@ -1170,19 +1175,30 @@ static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test
         });
     };
 
-    view.on_set_test_timeout = [&context, test_index, timeout_in_milliseconds](double milliseconds) {
-        auto& test = context.tests[test_index];
-        if (milliseconds > timeout_in_milliseconds)
-            test.timeout_timer->restart(milliseconds);
-    };
-
     view.load(url);
-    test.timeout_timer->start();
 }
 
 static void run_test(TestWebView& view, TestRunContext& context, size_t test_index, Application& app)
 {
     s_current_test_index_by_view.set(&view, test_index);
+
+    auto& test = context.tests[test_index];
+    auto timeout_in_milliseconds = app.per_test_timeout_in_seconds * 1000;
+
+    test.timeout_timer = Core::Timer::create_single_shot(timeout_in_milliseconds, [&view, &context, test_index]() {
+        auto& test = context.tests[test_index];
+        if (!test.did_start_test)
+            dbgln("Timeout during pre-navigation for {}, WebContent process may be unresponsive", test.relative_path);
+
+        view.on_test_complete({ test_index, TestResult::Timeout });
+    });
+    test.timeout_timer->start();
+
+    view.on_set_test_timeout = [&context, test_index, timeout_in_milliseconds](double milliseconds) {
+        auto& test = context.tests[test_index];
+        if (milliseconds > timeout_in_milliseconds)
+            test.timeout_timer->restart(AK::clamp_to<int>(milliseconds));
+    };
 
     // Clear the current document.
     // FIXME: Implement a debug-request to do this more thoroughly.
@@ -1201,6 +1217,8 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
 
     promise->when_resolved([&view, test_index, &app, &context](auto) {
         auto& test = context.tests[test_index];
+        test.did_start_test = true;
+
         auto real_path = MUST(FileSystem::real_path(test.input_path));
         auto headers_path = ByteString::formatted("{}.headers", real_path);
 
@@ -1225,13 +1243,13 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
         case TestMode::Crash:
         case TestMode::Text:
         case TestMode::Layout:
-            run_dump_test(view, context, test, *url, app.per_test_timeout_in_seconds * 1000);
+            run_dump_test(view, context, test, *url);
             return;
         case TestMode::Ref:
-            run_ref_test(view, context, test, *url, app.per_test_timeout_in_seconds * 1000);
+            run_ref_test(view, context, test, *url);
             return;
         case TestMode::Screenshot:
-            run_screenshot_test(view, context, test, *url, app.per_test_timeout_in_seconds * 1000);
+            run_screenshot_test(view, context, test, *url);
             return;
         }
 
@@ -1448,7 +1466,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     s_is_tty = TRY(Core::System::isatty(STDOUT_FILENO));
 
     // When on TTY with live display, use the N-line display; otherwise use single-line or verbose
-    bool use_live_display = s_is_tty && app.verbosity < Application::VERBOSITY_LEVEL_LOG_TEST_OUTPUT;
+    bool use_live_display = !app.quiet && s_is_tty && app.verbosity < Application::VERBOSITY_LEVEL_LOG_TEST_OUTPUT;
 
     if (use_live_display) {
         update_terminal_size();
@@ -1565,11 +1583,13 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
                     s_view_display_states[view_id].start_time = test.start_time;
                 }
                 render_live_display();
-            } else if (app.verbosity >= Application::VERBOSITY_LEVEL_LOG_TEST_DURATION) {
-                outln("[{:{}}] {:{}}/{}:  Start {}", view_id, digits_for_view_id, test.index + 1, digits_for_test_id, tests.size(), test.relative_path);
-            } else {
-                // Non-TTY mode: print each test as it starts
-                outln("{}/{}: {}", test.index + 1, tests.size(), test.relative_path);
+            } else if (!app.quiet) {
+                if (app.verbosity >= Application::VERBOSITY_LEVEL_LOG_TEST_DURATION) {
+                    outln("[{:{}}] {:{}}/{}:  Start {}", view_id, digits_for_view_id, test.index + 1, digits_for_test_id, tests.size(), test.relative_path);
+                } else {
+                    // Non-TTY mode: print each test as it starts
+                    outln("{}/{}: {}", test.index + 1, tests.size(), test.relative_path);
+                }
             }
 
             // Reset promise and attach completion callback
@@ -1603,7 +1623,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
                     (void)write_output_for_test(test, capture);
                 }
 
-                if (app.verbosity >= Application::VERBOSITY_LEVEL_LOG_TEST_DURATION) {
+                if (!app.quiet && app.verbosity >= Application::VERBOSITY_LEVEL_LOG_TEST_DURATION) {
                     auto duration = test.end_time - test.start_time;
                     outln("[{:{}}] {:{}}/{}: Finish {}: {}ms", view_id, digits_for_view_id, test.index + 1, digits_for_test_id, tests.size(), test.relative_path, duration.to_milliseconds());
                 }
@@ -1752,7 +1772,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             outln("{}: {}", test_result_to_string(non_passing_test.result), test.relative_path);
     }
 
-    if (app.verbosity >= Application::VERBOSITY_LEVEL_LOG_SLOWEST_TESTS) {
+    if (!app.quiet && app.verbosity >= Application::VERBOSITY_LEVEL_LOG_SLOWEST_TESTS) {
         auto tests_to_print = min(10uz, tests.size());
         outln("\nSlowest {} tests:", tests_to_print);
 
@@ -1782,7 +1802,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     }
 
     // Generate result files (JSON data and HTML index)
-    if (app.verbosity < Application::VERBOSITY_LEVEL_LOG_TEST_OUTPUT || !non_passing_tests.is_empty()) {
+    if (app.quiet || app.verbosity < Application::VERBOSITY_LEVEL_LOG_TEST_OUTPUT || !non_passing_tests.is_empty()) {
         if (auto result = generate_result_files(tests, non_passing_tests); result.is_error())
             warnln("Failed to generate result files: {}", result.error());
         else

@@ -254,15 +254,13 @@ Ladybird will be built with one of the following browser frontends, depending on
 * [Qt](https://doc.qt.io/qt-6/) - The UI used on all other platforms.
 * [Android UI](https://developer.android.com/develop/ui) - The native UI on Android.
 
-The Qt UI is available on platforms where it is not the default as well (except on Android). To build the
-Qt UI, install the Qt dependencies for your platform, and enable the Qt UI via CMake:
+The Qt UI is available on platforms where it is not the default as well (except on Android).
+You can pick the UI using the `LADYBIRD_GUI_FRAMEWORK` option, for example to enable the Qt UI:
 
 ```bash
 # From /path/to/ladybird
-cmake --preset default -DENABLE_QT=ON
+cmake --preset Release -DLADYBIRD_GUI_FRAMEWORK=Qt
 ```
-
-To re-disable the Qt UI, run the above command with `-DENABLE_QT=OFF`.
 
 ### Build error messages you may encounter
 
@@ -304,7 +302,7 @@ to CMAKE_INSTALL_PREFIX. If it is not, things will break.
 
 ### Custom CMake build directory
 
-The script Meta/ladybird.py and the default preset in CMakePresets.json both define a build directory of
+The script Meta/ladybird.py and the Release preset in CMakePresets.json both define a build directory of
 `Build/release`. For distribution purposes, or when building multiple configurations, it may be useful to create a custom
 CMake build directory.
 
@@ -316,9 +314,9 @@ compiler (see [Build Prerequisites](BuildInstructionsLadybird.md#build-prerequis
 CMAKE_CXX_COMPILER cmake options.
 
 ```
-cmake --preset default -B MyBuildDir
+cmake --preset Release -B MyBuildDir
 # optionally, add -DCMAKE_CXX_COMPILER=<suitable compiler> -DCMAKE_C_COMPILER=<matching c compiler>
-cmake --build --preset default MyBuildDir
+cmake --build --preset Release MyBuildDir
 ninja -C MyBuildDir run-ladybird
 ```
 
@@ -330,7 +328,7 @@ If you wish to reduce the number of parallel link jobs, you may use the LAGOM_LI
 to set a maximum limit for the number of parallel link jobs.
 
 ```
-cmake --preset default -B MyBuildDir -DLAGOM_LINK_POOL_SIZE=2
+cmake --preset Release -B MyBuildDir -DLAGOM_LINK_POOL_SIZE=2
 ```
 
 ### Running manually

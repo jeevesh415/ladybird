@@ -17,6 +17,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImmutableBitmap.h>
 #include <LibJS/Runtime/NativeFunction.h>
+#include <LibJS/Runtime/Object.h>
 #include <LibURL/Parser.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibUnicode/Locale.h>
@@ -34,11 +35,13 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
+#include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
+#include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
@@ -64,6 +67,7 @@
 #include <LibWeb/HTML/HTMLButtonElement.h>
 #include <LibWeb/HTML/HTMLDialogElement.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
+#include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLFrameSetElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
@@ -146,6 +150,7 @@ void Element::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_class_list);
     visitor.visit(m_shadow_root);
     visitor.visit(m_part_list);
+    visitor.visit(m_custom_element_registry);
     visitor.visit(m_custom_element_definition);
     visitor.visit(m_custom_state_set);
     visitor.visit(m_cascaded_properties);
@@ -891,6 +896,23 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_style(bool& did_cha
         invalidation = CSS::RequiredInvalidationAfterStyleChange::full();
     }
 
+    // https://drafts.csswg.org/css-anchor-position-1/#determining
+    // Update the anchor name registry when anchor-name changes.
+    // FIXME: The tree root should be determined by the stylesheet origin, not the element's position in the tree.
+    if (is_connected()) {
+        auto& anchor_names = as_if<ShadowRoot>(root())
+            ? as<ShadowRoot>(root()).anchor_name_map()
+            : document().anchor_name_map();
+        if (m_computed_properties) {
+            m_computed_properties->for_each_anchor_name([&](FlyString const& name) {
+                anchor_names.unregister_name(name, *this);
+            });
+        }
+        new_computed_properties->for_each_anchor_name([&](FlyString const& name) {
+            anchor_names.register_name(name, *this);
+        });
+    }
+
     auto old_display_is_none = m_computed_properties ? m_computed_properties->display().is_none() : true;
     auto new_display_is_none = new_computed_properties->display().is_none();
 
@@ -985,7 +1007,8 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_inherited_style()
             // A property needs updating if:
             // - It uses relative units as it might have been affected by a change in ancestor element style.
             //   FIXME: Consider other style values that rely on relative lengths (e.g. CalculatedStyleValue,
-            //          StyleValues which contain lengths (e.g. StyleValueList))
+            //          StyleValues which contain lengths (e.g. StyleValueList)) - maybe we can use
+            //          `is_computationally_independent()`
             // - font-weight is `bolder` or `lighter`
             // - font-size is `larger` or `smaller`
             // FIXME: Consider any other properties that rely on inherited values for computation.
@@ -1067,7 +1090,7 @@ static bool is_valid_shadow_host_name(FlyString const& name)
 }
 
 // https://dom.spec.whatwg.org/#concept-attach-a-shadow-root
-WebIDL::ExceptionOr<void> Element::attach_a_shadow_root(Bindings::ShadowRootMode mode, bool clonable, bool serializable, bool delegates_focus, Bindings::SlotAssignmentMode slot_assignment)
+WebIDL::ExceptionOr<void> Element::attach_a_shadow_root(Bindings::ShadowRootMode mode, bool clonable, bool serializable, bool delegates_focus, Bindings::SlotAssignmentMode slot_assignment, GC::Ptr<HTML::CustomElementRegistry> registry)
 {
     // 1. If element’s namespace is not the HTML namespace, then throw a "NotSupportedError" DOMException.
     if (namespace_uri() != Namespace::HTML)
@@ -1077,17 +1100,19 @@ WebIDL::ExceptionOr<void> Element::attach_a_shadow_root(Bindings::ShadowRootMode
     if (!is_valid_shadow_host_name(local_name()))
         return WebIDL::NotSupportedError::create(realm(), "Element's local name is not a valid shadow host name"_utf16);
 
-    // 3. If element’s local name is a valid custom element name, or element’s is value is not null, then:
+    // 3. If element’s local name is a valid custom element name, or element’s is value is not null:
     if (HTML::is_valid_custom_element_name(local_name()) || m_is_value.has_value()) {
-        // 1. Let definition be the result of looking up a custom element definition given element’s node document, its namespace, its local name, and its is value.
-        auto definition = document().lookup_custom_element_definition(namespace_uri(), local_name(), m_is_value);
+        // 1. Let definition be the result of looking up a custom element definition given element’s custom element
+        //    registry, its namespace, its local name, and its is value.
+        auto definition = HTML::look_up_a_custom_element_definition(custom_element_registry(), namespace_uri(), local_name(), m_is_value);
 
-        // 2. If definition is not null and definition’s disable shadow is true, then throw a "NotSupportedError" DOMException.
+        // 2. If definition is non-null and definition’s disable shadow is true, then throw a "NotSupportedError"
+        //    DOMException.
         if (definition && definition->disable_shadow())
             return WebIDL::NotSupportedError::create(realm(), "Cannot attach a shadow root to a custom element that has disabled shadow roots"_utf16);
     }
 
-    // 4. If element is a shadow host, then:
+    // 4. If element is a shadow host:
     if (is_shadow_host()) {
         // 1. Let currentShadowRoot be element’s shadow root.
         auto current_shadow_root = shadow_root();
@@ -1111,13 +1136,15 @@ WebIDL::ExceptionOr<void> Element::attach_a_shadow_root(Bindings::ShadowRootMode
         return {};
     }
 
-    // 5. Let shadow be a new shadow root whose node document is element’s node document, host is this, and mode is mode.
+    // 5. Let shadow be a new shadow root whose node document is element’s node document, host is this, and mode is
+    //    mode.
     auto shadow = realm().create<ShadowRoot>(document(), *this, mode);
 
-    // 6. Set shadow’s delegates focus to delegatesFocus".
+    // 6. Set shadow’s delegates focus to delegatesFocus.
     shadow->set_delegates_focus(delegates_focus);
 
-    // 7. If element’s custom element state is "precustomized" or "custom", then set shadow’s available to element internals to true.
+    // 7. If element’s custom element state is "precustomized" or "custom", then set shadow’s available to element
+    //    internals to true.
     if (m_custom_element_state == CustomElementState::Precustomized || m_custom_element_state == CustomElementState::Custom)
         shadow->set_available_to_element_internals(true);
 
@@ -1133,7 +1160,10 @@ WebIDL::ExceptionOr<void> Element::attach_a_shadow_root(Bindings::ShadowRootMode
     // 11. Set shadow’s serializable to serializable.
     shadow->set_serializable(serializable);
 
-    // 12. Set element’s shadow root to shadow.
+    // 12. Set shadow’s custom element registry to registry.
+    shadow->set_custom_element_registry(registry);
+
+    // 13. Set element’s shadow root to shadow.
     set_shadow_root(shadow);
     return {};
 }
@@ -1141,10 +1171,23 @@ WebIDL::ExceptionOr<void> Element::attach_a_shadow_root(Bindings::ShadowRootMode
 // https://dom.spec.whatwg.org/#dom-element-attachshadow
 WebIDL::ExceptionOr<GC::Ref<ShadowRoot>> Element::attach_shadow(ShadowRootInit init)
 {
-    // 1. Run attach a shadow root with this, init["mode"], init["clonable"], init["serializable"], init["delegatesFocus"], and init["slotAssignment"].
-    TRY(attach_a_shadow_root(init.mode, init.clonable, init.serializable, init.delegates_focus, init.slot_assignment));
+    // 1. Let registry be this’s node document’s custom element registry.
+    auto registry = document().custom_element_registry();
 
-    // 2. Return this’s shadow root.
+    // 2. If init["customElementRegistry"] exists, then set registry to it.
+    if (init.custom_element_registry.has_value())
+        registry = init.custom_element_registry.value();
+
+    // 3. If registry is non-null, registry’s is scoped is false, and registry is not this’s node document’s custom
+    //    element registry, then throw a "NotSupportedError" DOMException.
+    if (registry && !registry->is_scoped() && registry != document().custom_element_registry())
+        return WebIDL::NotSupportedError::create(realm(), "'customElementRegistry' in ShadowRootInit must either be scoped or the document's custom element registry."_utf16);
+
+    // 4. Run attach a shadow root with this, init["mode"], init["clonable"], init["serializable"],
+    //    init["delegatesFocus"], init["slotAssignment"], and registry.
+    TRY(attach_a_shadow_root(init.mode, init.clonable, init.serializable, init.delegates_focus, init.slot_assignment, registry));
+
+    // 5. Return this’s shadow root.
     return GC::Ref { *shadow_root() };
 }
 
@@ -1176,7 +1219,7 @@ WebIDL::ExceptionOr<bool> Element::matches(StringView selectors) const
     auto sel = maybe_selectors.value();
     for (auto& s : sel) {
         SelectorEngine::MatchContext context;
-        if (SelectorEngine::matches(s, *this, nullptr, context, {}, static_cast<ParentNode const*>(this)))
+        if (SelectorEngine::matches(s, *this, nullptr, context, static_cast<ParentNode const*>(this)))
             return true;
     }
     return false;
@@ -1196,7 +1239,7 @@ WebIDL::ExceptionOr<DOM::Element const*> Element::closest(StringView selectors) 
         // 4. For each element in elements, if match a selector against an element, using s, element, and scoping root this, returns success, return element.
         for (auto const& selector : selector_list) {
             SelectorEngine::MatchContext context;
-            if (SelectorEngine::matches(selector, *element, nullptr, context, {}, this))
+            if (SelectorEngine::matches(selector, *element, nullptr, context, this))
                 return true;
         }
         return false;
@@ -1587,6 +1630,14 @@ void Element::removed_from(Node* old_parent, Node& old_root)
             document().element_with_id_was_removed({}, *this);
         if (m_name.has_value())
             document().element_with_name_was_removed({}, *this);
+        if (m_computed_properties) {
+            auto& anchor_names = is<ShadowRoot>(old_root)
+                ? as<ShadowRoot>(old_root).anchor_name_map()
+                : document().anchor_name_map();
+            m_computed_properties->for_each_anchor_name([&](FlyString const& name) {
+                anchor_names.unregister_name(name, *this);
+            });
+        }
     }
 
     play_or_cancel_animations_after_display_property_change();
@@ -1653,7 +1704,8 @@ bool Element::affected_by_pseudo_class(CSS::PseudoClass pseudo_class) const
 bool Element::matches_enabled_pseudo_class() const
 {
     // The :enabled pseudo-class must match any button, input, select, textarea, optgroup, option, fieldset element, or form-associated custom element that is not actually disabled.
-    return (is<HTML::HTMLButtonElement>(*this) || is<HTML::HTMLInputElement>(*this) || is<HTML::HTMLSelectElement>(*this) || is<HTML::HTMLTextAreaElement>(*this) || is<HTML::HTMLOptGroupElement>(*this) || is<HTML::HTMLOptionElement>(*this) || is<HTML::HTMLFieldSetElement>(*this))
+    auto is_form_associated_custom_element = is<HTML::HTMLElement>(*this) && static_cast<HTML::HTMLElement const&>(*this).is_form_associated_custom_element();
+    return (is<HTML::HTMLButtonElement>(*this) || is<HTML::HTMLInputElement>(*this) || is<HTML::HTMLSelectElement>(*this) || is<HTML::HTMLTextAreaElement>(*this) || is<HTML::HTMLOptGroupElement>(*this) || is<HTML::HTMLOptionElement>(*this) || is<HTML::HTMLFieldSetElement>(*this) || is_form_associated_custom_element)
         && !is_actually_disabled();
 }
 
@@ -1846,6 +1898,15 @@ bool Element::has_pseudo_elements() const
 }
 
 void Element::clear_pseudo_element_nodes(Badge<Layout::TreeBuilder>)
+{
+    if (m_pseudo_element_data) {
+        for (auto& pseudo_element : *m_pseudo_element_data) {
+            pseudo_element.value->set_layout_node(nullptr);
+        }
+    }
+}
+
+void Element::clear_pseudo_element_layout_nodes(Badge<Document>)
 {
     if (m_pseudo_element_data) {
         for (auto& pseudo_element : *m_pseudo_element_data) {
@@ -2281,7 +2342,10 @@ bool Element::is_actually_disabled() const
     if (is<HTML::HTMLFieldSetElement>(this))
         return static_cast<HTML::HTMLFieldSetElement const&>(*this).is_disabled();
 
-    // FIXME: - a form-associated custom element that is disabled
+    // - a form-associated custom element that is disabled
+    if (auto const* html_element = as_if<HTML::HTMLElement>(this); html_element && html_element->is_form_associated_custom_element())
+        return !html_element->enabled();
+
     return false;
 }
 
@@ -3199,8 +3263,9 @@ JS::ThrowCompletionOr<void> Element::upgrade_element(GC::Ref<HTML::CustomElement
     // 3. Set element's custom element state to "failed".
     set_custom_element_state(CustomElementState::Failed);
 
-    // 4. For each attribute in element's attribute list, in order, enqueue a custom element callback reaction with element, callback name "attributeChangedCallback",
-    //    and « attribute's local name, null, attribute's value, attribute's namespace ».
+    // 4. For each attribute in element's attribute list, in order, enqueue a custom element callback reaction with
+    //    element, callback name "attributeChangedCallback", and « attribute's local name, null, attribute's value,
+    //    attribute's namespace ».
     size_t attribute_count = m_attributes ? m_attributes->length() : 0;
     for (size_t attribute_index = 0; attribute_index < attribute_count; ++attribute_index) {
         auto const* attribute = m_attributes->item(attribute_index);
@@ -3216,7 +3281,8 @@ JS::ThrowCompletionOr<void> Element::upgrade_element(GC::Ref<HTML::CustomElement
         enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::attributeChangedCallback, move(arguments));
     }
 
-    // 5. If element is connected, then enqueue a custom element callback reaction with element, callback name "connectedCallback", and « ».
+    // 5. If element is connected, then enqueue a custom element callback reaction with element, callback name
+    //    "connectedCallback", and « ».
     if (is_connected()) {
         GC::RootVector<JS::Value> empty_arguments { vm.heap() };
         enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::connectedCallback, move(empty_arguments));
@@ -3228,9 +3294,14 @@ JS::ThrowCompletionOr<void> Element::upgrade_element(GC::Ref<HTML::CustomElement
     // 7. Let C be definition's constructor.
     auto& constructor = custom_element_definition->constructor();
 
-    // 8. Run the following substeps while catching any exceptions:
+    // 8. Set the surrounding agent's active custom element constructor map[C] to element's custom element registry.
+    auto& surrounding_agent = HTML::relevant_similar_origin_window_agent(*this);
+    surrounding_agent.active_custom_element_constructor_map.set(static_cast<JS::FunctionObject&>(*constructor.callback), custom_element_registry());
+
+    // 9. Run the following steps while catching any exceptions:
     auto attempt_to_construct_custom_element = [&]() -> JS::ThrowCompletionOr<void> {
-        // 1. If definition's disable shadow is true and element's shadow root is non-null, then throw a "NotSupportedError" DOMException.
+        // 1. If definition's disable shadow is true and element's shadow root is non-null, then throw a
+        //    "NotSupportedError" DOMException.
         if (custom_element_definition->disable_shadow() && shadow_root())
             return JS::throw_completion(WebIDL::NotSupportedError::create(realm, "Custom element definition disables shadow DOM and the custom element has a shadow root"_utf16));
 
@@ -3249,8 +3320,11 @@ JS::ThrowCompletionOr<void> Element::upgrade_element(GC::Ref<HTML::CustomElement
 
     auto maybe_exception = attempt_to_construct_custom_element();
 
-    // Then, perform the following substep, regardless of whether the above steps threw an exception or not:
-    // 1. Remove the last entry from the end of definition's construction stack.
+    // Then, perform the following steps, regardless of whether the above steps threw an exception or not:
+    // 1. Remove the surrounding agent's active custom element constructor map[C].
+    surrounding_agent.active_custom_element_constructor_map.remove(static_cast<JS::FunctionObject&>(*constructor.callback));
+
+    // 2. Remove the last entry from the end of definition's construction stack.
     (void)custom_element_definition->construction_stack().take_last();
 
     // Finally, if the above steps threw an exception, then:
@@ -3266,11 +3340,18 @@ JS::ThrowCompletionOr<void> Element::upgrade_element(GC::Ref<HTML::CustomElement
         return maybe_exception.release_error();
     }
 
-    // FIXME: 9. If element is a form-associated custom element, then:
-    //           1. Reset the form owner of element. If element is associated with a form element, then enqueue a custom element callback reaction with element, callback name "formAssociatedCallback", and « the associated form ».
-    //           2. If element is disabled, then enqueue a custom element callback reaction with element, callback name "formDisabledCallback", and « true ».
+    // 10. If element is a form-associated custom element, then:
+    if (auto* html_element = as_if<HTML::HTMLElement>(this); html_element && html_element->is_form_associated_custom_element()) {
+        // 1. Reset the form owner of element.
+        // FIXME: If element is associated with a form element, then enqueue a custom element callback reaction with element, callback name "formAssociatedCallback", and « the associated form ».
+        // AD-HOC: We don't do the second part of this step here, because it's inside reset_form_owner.
+        html_element->reset_form_owner();
 
-    // 10. Set element's custom element state to "custom".
+        // 2. If element is disabled, then enqueue a custom element callback reaction with element, callback name "formDisabledCallback", and « true ».
+        html_element->update_face_disabled_state();
+    }
+
+    // 11. Set element's custom element state to "custom".
     set_custom_element_state(CustomElementState::Custom);
 
     return {};
@@ -3279,8 +3360,9 @@ JS::ThrowCompletionOr<void> Element::upgrade_element(GC::Ref<HTML::CustomElement
 // https://html.spec.whatwg.org/multipage/custom-elements.html#concept-try-upgrade
 void Element::try_to_upgrade()
 {
-    // 1. Let definition be the result of looking up a custom element definition given element's node document, element's namespace, element's local name, and element's is value.
-    auto definition = document().lookup_custom_element_definition(namespace_uri(), local_name(), m_is_value);
+    // 1. Let definition be the result of looking up a custom element definition given element's custom element
+    //    registry, element's namespace, element's local name, and element's is value.
+    auto definition = HTML::look_up_a_custom_element_definition(custom_element_registry(), namespace_uri(), local_name(), is_value());
 
     // 2. If definition is not null, then enqueue a custom element upgrade reaction given element and definition.
     if (definition)
@@ -3415,10 +3497,13 @@ void Element::set_cascaded_properties(Optional<CSS::PseudoElement> pseudo_elemen
     if (pseudo_element.has_value()) {
         if (pseudo_element.value() >= CSS::PseudoElement::KnownPseudoElementCount)
             return;
-        ensure_pseudo_element(pseudo_element.value()).set_cascaded_properties(cascaded_properties);
-    } else {
-        m_cascaded_properties = cascaded_properties;
+        if (cascaded_properties)
+            ensure_pseudo_element(pseudo_element.value()).set_cascaded_properties(cascaded_properties);
+        else if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
+            existing_pseudo_element->set_cascaded_properties({});
+        return;
     }
+    m_cascaded_properties = cascaded_properties;
 }
 
 GC::Ptr<CSS::ComputedProperties> Element::computed_properties(Optional<CSS::PseudoElement> pseudo_element_type)
@@ -3446,7 +3531,10 @@ void Element::set_computed_properties(Optional<CSS::PseudoElement> pseudo_elemen
     if (pseudo_element_type.has_value()) {
         if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(*pseudo_element_type))
             return;
-        ensure_pseudo_element(*pseudo_element_type).set_computed_properties(style);
+        if (style)
+            ensure_pseudo_element(*pseudo_element_type).set_computed_properties(style);
+        else if (auto existing_pseudo_element = get_pseudo_element(*pseudo_element_type); existing_pseudo_element.has_value())
+            existing_pseudo_element->set_computed_properties({});
         return;
     }
     m_computed_properties = style;
@@ -3477,11 +3565,10 @@ PseudoElement& Element::ensure_pseudo_element(CSS::PseudoElement type) const
     VERIFY(CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(type));
 
     if (!m_pseudo_element_data->get(type).has_value()) {
-        if (is_pseudo_element_root(type)) {
+        if (is_pseudo_element_root(type))
             m_pseudo_element_data->set(type, heap().allocate<PseudoElementTreeNode>());
-        } else {
+        else
             m_pseudo_element_data->set(type, heap().allocate<PseudoElement>());
-        }
     }
 
     return *(m_pseudo_element_data->get(type).value());
@@ -3494,11 +3581,13 @@ void Element::set_custom_property_data(Optional<CSS::PseudoElement> pseudo_eleme
         return;
     }
 
-    if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value())) {
+    if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
         return;
-    }
 
-    ensure_pseudo_element(pseudo_element.value()).set_custom_property_data(move(data));
+    if (data)
+        ensure_pseudo_element(pseudo_element.value()).set_custom_property_data(move(data));
+    else if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
+        existing_pseudo_element->set_custom_property_data({});
 }
 
 RefPtr<CSS::CustomPropertyData const> Element::custom_property_data(Optional<CSS::PseudoElement> pseudo_element) const
@@ -4058,7 +4147,7 @@ Optional<Element::Directionality> Element::auto_directionality() const
     // 1. If element is an auto-directionality form-associated element:
     if (is_auto_directionality_form_associated_element()) {
         auto const& form_associated_element = as<HTML::FormAssociatedElement>(*this);
-        auto const& value = form_associated_element.value();
+        auto const& value = form_associated_element.form_value();
 
         // 1. If element's value contains a character of bidirectional character type AL or R,
         //    and there is no character of bidirectional character type L anywhere before it in the element's value, then return 'rtl'.
@@ -4198,6 +4287,22 @@ Element::Directionality Element::parent_directionality() const
     return Directionality::Ltr;
 }
 
+static void prefetch_inline_style_image_resources(CSS::CSSStyleProperties const& inline_style, Document& document)
+{
+    auto load_image_if_needed = [&](CSS::StyleValue const& value) {
+        if (value.is_abstract_image())
+            const_cast<CSS::AbstractImageStyleValue&>(value.as_abstract_image()).load_any_resources(document);
+    };
+    for (auto const& property : inline_style.properties()) {
+        if (property.value->is_value_list()) {
+            for (auto const& item : property.value->as_value_list().values())
+                load_image_if_needed(*item);
+        } else {
+            load_image_if_needed(*property.value);
+        }
+    }
+}
+
 // https://dom.spec.whatwg.org/#concept-element-attributes-change-ext
 void Element::attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
 {
@@ -4278,6 +4383,7 @@ void Element::attribute_changed(FlyString const& local_name, Optional<String> co
         if (!m_inline_style)
             m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this }, {}, {});
         m_inline_style->set_declarations_from_text(value.value_or(""_string));
+        prefetch_inline_style_image_resources(*m_inline_style, document());
         set_needs_style_update(true);
     } else if (local_name == HTML::AttributeNames::dir) {
         // https://html.spec.whatwg.org/multipage/dom.html#attr-dir

@@ -215,18 +215,6 @@ VM::VM(ErrorMessages error_messages)
         return HandledByHost::Unhandled;
     };
 
-    // 3.6.1 HostInitializeShadowRealm ( realm, context, O ), https://tc39.es/proposal-shadowrealm/#sec-hostinitializeshadowrealm
-    host_initialize_shadow_realm = [](Realm&, NonnullOwnPtr<ExecutionContext>, ShadowRealm&) -> ThrowCompletionOr<void> {
-        // The host-defined abstract operation HostInitializeShadowRealm takes arguments realm (a Realm Record),
-        // context (an execution context), and O (a ShadowRealm object) and returns either a normal completion
-        // containing unused or a throw completion. It is used to inform the host of any newly created realms
-        // from the ShadowRealm constructor. The idea of this hook is to initialize host data structures related
-        // to the ShadowRealm, e.g., for module loading.
-        //
-        // The host may use this hook to add properties to the ShadowRealm's global object. Those properties must be configurable.
-        return {};
-    };
-
     // 2.3.1 HostSystemUTCEpochNanoseconds ( global ), https://tc39.es/proposal-temporal/#sec-hostsystemutcepochnanoseconds
     host_system_utc_epoch_nanoseconds = [](Object const&) {
         // 1. Let ns be the approximate current UTC date and time, in nanoseconds since the epoch.
@@ -619,16 +607,16 @@ ThrowCompletionOr<void> VM::link_and_eval_module(CyclicModule& module)
     if (evaluated_or_error.is_error())
         return evaluated_or_error.throw_completion();
 
-    auto evaluated_value = evaluated_or_error.value();
+    auto const& evaluated_value = static_cast<Promise&>(*evaluated_or_error.value()->promise());
 
     run_queued_promise_jobs();
     VERIFY(m_promise_jobs.is_empty());
 
     // FIXME: This will break if we start doing promises actually asynchronously.
-    VERIFY(evaluated_value->state() != Promise::State::Pending);
+    VERIFY(evaluated_value.state() != Promise::State::Pending);
 
-    if (evaluated_value->state() == Promise::State::Rejected)
-        return JS::throw_completion(evaluated_value->result());
+    if (evaluated_value.state() == Promise::State::Rejected)
+        return JS::throw_completion(evaluated_value.result());
 
     dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] Evaluating passed for module {}", module.filename());
     return {};
@@ -774,7 +762,7 @@ void VM::load_imported_module(ImportedModuleReferrer referrer, ModuleRequest con
         // must either be the Completion Record returned by an invocation of ParseJSONModule or a throw completion.
         if (module_type == "json"sv) {
             dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] reading and parsing JSON module {}", filename);
-            return parse_json_module(*current_realm(), content_view, filename);
+            return TRY(parse_json_module(*current_realm(), content_view, filename));
         }
 
         dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] reading and parsing as SourceTextModule module {}", filename);

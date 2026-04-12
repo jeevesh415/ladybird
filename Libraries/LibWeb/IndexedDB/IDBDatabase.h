@@ -20,10 +20,11 @@
 namespace Web::IndexedDB {
 
 using KeyPath = Variant<String, Vector<String>>;
+using NullableKeyPath = Variant<String, Vector<String>, Empty>;
 
 // https://w3c.github.io/IndexedDB/#dictdef-idbobjectstoreparameters
 struct IDBObjectStoreParameters {
-    Optional<KeyPath> key_path;
+    NullableKeyPath key_path { Empty {} };
     bool auto_increment { false };
 };
 
@@ -39,7 +40,10 @@ class IDBDatabase : public DOM::EventTarget {
     GC_DECLARE_ALLOCATOR(IDBDatabase);
 
 public:
+    static constexpr bool OVERRIDES_FINALIZE = true;
+
     virtual ~IDBDatabase() override;
+    virtual void finalize() override;
 
     [[nodiscard]] static GC::Ref<IDBDatabase> create(JS::Realm&, Database&);
 

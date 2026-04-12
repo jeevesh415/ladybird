@@ -1,21 +1,16 @@
 include(libjs_generators)
 
 set(SOURCES
-    AST.cpp
-    ASTDump.cpp
     Bytecode/AsmInterpreter/AsmInterpreter.cpp
-    Bytecode/ASTCodegen.cpp
     Bytecode/BasicBlock.cpp
-    Bytecode/Builtins.cpp
     Bytecode/Executable.cpp
-    Bytecode/Generator.cpp
     Bytecode/IdentifierTable.cpp
     Bytecode/Instruction.cpp
     Bytecode/Interpreter.cpp
     Bytecode/Label.cpp
+    Bytecode/PropertyNameIterator.cpp
     Bytecode/PropertyKeyTable.cpp
     Bytecode/RegexTable.cpp
-    Bytecode/ScopedOperand.cpp
     Bytecode/StringTable.cpp
     Console.cpp
     Contrib/Test262/262Object.cpp
@@ -24,11 +19,8 @@ set(SOURCES
     Contrib/Test262/IsHTMLDDA.cpp
     CyclicModule.cpp
     Heap/Cell.cpp
-    Lexer.cpp
     Module.cpp
-    Parser.cpp
     ParserError.cpp
-    PipelineComparison.cpp
     Print.cpp
     RustIntegration.cpp
     Runtime/AbstractOperations.cpp
@@ -88,6 +80,7 @@ set(SOURCES
     Runtime/Environment.cpp
     Runtime/Error.cpp
     Runtime/ErrorConstructor.cpp
+    Runtime/ErrorData.cpp
     Runtime/ErrorPrototype.cpp
     Runtime/ErrorTypes.cpp
     Runtime/ExecutionContext.cpp
@@ -103,7 +96,6 @@ set(SOURCES
     Runtime/GeneratorFunctionPrototype.cpp
     Runtime/GeneratorObject.cpp
     Runtime/GeneratorPrototype.cpp
-    Runtime/GeneratorResult.cpp
     Runtime/GlobalEnvironment.cpp
     Runtime/GlobalObject.cpp
     Runtime/IndexedProperties.cpp
@@ -201,9 +193,6 @@ set(SOURCES
     Runtime/SetIterator.cpp
     Runtime/SetIteratorPrototype.cpp
     Runtime/SetPrototype.cpp
-    Runtime/ShadowRealm.cpp
-    Runtime/ShadowRealmConstructor.cpp
-    Runtime/ShadowRealmPrototype.cpp
     Runtime/Shape.cpp
     Runtime/SharedArrayBufferConstructor.cpp
     Runtime/SharedArrayBufferPrototype.cpp
@@ -267,14 +256,11 @@ set(SOURCES
     Runtime/WeakSetConstructor.cpp
     Runtime/WeakSetPrototype.cpp
     Runtime/WrapForValidIteratorPrototype.cpp
-    Runtime/WrappedFunction.cpp
-    ScopeCollector.cpp
     Script.cpp
     SourceCode.cpp
     SourceTextModule.cpp
     SyntaxHighlighter.cpp
     SyntheticModule.cpp
-    Token.cpp
 )
 
 generate_bytecode_def_derived()
@@ -306,33 +292,36 @@ endif()
 
 target_link_libraries(LibJS PUBLIC JSClangPlugin)
 
-if (ENABLE_RUST)
-    import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libjs_rust)
-    target_link_libraries(LibJS PRIVATE libjs_rust)
-    target_compile_definitions(LibJS PRIVATE ENABLE_RUST)
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libjs_rust FFI_HEADER RustFFI.h)
+target_link_libraries(LibJS PRIVATE libjs_rust)
+if ((LINUX OR BSD) AND NOT BUILD_SHARED_LIBS)
+    # Rust staticlibs each carry the same allocator shim symbols. LibJS can
+    # pull in multiple crates' copies in static ELF links, but they all
+    # forward to the same ladybird_rust_* entry points in AK/kmalloc.cpp.
+    target_link_options(LibJS INTERFACE LINKER:--allow-multiple-definition)
+endif()
 
-    # The Rust library and LibJS have a circular dependency (C++ calls Rust
-    # entry points, Rust calls C++ callbacks). For static builds, merge the
-    # Rust archive into the LibJS archive so all symbols are in one place.
-    if(NOT BUILD_SHARED_LIBS)
-        add_custom_command(TARGET LibJS POST_BUILD
-            COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libjs_rust>
-            COMMAND ${CMAKE_AR} -qS $<TARGET_FILE:LibJS> *.o
-            COMMAND ${CMAKE_RANLIB} $<TARGET_FILE:LibJS>
-            COMMAND ${CMAKE_COMMAND} -E remove -f *.o
-            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/rust_merge_tmp
-            COMMENT "Merging Rust archive into LibJS"
-        )
-        file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/rust_merge_tmp)
-    endif()
+# The Rust library and LibJS have a circular dependency (C++ calls Rust
+# entry points, Rust calls C++ callbacks). For static builds, merge the
+# Rust archive into the LibJS archive so all symbols are in one place.
+if(NOT BUILD_SHARED_LIBS)
+    add_custom_command(TARGET LibJS POST_BUILD
+        COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libjs_rust>
+        COMMAND ${CMAKE_AR} -qS $<TARGET_FILE:LibJS> *.o
+        COMMAND ${CMAKE_RANLIB} $<TARGET_FILE:LibJS>
+        COMMAND ${CMAKE_COMMAND} -E remove -f *.o
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/rust_merge_tmp
+        COMMENT "Merging Rust archive into LibJS"
+    )
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/rust_merge_tmp)
 endif()
 
 # AsmInterpreter: generate platform-specific assembly from DSL
 # NB: Win64 uses a different ABI (shadow space, different arg registers)
 #     from SysV AMD64, and the x86_64 backend only supports SysV for now.
-if (NOT WIN32 AND ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64"))
+if (NOT WIN32 AND ("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(x86_64|amd64|AMD64)$"))
     set(ASMINT_ARCH "x86_64")
-elseif ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "aarch64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64")
+elseif ("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(aarch64|arm64)$")
     set(ASMINT_ARCH "aarch64")
 endif()
 
@@ -364,7 +353,15 @@ if (DEFINED ASMINT_ARCH)
         COMMENT "Generating asm struct offsets"
     )
 
-    file(GLOB ASMINTGEN_SOURCES "${ASMINTGEN_DIR}/src/*.rs" "${ASMINTGEN_DIR}/Cargo.toml")
+    file(GLOB ASMINTGEN_RUST_SOURCES CONFIGURE_DEPENDS "${ASMINTGEN_DIR}/src/*.rs")
+    file(GLOB ASMINTGEN_BYTECODE_DEF_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/BytecodeDef/src/*.rs")
+    set(ASMINTGEN_SOURCES
+        "${ASMINTGEN_DIR}/Cargo.toml"
+        "${ASMINTGEN_DIR}/Cargo.lock"
+        "${CMAKE_CURRENT_SOURCE_DIR}/BytecodeDef/Cargo.toml"
+        ${ASMINTGEN_RUST_SOURCES}
+        ${ASMINTGEN_BYTECODE_DEF_SOURCES}
+    )
     # NB: Clear linker-related env vars so cargo uses the default host
     # linker. The CI may set CC/CXX or CARGO_TARGET_*_LINKER to a
     # compiler that isn't available in all build configurations (e.g.
@@ -410,11 +407,4 @@ if (DEFINED ASMINT_ARCH)
     )
 
     target_sources(LibJS PRIVATE "${ASMINT_GENERATED_S}")
-endif()
-
-if (WIN32 AND ENABLE_ADDRESS_SANITIZER)
-    # FIXME: Fix address sanitizer stack-overflow error when running test-js.
-    # Even tripling the stack size for this target to 24MB didn't fix it, so it is most likely some ASAN related bug/quirk given test-js passes using the 8MB stack without ASAN
-    # ==9948==ERROR: AddressSanitizer: stack-overflow on address 0x7ffd983a6f47 (pc 0x7ffd983a6f47 bp 0x004e514053e0 sp 0x004e51405348 T0)
-    target_compile_options(LibJS PRIVATE -fno-sanitize=address)
 endif()

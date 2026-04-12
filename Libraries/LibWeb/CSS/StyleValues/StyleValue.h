@@ -184,6 +184,11 @@ public:
         return this->equals(other);
     }
 
+    // https://drafts.css-houdini.org/css-properties-values-api/#computationally-independent
+    // A property value is computationally independent if it can be converted into a computed value using only the value
+    // of the property on the element, and "global" information that cannot be changed by CSS.
+    virtual bool is_computationally_independent() const = 0;
+
 protected:
     explicit StyleValue(Type);
 
@@ -205,7 +210,7 @@ struct StyleValueWithDefaultOperators : public StyleValue {
     }
 };
 
-i64 int_from_style_value(NonnullRefPtr<StyleValue const> const& style_value);
+i32 int_from_style_value(NonnullRefPtr<StyleValue const> const& style_value);
 double number_from_style_value(NonnullRefPtr<StyleValue const> const& style_value, Optional<double> percentage_basis);
 FlyString const& string_from_style_value(NonnullRefPtr<StyleValue const> const& style_value);
 

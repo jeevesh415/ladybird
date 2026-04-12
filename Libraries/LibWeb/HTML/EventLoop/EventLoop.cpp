@@ -116,43 +116,6 @@ void EventLoop::spin_until(GC::Ref<GC::Function<bool()>> goal_condition)
     // NOTE: This is achieved by returning from the function.
 }
 
-void EventLoop::spin_processing_tasks_with_source_until(Task::Source source, GC::Ref<GC::Function<bool()>> goal_condition)
-{
-    auto& vm = this->vm();
-    vm.save_execution_context_stack();
-    vm.clear_execution_context_stack();
-
-    perform_a_microtask_checkpoint();
-
-    // NOTE: HTML event loop processing steps could run a task with arbitrary source. We could end up re-entering into
-    //       this method; this makes sure we restore the skip value to its original value.
-    TemporaryChange saved_skip(m_skip_event_loop_processing_steps, true);
-
-    Platform::EventLoopPlugin::the().spin_until(GC::create_function(heap(), [this, source, goal_condition] {
-        if (goal_condition->function()())
-            return true;
-        if (m_task_queue->has_runnable_tasks()) {
-            auto tasks = m_task_queue->take_tasks_matching([&](auto& task) {
-                return task.source() == source && task.is_runnable();
-            });
-
-            for (auto& task : tasks) {
-                m_currently_running_task = task.ptr();
-                task->execute();
-                m_currently_running_task = nullptr;
-            }
-        }
-
-        // FIXME: Remove the platform event loop plugin so that this doesn't look out of place
-        Core::EventLoop::current().wake();
-        return goal_condition->function()();
-    }));
-
-    schedule();
-
-    vm.restore_execution_context_stack();
-}
-
 // https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
 void EventLoop::process()
 {
@@ -353,7 +316,12 @@ void EventLoop::update_the_rendering()
     // 1. Let frameTimestamp be eventLoop's last render opportunity time.
     auto frame_timestamp = m_last_render_opportunity_time;
 
-    // FIXME: 2. Let docs be all fully active Document objects whose relevant agent's event loop is eventLoop, sorted arbitrarily except that the following conditions must be met:
+    // 2. Let docs be all fully active Document objects whose relevant agent's event loop is
+    //    eventLoop, sorted arbitrarily except that the following conditions must be met:
+    //    - Any Document B whose container document is A must be listed after A in the list.
+    //    - If there are two documents A and B that both have the same non-null container document
+    //      C, then the order of A and B in the list must match the shadow-including tree order
+    //      of their respective navigable containers in C's node tree.
     // 3. Filter non-renderable documents: Remove from docs any Document object doc for which any of the following are true:
     auto docs = documents_in_this_event_loop_matching([&](auto const& document) {
         if (!document.is_fully_active())
@@ -519,15 +487,19 @@ void EventLoop::update_the_rendering()
     // FIXME: 21. For each doc of docs, mark paint timing for doc.
 
     // 22. For each doc of docs, update the rendering or user interface of doc and its node navigable to reflect the current state.
-    for (auto& document : docs) {
-        auto navigable = document->navigable();
-        if (!navigable->is_traversable())
-            continue;
-        auto traversable = navigable->traversable_navigable();
-        traversable->process_screenshot_requests();
+    for (auto& doc : docs.in_reverse()) {
+        auto navigable = doc->navigable();
         if (!navigable->needs_repaint())
             continue;
+        if (navigable->is_svg_page())
+            continue;
+        if (auto document = navigable->active_document())
+            document->update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
         navigable->paint_next_frame();
+        if (navigable->is_traversable()) {
+            auto traversable = navigable->traversable_navigable();
+            traversable->process_screenshot_requests();
+        }
     }
 
     // 23. For each doc of docs, process top layer removals given doc.
@@ -654,8 +626,7 @@ void EventLoop::perform_a_microtask_checkpoint()
     // 4. For each environment settings object settingsObject whose responsible event loop is this event loop, notify about rejected promises given settingsObject's global object.
     auto environments = GC::RootVector { heap(), m_related_environment_settings_objects };
     for (auto& environment_settings_object : environments) {
-        auto& global = as<HTML::UniversalGlobalScopeMixin>(environment_settings_object->global_object());
-        global.notify_about_rejected_promises({});
+        environment_settings_object->universal_global_scope().notify_about_rejected_promises({});
     }
 
     // 5. Cleanup Indexed Database transactions.
@@ -672,6 +643,7 @@ void EventLoop::perform_a_microtask_checkpoint()
 
 Vector<GC::Root<DOM::Document>> EventLoop::documents_in_this_event_loop_matching(Function<bool(DOM::Document&)> callback) const
 {
+    ensure_documents_sorted();
     Vector<GC::Root<DOM::Document>> documents;
     for (auto& document : m_documents) {
         VERIFY(document);
@@ -687,6 +659,7 @@ Vector<GC::Root<DOM::Document>> EventLoop::documents_in_this_event_loop_matching
 void EventLoop::register_document(Badge<DOM::Document>, DOM::Document& document)
 {
     m_documents.append(&document);
+    m_documents_sort_dirty = true;
 }
 
 void EventLoop::unregister_document(Badge<DOM::Document>, DOM::Document& document)
@@ -695,9 +668,54 @@ void EventLoop::unregister_document(Badge<DOM::Document>, DOM::Document& documen
     VERIFY(did_remove);
 }
 
-void EventLoop::push_onto_backup_incumbent_realm_stack(JS::Realm& realm)
+void EventLoop::document_navigable_did_change(Badge<DOM::Document>)
 {
-    m_backup_incumbent_realm_stack.append(realm);
+    m_documents_sort_dirty = true;
+}
+
+void EventLoop::ensure_documents_sorted() const
+{
+    // https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering step 3.2:
+    // - Any Document B whose container document is A must be listed after A in the list.
+    // - If there are two documents A and B that both have the same non-null container document
+    //   C, then the order of A and B in the list must match the shadow-including tree order
+    //   of their respective navigable containers in C's node tree.
+
+    if (!m_documents_sort_dirty)
+        return;
+    m_documents_sort_dirty = false;
+
+    HashMap<DOM::Document*, size_t> doc_to_index;
+    doc_to_index.ensure_capacity(m_documents.size());
+    for (size_t i = 0; i < m_documents.size(); ++i)
+        doc_to_index.set(m_documents[i].ptr(), i);
+
+    Vector<bool> visited;
+    visited.resize(m_documents.size());
+    Vector<GC::Weak<DOM::Document>> sorted;
+    sorted.ensure_capacity(m_documents.size());
+
+    auto visit = [&](auto& self, size_t idx) -> void {
+        if (visited[idx])
+            return;
+        visited[idx] = true;
+        if (auto navigable = m_documents[idx]->navigable()) {
+            if (auto container_doc = navigable->container_document()) {
+                if (auto container_idx = doc_to_index.get(container_doc.ptr()); container_idx.has_value())
+                    self(self, *container_idx);
+            }
+        }
+        sorted.append(m_documents[idx]);
+    };
+    for (size_t i = 0; i < m_documents.size(); ++i)
+        visit(visit, i);
+
+    m_documents = move(sorted);
+}
+
+void EventLoop::push_onto_backup_incumbent_realm_stack(GC::Ref<EnvironmentSettingsObject> environment_settings_object)
+{
+    m_backup_incumbent_realm_stack.append(environment_settings_object);
 }
 
 void EventLoop::pop_backup_incumbent_realm_stack()
@@ -705,7 +723,7 @@ void EventLoop::pop_backup_incumbent_realm_stack()
     m_backup_incumbent_realm_stack.take_last();
 }
 
-JS::Realm& EventLoop::top_of_backup_incumbent_realm_stack()
+EnvironmentSettingsObject& EventLoop::top_of_backup_incumbent_realm_stack()
 {
     return m_backup_incumbent_realm_stack.last();
 }
@@ -779,7 +797,7 @@ EventLoop::PauseHandle EventLoop::pause()
     m_execution_paused = true;
 
     // 1. Let global be the current global object.
-    auto& global = current_principal_global_object();
+    auto& global = current_global_object();
 
     // 2. Let timeBeforePause be the current high resolution time given global.
     auto time_before_pause = HighResolutionTime::current_high_resolution_time(global);

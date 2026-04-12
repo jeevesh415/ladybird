@@ -316,7 +316,7 @@ static NonnullRefPtr<StyleValue const> style_value_for_size(Size const& size)
         return KeywordStyleValue::create(Keyword::MaxContent);
     if (size.is_fit_content()) {
         if (auto available_space = size.fit_content_available_space(); available_space.has_value())
-            return FitContentStyleValue::create(available_space.release_value());
+            return FitContentStyleValue::create(style_value_for_length_percentage(available_space.release_value()));
         return FitContentStyleValue::create();
     }
     TODO();
@@ -540,10 +540,19 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
 
         auto abstract_element = *owner_node();
 
-        // https://www.w3.org/TR/cssom-1/#dom-window-getcomputedstyle
-        // NB: This is a partial enforcement of step 5 ("If elt is connected, ...")
-        if (!abstract_element.element().is_connected())
+        // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
+        // NB: This is a partial enforcement of step 5:
+        // If [...] elt is connected, part of the flat tree, and its shadow-including root has a browsing context which
+        // either doesn't have a browsing context container, or whose browsing context container is being rendered.
+        auto& element = abstract_element.element();
+        if (!element.is_connected())
             return {};
+        auto browsing_context = element.shadow_including_root().document().browsing_context();
+        if (!browsing_context)
+            return {};
+        // FIXME: Check if the element is part of the flat tree.
+        // FIXME: Check that the browsing context either doesn't have a browsing context container, or that its
+        //        browsing context container is being rendered.
 
         // NB: We grab the layout node before deciding whether update_layout() is needed.
         //     For properties that don't need layout or a layout node (the else branch below),
@@ -589,7 +598,10 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
         }
 
         if (!layout_node) {
-            auto style = abstract_element.document().style_computer().compute_style(abstract_element);
+            // Seed the ancestor chain before this one-off style computation, so
+            // ancestor-dependent selectors still match for no `layout_node`
+            // queries (for example `.outer .inner .target`).
+            auto style = abstract_element.document().style_computer().compute_style_with_seeded_ancestors(abstract_element);
             return StyleProperty {
                 .property_id = property_id,
                 .value = style->property(property_id),
@@ -1010,10 +1022,6 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
                 if (auto used_values_for_grid_template_rows = paintable_box.used_values_for_grid_template_rows()) {
                     return used_values_for_grid_template_rows;
                 }
-            }
-        } else if (property_id == PropertyID::ZIndex) {
-            if (auto z_index = layout_node.computed_values().z_index(); z_index.has_value()) {
-                return NumberStyleValue::create(z_index.value());
             }
         }
 

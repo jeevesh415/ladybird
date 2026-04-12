@@ -43,6 +43,7 @@ struct ShadowRootInit {
     Bindings::SlotAssignmentMode slot_assignment { Bindings::SlotAssignmentMode::Named };
     bool clonable = false;
     bool serializable = false;
+    Optional<GC::Ptr<HTML::CustomElementRegistry>> custom_element_registry {};
 };
 
 struct GetHTMLOptions {
@@ -195,7 +196,7 @@ public:
     ReadonlySpan<FlyString> part_names() const { return m_parts; }
 
     WebIDL::ExceptionOr<GC::Ref<ShadowRoot>> attach_shadow(ShadowRootInit init);
-    WebIDL::ExceptionOr<void> attach_a_shadow_root(Bindings::ShadowRootMode mode, bool clonable, bool serializable, bool delegates_focus, Bindings::SlotAssignmentMode slot_assignment);
+    WebIDL::ExceptionOr<void> attach_a_shadow_root(Bindings::ShadowRootMode mode, bool clonable, bool serializable, bool delegates_focus, Bindings::SlotAssignmentMode slot_assignment, GC::Ptr<HTML::CustomElementRegistry> registry);
     GC::Ptr<ShadowRoot> shadow_root_for_bindings() const;
 
     WebIDL::ExceptionOr<bool> matches(StringView selectors) const;
@@ -354,6 +355,7 @@ public:
     bool has_pseudo_element(CSS::PseudoElement) const;
     bool has_pseudo_elements() const;
     void clear_pseudo_element_nodes(Badge<Layout::TreeBuilder>);
+    void clear_pseudo_element_layout_nodes(Badge<Document>);
 
     void serialize_children_as_json(JsonObjectSerializer<StringBuilder>&) const;
 
@@ -581,6 +583,9 @@ public:
 
     GC::Ref<WebIDL::Promise> request_pointer_lock(Optional<PointerLockOptions>);
 
+    GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const { return m_custom_element_registry; }
+    void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> registry) { m_custom_element_registry = registry; }
+
 protected:
     Element(Document&, DOM::QualifiedName);
     virtual void initialize(JS::Realm&) override;
@@ -602,6 +607,7 @@ protected:
     virtual bool id_reference_exists(String const&) const override;
 
     CustomElementState custom_element_state() const { return m_custom_element_state; }
+    GC::Ptr<HTML::CustomElementDefinition> custom_element_definition() const { return m_custom_element_definition; }
 
     void play_or_cancel_animations_after_display_property_change();
 
@@ -660,6 +666,9 @@ private:
     // All elements have an associated custom element reaction queue, initially empty. Each item in the custom element reaction queue is of one of two types:
     // NOTE: See the structs at the top of this header.
     OwnPtr<CustomElementReactionQueue> m_custom_element_reaction_queue;
+
+    // https://dom.spec.whatwg.org/#element-custom-element-registry
+    GC::Ptr<HTML::CustomElementRegistry> m_custom_element_registry;
 
     // https://dom.spec.whatwg.org/#concept-element-custom-element-definition
     GC::Ptr<HTML::CustomElementDefinition> m_custom_element_definition;

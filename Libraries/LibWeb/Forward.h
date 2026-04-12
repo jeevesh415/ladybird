@@ -52,7 +52,6 @@ class SVGPatternPaintStyle;
 class ScrollStateSnapshot;
 using PaintStyle = RefPtr<SVGPaintServerPaintStyle>;
 using PaintStyleOrColor = Variant<PaintStyle, Gfx::Color>;
-using ScrollStateSnapshotByDisplayList = HashMap<NonnullRefPtr<DisplayList>, ScrollStateSnapshot>;
 
 }
 
@@ -218,11 +217,11 @@ class AddFunctionStyleValue;
 class AnchorStyleValue;
 class AnchorSizeStyleValue;
 class Angle;
-class AngleOrCalculated;
 class AnglePercentage;
 class AngleStyleValue;
 class BackgroundSizeStyleValue;
 class BasicShapeStyleValue;
+class BooleanExpression;
 class BorderImageSliceStyleValue;
 class BorderRadiusRectStyleValue;
 class BorderRadiusStyleValue;
@@ -238,6 +237,7 @@ class ColorFunctionStyleValue;
 class ColorStyleValue;
 class ComputedProperties;
 class ConicGradientStyleValue;
+class ContainerQuery;
 class ContentStyleValue;
 class CounterDefinitionsStyleValue;
 class CounterStyle;
@@ -247,12 +247,15 @@ class CounterStyleValue;
 class CountersSet;
 class CSSAnimation;
 class CSSConditionRule;
+class CSSContainerRule;
 class CSSCounterStyleRule;
 class CSSDescriptors;
 class CSSFontFaceDescriptors;
 class CSSFontFaceRule;
 class CSSFontFeatureValuesMap;
 class CSSFontFeatureValuesRule;
+class CSSFunctionDescriptors;
+class CSSFunctionRule;
 class CSSGroupingRule;
 class CSSImageValue;
 class CSSImportRule;
@@ -310,7 +313,6 @@ class ExplicitGridTrack;
 class FilterValueListStyleValue;
 class FitContentStyleValue;
 class Flex;
-class FlexOrCalculated;
 class FlexStyleValue;
 class FontComputer;
 class FontFace;
@@ -319,7 +321,6 @@ class FontSourceStyleValue;
 class FontStyleStyleValue;
 class FontVariantAlternatesFunctionStyleValue;
 class Frequency;
-class FrequencyOrCalculated;
 class FrequencyPercentage;
 class FrequencyStyleValue;
 class GridAutoFlowStyleValue;
@@ -336,15 +337,12 @@ class GuaranteedInvalidStyleValue;
 class HSLColorStyleValue;
 class HWBColorStyleValue;
 class ImageStyleValue;
-class IntegerOrCalculated;
 class IntegerStyleValue;
 class InvalidationSet;
 class KeywordStyleValue;
 class Length;
 class LengthBox;
 class LengthOrAuto;
-class LengthOrAutoOrCalculated;
-class LengthOrCalculated;
 class LengthPercentage;
 class LengthPercentageOrAuto;
 class LengthStyleValue;
@@ -355,7 +353,6 @@ class MediaQuery;
 class MediaQueryList;
 class MediaQueryListEvent;
 class Number;
-class NumberOrCalculated;
 class NumberStyleValue;
 class NumericType;
 class OKLabColorStyleValue;
@@ -364,7 +361,6 @@ class OpenTypeTaggedStyleValue;
 class ParsedFontFace;
 class PendingSubstitutionStyleValue;
 class Percentage;
-class PercentageOrCalculated;
 class PercentageStyleValue;
 class PositionStyleValue;
 class PropertyNameAndID;
@@ -376,7 +372,6 @@ class RatioStyleValue;
 class RectStyleValue;
 class RepeatStyleStyleValue;
 class Resolution;
-class ResolutionOrCalculated;
 class ResolutionStyleValue;
 class RGBColorStyleValue;
 class Screen;
@@ -403,9 +398,10 @@ class SVGPaint;
 class TextIndentStyleValue;
 class TextUnderlinePositionStyleValue;
 class Time;
-class TimeOrCalculated;
 class TimePercentage;
 class TimeStyleValue;
+template<typename T>
+class TokenStream;
 class TransformationStyleValue;
 class TreeCountingFunctionStyleValue;
 class TupleStyleValue;
@@ -478,9 +474,12 @@ enum class WritingMode : u8;
 struct BackgroundLayerData;
 struct CalculationContext;
 struct CalculationResolutionContext;
+struct ComputationContext;
 struct CSSStyleSheetInit;
+struct FunctionParameterInternal;
 struct GridRepeatParams;
 struct LogicalAliasMappingContext;
+struct NormalGap;
 struct RandomCachingKey;
 struct RequiredInvalidationAfterStyleChange;
 struct StyleSheetIdentifier;
@@ -522,6 +521,7 @@ class AbortSignal;
 class AbstractElement;
 class AbstractRange;
 class AccessibilityTreeNode;
+class AnchorNameMap;
 class Attr;
 class CDATASection;
 class CharacterData;
@@ -770,6 +770,7 @@ class HTMLOutputElement;
 class HTMLParagraphElement;
 class HTMLParamElement;
 class HTMLParser;
+class HTMLParserEndState;
 class HTMLPictureElement;
 class HTMLPreElement;
 class HTMLProgressElement;
@@ -886,7 +887,6 @@ struct SerializedPolicyContainer;
 struct SerializedTransferRecord;
 struct SourceSnapshotParams;
 struct StructuredSerializeOptions;
-struct SyntheticRealmSettings;
 struct ToggleTaskTracker;
 
 }
@@ -1126,6 +1126,8 @@ struct SerialPortInfo;
 
 namespace Web::ServiceWorker {
 
+class Cache;
+class CacheStorage;
 class ServiceWorker;
 class ServiceWorkerContainer;
 class ServiceWorkerRegistration;
@@ -1296,6 +1298,7 @@ class Instance;
 class Memory;
 class Module;
 class Table;
+class WebAssemblyModule;
 
 }
 
@@ -1410,9 +1413,12 @@ class VTTRegion;
 
 namespace Web::WebXR {
 
+class XRLayer;
+class XRRenderState;
 class XRSession;
 class XRSessionEvent;
 class XRSystem;
+class XRWebGLLayer;
 
 }
 

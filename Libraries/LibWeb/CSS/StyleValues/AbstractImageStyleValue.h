@@ -10,7 +10,6 @@
 #pragma once
 
 #include <LibWeb/CSS/PercentageOr.h>
-#include <LibWeb/CSS/Serialize.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
@@ -61,6 +60,13 @@ struct ColorStopListElement {
 
     bool operator==(ColorStopListElement const&) const = default;
     ColorStopListElement absolutized(ComputationContext const& context) const;
+    bool is_computationally_independent() const
+    {
+        return (!transition_hint || transition_hint->is_computationally_independent())
+            && (!color_stop.color || color_stop.color->is_computationally_independent())
+            && (!color_stop.position || color_stop.position->is_computationally_independent())
+            && (!color_stop.second_position || color_stop.second_position->is_computationally_independent());
+    }
 };
 void serialize_color_stop_list(StringBuilder&, Vector<ColorStopListElement> const&, SerializationMode);
 

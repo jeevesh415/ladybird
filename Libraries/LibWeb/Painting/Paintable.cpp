@@ -27,9 +27,10 @@ Paintable::Paintable(Layout::Node const& layout_node)
     : m_layout_node(layout_node)
 {
     auto& computed_values = layout_node.computed_values();
-    if (layout_node.is_grid_item() && computed_values.z_index().has_value()) {
-        // https://www.w3.org/TR/css-grid-2/#z-order
-        // grid items with z_index should behave as if position were "relative"
+    if ((layout_node.is_flex_item() || layout_node.is_grid_item()) && computed_values.z_index().has_value()) {
+        // https://drafts.csswg.org/css-flexbox-1/#painting
+        // https://drafts.csswg.org/css-grid-2/#z-order
+        // Flex and grid items with z-index values other than "auto" behave as if position were "relative".
         m_positioned = true;
     } else {
         m_positioned = computed_values.position() != CSS::Positioning::Static;
@@ -155,13 +156,13 @@ void Paintable::paint_inspector_overlay(DisplayListRecordingContext& context) co
         paintable_box = first_ancestor_of_type<PaintableBox>();
 
     if (paintable_box) {
-        auto* visual_context_tree = const_cast<ViewportPaintable*>(document().paintable())->visual_context_tree();
+        auto& visual_context_tree = const_cast<ViewportPaintable*>(document().paintable())->visual_context_tree();
         auto visual_context_index = paintable_box->accumulated_visual_context_index();
 
-        if (visual_context_tree && visual_context_index.value()) {
+        if (visual_context_index.value()) {
             Vector<VisualContextIndex> relevant_indices;
-            for (auto i = visual_context_index; i.value(); i = visual_context_tree->node_at(i).parent_index) {
-                auto should_keep = visual_context_tree->node_at(i).data.visit(
+            for (auto i = visual_context_index; i.value(); i = visual_context_tree.node_at(i).parent_index) {
+                auto should_keep = visual_context_tree.node_at(i).data.visit(
                     [](ScrollData const&) { return true; },
                     [](ClipData const&) { return false; },
                     [](TransformData const&) { return true; },
@@ -174,7 +175,7 @@ void Paintable::paint_inspector_overlay(DisplayListRecordingContext& context) co
 
             VisualContextIndex overlay_visual_context_index {};
             for (auto const& source_visual_context_index : relevant_indices.in_reverse())
-                overlay_visual_context_index = visual_context_tree->append(visual_context_tree->node_at(source_visual_context_index).data, overlay_visual_context_index);
+                overlay_visual_context_index = visual_context_tree.append(visual_context_tree.node_at(source_visual_context_index).data, overlay_visual_context_index);
 
             if (overlay_visual_context_index.value())
                 display_list_recorder.set_accumulated_visual_context(overlay_visual_context_index);
@@ -212,15 +213,15 @@ CSSPixelPoint Paintable::box_type_agnostic_position() const
     return position;
 }
 
-Painting::BorderRadiiData normalize_border_radii_data(Layout::Node const& node, CSSPixelRect const& rect, CSS::BorderRadiusData const& top_left_radius, CSS::BorderRadiusData const& top_right_radius, CSS::BorderRadiusData const& bottom_right_radius, CSS::BorderRadiusData const& bottom_left_radius)
+Painting::BorderRadiiData normalize_border_radii_data(Layout::Node const& node, CSSPixelRect const& border_rect, CSSPixelRect const& reference_rect, CSS::BorderRadiusData const& top_left_radius, CSS::BorderRadiusData const& top_right_radius, CSS::BorderRadiusData const& bottom_right_radius, CSS::BorderRadiusData const& bottom_left_radius)
 {
     Painting::BorderRadiiData radii_px {
         .top_left = {
-            top_left_radius.horizontal_radius.to_px(node, rect.width()),
-            top_left_radius.vertical_radius.to_px(node, rect.height()) },
-        .top_right = { top_right_radius.horizontal_radius.to_px(node, rect.width()), top_right_radius.vertical_radius.to_px(node, rect.height()) },
-        .bottom_right = { bottom_right_radius.horizontal_radius.to_px(node, rect.width()), bottom_right_radius.vertical_radius.to_px(node, rect.height()) },
-        .bottom_left = { bottom_left_radius.horizontal_radius.to_px(node, rect.width()), bottom_left_radius.vertical_radius.to_px(node, rect.height()) }
+            top_left_radius.horizontal_radius.to_px(node, reference_rect.width()),
+            top_left_radius.vertical_radius.to_px(node, reference_rect.height()) },
+        .top_right = { top_right_radius.horizontal_radius.to_px(node, reference_rect.width()), top_right_radius.vertical_radius.to_px(node, reference_rect.height()) },
+        .bottom_right = { bottom_right_radius.horizontal_radius.to_px(node, reference_rect.width()), bottom_right_radius.vertical_radius.to_px(node, reference_rect.height()) },
+        .bottom_left = { bottom_left_radius.horizontal_radius.to_px(node, reference_rect.width()), bottom_left_radius.vertical_radius.to_px(node, reference_rect.height()) }
     };
 
     // Scale overlapping curves according to https://www.w3.org/TR/css-backgrounds-3/#corner-overlap
@@ -238,14 +239,14 @@ Painting::BorderRadiiData normalize_border_radii_data(Layout::Node const& node, 
         auto s_left = radii_px.bottom_left.vertical_radius + radii_px.top_left.vertical_radius;
 
         CSSPixelFraction f = 1;
-        if (s_top > rect.width())
-            f = min(f, rect.width() / s_top);
-        if (s_right > rect.height())
-            f = min(f, rect.height() / s_right);
-        if (s_bottom > rect.width())
-            f = min(f, rect.width() / s_bottom);
-        if (s_left > rect.height())
-            f = min(f, rect.height() / s_left);
+        if (s_top > border_rect.width())
+            f = min(f, border_rect.width() / s_top);
+        if (s_right > border_rect.height())
+            f = min(f, border_rect.height() / s_right);
+        if (s_bottom > border_rect.width())
+            f = min(f, border_rect.width() / s_bottom);
+        if (s_left > border_rect.height())
+            f = min(f, border_rect.height() / s_left);
 
         // If f is 1 or more, the radii fit perfectly and no more scaling is needed
         if (f >= 1)
@@ -295,11 +296,11 @@ Paintable::SelectionStyle Paintable::selection_style() const
         auto context = CSS::ColorResolutionContext::for_layout_node_with_style(*element_layout_node);
 
         SelectionStyle style;
-        style.background_color = computed_selection_style->color_or_fallback(CSS::PropertyID::BackgroundColor, context, Color::Transparent);
+        style.background_color = computed_selection_style->color(CSS::PropertyID::BackgroundColor, context);
 
         // Only use text color if it was explicitly set in the ::selection rule, not inherited.
         if (!computed_selection_style->is_property_inherited(CSS::PropertyID::Color))
-            style.text_color = computed_selection_style->color_or_fallback(CSS::PropertyID::Color, context, Color::Transparent);
+            style.text_color = computed_selection_style->color(CSS::PropertyID::Color, context);
 
         // Only use text-shadow if it was explicitly set in the ::selection rule, not inherited.
         if (!computed_selection_style->is_property_inherited(CSS::PropertyID::TextShadow)) {
@@ -316,7 +317,7 @@ Paintable::SelectionStyle Paintable::selection_style() const
             style.text_decoration = TextDecorationStyle {
                 .line = computed_selection_style->text_decoration_line(),
                 .style = computed_selection_style->text_decoration_style(),
-                .color = computed_selection_style->color_or_fallback(CSS::PropertyID::TextDecorationColor, context, style.text_color.value_or(Color::Black)),
+                .color = computed_selection_style->color(CSS::PropertyID::TextDecorationColor, context),
             };
         }
 
@@ -349,10 +350,17 @@ void Paintable::set_selection_state(SelectionState state)
     if (m_selection_state == state)
         return;
     m_selection_state = state;
-    if (auto* box = as_if<PaintableBox>(this))
+    if (auto* box = as_if<PaintableBox>(this)) {
         box->invalidate_paint_cache();
-    else if (auto* containing_block = this->containing_block())
+    } else if (auto* containing_block = this->containing_block()) {
         containing_block->invalidate_paint_cache();
+        for (auto const* ancestor = layout_node().parent(); ancestor && ancestor != &containing_block->layout_node(); ancestor = ancestor->parent()) {
+            for (auto& paintable : ancestor->paintables()) {
+                if (auto* ancestor_box = as_if<PaintableBox>(paintable))
+                    ancestor_box->invalidate_paint_cache();
+            }
+        }
+    }
 }
 
 void Paintable::scroll_ancestor_to_offset_into_view(size_t offset)

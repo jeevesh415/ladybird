@@ -202,13 +202,21 @@ impl Parser<'_> {
         // falsely flagging parameter names like `function f(arguments)`.
         if let ExpressionKind::Identifier(ref id) = expression.inner
             && id.name == utf16!("arguments")
-            && !self.flags.strict_mode
-            && !self
-                .scope_collector
-                .has_declaration_in_current_function(&id.name)
         {
-            self.scope_collector
-                .set_contains_access_to_arguments_object_in_non_strict_mode();
+            // https://tc39.es/ecma262/#sec-class-static-initialization-blocks
+            // It is a Syntax Error if ContainsArguments of ClassStaticBlockBody is true.
+            if self.flags.in_class_static_init_block {
+                self.syntax_error(
+                    "'arguments' is not allowed in class static initialization blocks",
+                );
+            } else if !self.flags.strict_mode
+                && !self
+                    .scope_collector
+                    .has_declaration_in_current_function(&id.name)
+            {
+                self.scope_collector
+                    .set_contains_access_to_arguments_object_in_non_strict_mode();
+            }
         }
 
         if !should_continue {
@@ -296,7 +304,7 @@ impl Parser<'_> {
                 self.report_invalid_private_identifier_usage(&expression);
                 expressions.push(expression);
             }
-            return self.expression(start, ExpressionKind::Sequence(expressions));
+            return self.expression(start, ExpressionKind::Sequence(Box::new(expressions)));
         }
         expression
     }
@@ -370,10 +378,10 @@ impl Parser<'_> {
                     (
                         self.expression(
                             after_super,
-                            ExpressionKind::SuperCall(SuperCallData {
+                            ExpressionKind::SuperCall(Box::new(SuperCallData {
                                 arguments,
                                 is_synthetic: false,
-                            }),
+                            })),
                         ),
                         true,
                     )
@@ -415,7 +423,7 @@ impl Parser<'_> {
                     })
                     .collect();
                 (
-                    self.expression(start, ExpressionKind::BigIntLiteral(value_utf8)),
+                    self.expression(start, ExpressionKind::BigIntLiteral(Box::new(value_utf8))),
                     true,
                 )
             }
@@ -446,7 +454,7 @@ impl Parser<'_> {
                     }
                 }
                 (
-                    self.expression(after_string, ExpressionKind::StringLiteral(value)),
+                    self.expression(after_string, ExpressionKind::StringLiteral(Box::new(value))),
                     true,
                 )
             }
@@ -496,10 +504,8 @@ impl Parser<'_> {
                     return (arrow, false);
                 }
                 let token = self.consume_and_check_identifier();
-                let value = self.token_value(&token).to_vec();
-                let id = self.make_identifier(start, value.clone());
-                self.scope_collector
-                    .register_identifier(id.clone(), &value, None);
+                let id = self.make_identifier(start, self.token_identifier_name(&token));
+                self.scope_collector.register_identifier(id.clone(), None);
                 (self.expression(start, ExpressionKind::Identifier(id)), true)
             }
 
@@ -559,10 +565,10 @@ impl Parser<'_> {
                     (
                         self.expression(
                             start,
-                            ExpressionKind::ImportCall {
+                            ExpressionKind::ImportCall(Box::new(ImportCallData {
                                 specifier: Box::new(specifier),
                                 options,
-                            },
+                            })),
                         ),
                         true,
                     )
@@ -597,7 +603,7 @@ impl Parser<'_> {
             TokenType::PrivateIdentifier => {
                 let id = self.parse_private_identifier(start);
                 (
-                    self.expression(start, ExpressionKind::PrivateIdentifier(id)),
+                    self.expression(start, ExpressionKind::PrivateIdentifier(Box::new(id))),
                     true,
                 )
             }
@@ -646,18 +652,14 @@ impl Parser<'_> {
                         );
                     }
                     let token = self.consume_and_check_identifier();
-                    let value = self.token_value(&token).to_vec();
-                    let id = self.make_identifier(start, value.clone());
-                    self.scope_collector
-                        .register_identifier(id.clone(), &value, None);
+                    let id = self.make_identifier(start, self.token_identifier_name(&token));
+                    self.scope_collector.register_identifier(id.clone(), None);
                     (self.expression(start, ExpressionKind::Identifier(id)), true)
                 } else if self.match_token(TokenType::EscapedKeyword) {
                     self.syntax_error("Keyword must not contain escaped characters");
                     let token = self.consume_and_check_identifier();
-                    let value = self.token_value(&token).to_vec();
-                    let id = self.make_identifier(start, value.clone());
-                    self.scope_collector
-                        .register_identifier(id.clone(), &value, None);
+                    let id = self.make_identifier(start, self.token_identifier_name(&token));
+                    self.scope_collector.register_identifier(id.clone(), None);
                     (self.expression(start, ExpressionKind::Identifier(id)), true)
                 } else {
                     self.expected("primary expression");
@@ -682,21 +684,20 @@ impl Parser<'_> {
             Vec::new()
         };
         self.validate_regex_flags(&flags);
-        let compiled_regex = Rc::new(CompiledRegex::new(std::ptr::null_mut()));
-        self.deferred_regexes.push(super::DeferredRegex {
-            compiled_regex: compiled_regex.clone(),
-            pattern: pattern.clone(),
-            flags: flags.clone(),
-            line: start.line,
-            column: start.column,
-        });
+        let compiled_regex = match crate::bytecode::ffi::compile_regex(&pattern, &flags) {
+            Ok(handle) => Rc::new(CompiledRegex::new(handle)),
+            Err(msg) => {
+                self.syntax_error_at_position(&msg, start);
+                Rc::new(CompiledRegex::new(std::ptr::null_mut()))
+            }
+        };
         self.expression(
             start,
-            ExpressionKind::RegExpLiteral(RegExpLiteralData {
+            ExpressionKind::RegExpLiteral(Box::new(RegExpLiteralData {
                 pattern: pattern.into(),
                 flags: flags.into(),
                 compiled_regex,
-            }),
+            })),
         )
     }
 
@@ -737,7 +738,6 @@ impl Parser<'_> {
             | TokenType::ExclamationMarkEquals
             | TokenType::EqualsEqualsEquals
             | TokenType::ExclamationMarkEqualsEquals
-            | TokenType::In
             | TokenType::Instanceof => {
                 let op = token_to_binary_op(tt);
                 self.consume();
@@ -749,11 +749,39 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Binary {
+                        ExpressionKind::Binary(Box::new(BinaryExprData {
                             op,
                             lhs: Box::new(lhs),
                             rhs: Box::new(rhs),
-                        },
+                        })),
+                    ),
+                    ForbiddenTokens::none(),
+                )
+            }
+
+            TokenType::In => {
+                let is_private_in = matches!(&lhs.inner, ExpressionKind::PrivateIdentifier(_));
+                self.consume();
+                let rhs = self.parse_expression(
+                    min_precedence,
+                    Self::operator_associativity(tt),
+                    forbidden,
+                );
+                if is_private_in
+                    && let ExpressionKind::Function(fn_id) = &rhs.inner
+                    && self.function_table.get(*fn_id).is_arrow_function
+                {
+                    self.syntax_error("Arrow function is not allowed as the right-hand side of a private 'in' expression");
+                }
+
+                (
+                    self.expression(
+                        start,
+                        ExpressionKind::Binary(Box::new(BinaryExprData {
+                            op: BinaryOp::In,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        })),
                     ),
                     ForbiddenTokens::none(),
                 )
@@ -771,11 +799,11 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Logical {
+                        ExpressionKind::Logical(Box::new(LogicalExprData {
                             op: LogicalOp::And,
                             lhs: Box::new(lhs),
                             rhs: Box::new(rhs),
-                        },
+                        })),
                     ),
                     new_forbidden,
                 )
@@ -787,11 +815,11 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Logical {
+                        ExpressionKind::Logical(Box::new(LogicalExprData {
                             op: LogicalOp::Or,
                             lhs: Box::new(lhs),
                             rhs: Box::new(rhs),
-                        },
+                        })),
                     ),
                     new_forbidden,
                 )
@@ -804,11 +832,11 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Logical {
+                        ExpressionKind::Logical(Box::new(LogicalExprData {
                             op: LogicalOp::NullishCoalescing,
                             lhs: Box::new(lhs),
                             rhs: Box::new(rhs),
-                        },
+                        })),
                     ),
                     new_forbidden,
                 )
@@ -848,8 +876,10 @@ impl Parser<'_> {
 
                     // Register synthesized identifiers with the scope collector so
                     // they get resolved as locals during analyze().
-                    for (name, id) in self.pattern_bound_names.drain(..) {
-                        self.scope_collector.register_identifier(id, &name, None);
+                    let bound_names: Vec<_> = self.pattern_bound_names.drain(..).collect();
+                    for (name, id) in &bound_names {
+                        self.check_identifier_name_for_assignment_validity(name, false);
+                        self.scope_collector.register_identifier(id.clone(), None);
                     }
                     self.pattern_bound_names = saved_bound_names;
                     self.consume();
@@ -858,11 +888,11 @@ impl Parser<'_> {
                     return (
                         self.expression(
                             start,
-                            ExpressionKind::Assignment {
+                            ExpressionKind::Assignment(Box::new(AssignmentExprData {
                                 op,
                                 lhs: AssignmentLhs::Pattern(binding_pattern),
                                 rhs: Box::new(rhs),
-                            },
+                            })),
                         ),
                         ForbiddenTokens::none(),
                     );
@@ -884,11 +914,11 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Assignment {
+                        ExpressionKind::Assignment(Box::new(AssignmentExprData {
                             op,
                             lhs: AssignmentLhs::Expression(Box::new(lhs)),
                             rhs: Box::new(rhs),
-                        },
+                        })),
                     ),
                     ForbiddenTokens::none(),
                 )
@@ -904,11 +934,11 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Conditional {
+                        ExpressionKind::Conditional(Box::new(ConditionalExprData {
                             test: Box::new(lhs),
                             consequent: Box::new(consequent),
                             alternate: Box::new(alternate),
-                        },
+                        })),
                     ),
                     ForbiddenTokens::none(),
                 )
@@ -918,36 +948,42 @@ impl Parser<'_> {
             TokenType::Period => {
                 self.consume();
                 if self.match_token(TokenType::PrivateIdentifier) {
+                    // https://tc39.es/ecma262/#sec-static-semantics-early-errors
+                    // It is a Syntax Error if MemberExpression is SuperProperty
+                    // and the PrivateIdentifier is present.
+                    if matches!(lhs.inner, ExpressionKind::Super) {
+                        self.syntax_error("Cannot access private field or method via 'super'");
+                    }
                     // C++ uses rule_start (period position) for property identifiers.
                     let id = self.parse_private_identifier(start);
-                    let property = self.expression(start, ExpressionKind::PrivateIdentifier(id));
+                    let property =
+                        self.expression(start, ExpressionKind::PrivateIdentifier(Box::new(id)));
                     (
                         self.expression(
                             start,
-                            ExpressionKind::Member {
+                            ExpressionKind::Member(Box::new(MemberExprData {
                                 object: Box::new(lhs),
                                 property: Box::new(property),
                                 computed: false,
-                            },
+                            })),
                         ),
                         ForbiddenTokens::none(),
                     )
                 } else if self.match_identifier_name() {
                     let token = self.consume();
-                    let value = self.token_value(&token).to_vec();
                     // C++ uses rule_start (period position) for property identifiers.
-                    let property = self.expression(
-                        start,
-                        ExpressionKind::Identifier(self.make_identifier(start, value)),
-                    );
+                    let property_identifier =
+                        self.make_identifier(start, self.token_identifier_name(&token));
+                    let property =
+                        self.expression(start, ExpressionKind::Identifier(property_identifier));
                     (
                         self.expression(
                             start,
-                            ExpressionKind::Member {
+                            ExpressionKind::Member(Box::new(MemberExprData {
                                 object: Box::new(lhs),
                                 property: Box::new(property),
                                 computed: false,
-                            },
+                            })),
                         ),
                         ForbiddenTokens::none(),
                     )
@@ -965,11 +1001,11 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Member {
+                        ExpressionKind::Member(Box::new(MemberExprData {
                             object: Box::new(lhs),
                             property: Box::new(property),
                             computed: true,
-                        },
+                        })),
                     ),
                     ForbiddenTokens::none(),
                 )
@@ -1018,11 +1054,11 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Update {
+                        ExpressionKind::Update(Box::new(UpdateExprData {
                             op: UpdateOp::Increment,
                             argument: Box::new(lhs),
                             prefixed: false,
-                        },
+                        })),
                     ),
                     ForbiddenTokens::none(),
                 )
@@ -1038,11 +1074,11 @@ impl Parser<'_> {
                 (
                     self.expression(
                         start,
-                        ExpressionKind::Update {
+                        ExpressionKind::Update(Box::new(UpdateExprData {
                             op: UpdateOp::Decrement,
                             argument: Box::new(lhs),
                             prefixed: false,
-                        },
+                        })),
                     ),
                     ForbiddenTokens::none(),
                 )
@@ -1075,11 +1111,11 @@ impl Parser<'_> {
                 }
                 self.expression(
                     start,
-                    ExpressionKind::Update {
+                    ExpressionKind::Update(Box::new(UpdateExprData {
                         op: UpdateOp::Increment,
                         argument: Box::new(expression),
                         prefixed: true,
-                    },
+                    })),
                 )
             }
             TokenType::MinusMinus => {
@@ -1097,11 +1133,11 @@ impl Parser<'_> {
                 }
                 self.expression(
                     start,
-                    ExpressionKind::Update {
+                    ExpressionKind::Update(Box::new(UpdateExprData {
                         op: UpdateOp::Decrement,
                         argument: Box::new(expression),
                         prefixed: true,
-                    },
+                    })),
                 )
             }
             TokenType::ExclamationMark
@@ -1152,8 +1188,8 @@ impl Parser<'_> {
                         rhs_start.column,
                     );
                 }
-                if let ExpressionKind::Member { property, .. } = &expression.inner
-                    && matches!(property.inner, ExpressionKind::PrivateIdentifier(_))
+                if let ExpressionKind::Member(ref data) = expression.inner
+                    && matches!(data.property.inner, ExpressionKind::PrivateIdentifier(_))
                 {
                     self.syntax_error("Private fields cannot be deleted");
                 }
@@ -1194,10 +1230,7 @@ impl Parser<'_> {
             // It is a Syntax Error if NewTarget is not enclosed, directly or indirectly
             // (but not crossing function or class static initialization block boundaries),
             // within a FunctionBody, ConciseBody, ClassStaticBlock, or ClassBody.
-            if !self.flags.in_function_context
-                && !self.in_eval_function_context
-                && !self.flags.in_class_static_init_block
-            {
+            if !self.flags.new_target_is_valid && !self.in_eval_function_context {
                 self.syntax_error("'new.target' not allowed outside of a function");
             }
             if self.scope_collector.has_current_scope() {
@@ -1217,7 +1250,7 @@ impl Parser<'_> {
             self.parse_expression(PRECEDENCE_MEMBER, Associativity::Right, forbidden)
         };
 
-        if matches!(callee.inner, ExpressionKind::ImportCall { .. }) {
+        if matches!(callee.inner, ExpressionKind::ImportCall(_)) {
             self.syntax_error("Cannot call new on dynamic import");
         }
 
@@ -1225,23 +1258,23 @@ impl Parser<'_> {
             let arguments = self.parse_arguments();
             self.expression(
                 start,
-                ExpressionKind::New(CallExpressionData {
+                ExpressionKind::New(Box::new(CallExpressionData {
                     callee: Box::new(callee),
                     arguments,
                     // Mirrors C++ InvocationStyle::Parenthesized for `new Foo(...)`.
                     is_parenthesized: true,
                     is_inside_parens: false,
-                }),
+                })),
             )
         } else {
             self.expression(
                 start,
-                ExpressionKind::New(CallExpressionData {
+                ExpressionKind::New(Box::new(CallExpressionData {
                     callee: Box::new(callee),
                     arguments: Vec::new(),
                     is_parenthesized: false,
                     is_inside_parens: false,
-                }),
+                })),
             )
         }
     }
@@ -1264,12 +1297,12 @@ impl Parser<'_> {
         }
         self.expression(
             start,
-            ExpressionKind::Call(CallExpressionData {
+            ExpressionKind::Call(Box::new(CallExpressionData {
                 callee: Box::new(callee),
                 arguments,
                 is_parenthesized: false,
                 is_inside_parens: false,
-            }),
+            })),
         )
     }
 
@@ -1345,9 +1378,11 @@ impl Parser<'_> {
                         if self.match_identifier_name() {
                             let property_start = self.position();
                             let token = self.consume();
-                            let value = self.token_value(&token).to_vec();
                             references.push(OptionalChainReference::MemberReference {
-                                identifier: self.make_identifier(property_start, value),
+                                identifier: self.make_identifier(
+                                    property_start,
+                                    self.token_identifier_name(&token),
+                                ),
                                 mode: OptionalChainMode::Optional,
                             });
                         } else {
@@ -1374,9 +1409,9 @@ impl Parser<'_> {
                 } else if self.match_identifier_name() {
                     let property_start = self.position();
                     let token = self.consume();
-                    let value = self.token_value(&token).to_vec();
                     references.push(OptionalChainReference::MemberReference {
-                        identifier: self.make_identifier(property_start, value),
+                        identifier: self
+                            .make_identifier(property_start, self.token_identifier_name(&token)),
                         mode: OptionalChainMode::NotOptional,
                     });
                 } else {
@@ -1405,10 +1440,10 @@ impl Parser<'_> {
 
         self.expression(
             start,
-            ExpressionKind::OptionalChain {
+            ExpressionKind::OptionalChain(Box::new(OptionalChainData {
                 base: Box::new(base),
                 references,
-            },
+            })),
         )
     }
 
@@ -1433,10 +1468,10 @@ impl Parser<'_> {
         if self.current_token.trivia_has_line_terminator {
             return self.expression(
                 start,
-                ExpressionKind::Yield {
+                ExpressionKind::Yield(Box::new(YieldExprData {
                     argument: None,
                     is_yield_from: false,
-                },
+                })),
             );
         }
 
@@ -1449,18 +1484,18 @@ impl Parser<'_> {
             let argument = self.parse_assignment_expression();
             self.expression(
                 start,
-                ExpressionKind::Yield {
+                ExpressionKind::Yield(Box::new(YieldExprData {
                     argument: Some(Box::new(argument)),
                     is_yield_from,
-                },
+                })),
             )
         } else {
             self.expression(
                 start,
-                ExpressionKind::Yield {
+                ExpressionKind::Yield(Box::new(YieldExprData {
                     argument: None,
                     is_yield_from: false,
-                },
+                })),
             )
         }
     }
@@ -1533,7 +1568,7 @@ impl Parser<'_> {
         }
 
         self.consume_token(TokenType::CurlyClose);
-        self.expression(start, ExpressionKind::Object(properties))
+        self.expression(start, ExpressionKind::Object(Box::new(properties)))
     }
 
     fn parse_object_property(&mut self, obj_start: Position) -> ObjectProperty {
@@ -1636,6 +1671,10 @@ impl Parser<'_> {
         if is_async {
             self.syntax_error("Expected function after async keyword");
         }
+        // Generator shorthand requires a method body.
+        if is_generator {
+            self.syntax_error("Expected method after generator star");
+        }
 
         if is_getter || is_setter {
             let method_kind = if is_getter {
@@ -1690,8 +1729,7 @@ impl Parser<'_> {
             && let Some(kv) = &key_value
         {
             let id = self.make_identifier(obj_start, kv.clone());
-            self.scope_collector
-                .register_identifier(id.clone(), &id.name, None);
+            self.scope_collector.register_identifier(id.clone(), None);
             let value = self.expression(obj_start, ExpressionKind::Identifier(id));
             self.consume(); // consume '='
             // NB: Add a syntax error for CoverInitializedName. This error will
@@ -1722,8 +1760,7 @@ impl Parser<'_> {
                 self.syntax_error(&format!("'{name_str}' is a reserved keyword"));
             }
             let id = self.make_identifier(obj_start, kv);
-            self.scope_collector
-                .register_identifier(id.clone(), &id.name, None);
+            self.scope_collector.register_identifier(id.clone(), None);
             let value = self.expression(obj_start, ExpressionKind::Identifier(id));
             return ObjectProperty {
                 range: self.range_from(obj_start),
@@ -1803,8 +1840,10 @@ impl Parser<'_> {
                     }
                 }
                 let is_proto = value == proto_name;
-                let expression =
-                    self.expression(after_string, ExpressionKind::StringLiteral(value.clone()));
+                let expression = self.expression(
+                    after_string,
+                    ExpressionKind::StringLiteral(Box::new(value.clone())),
+                );
                 PropertyKey {
                     expression,
                     name: Some(value),
@@ -1840,7 +1879,8 @@ impl Parser<'_> {
                         c as u8 as char
                     })
                     .collect();
-                let expression = self.expression(start, ExpressionKind::BigIntLiteral(value_utf8));
+                let expression =
+                    self.expression(start, ExpressionKind::BigIntLiteral(Box::new(value_utf8)));
                 PropertyKey {
                     expression,
                     name: None,
@@ -1861,10 +1901,10 @@ impl Parser<'_> {
                 let key_start = ident_pos_override.unwrap_or(start);
                 let expression = self.expression(
                     key_start,
-                    ExpressionKind::PrivateIdentifier(PrivateIdentifier {
+                    ExpressionKind::PrivateIdentifier(Box::new(PrivateIdentifier {
                         range: self.range_from(key_start),
                         name: value.clone(),
-                    }),
+                    })),
                 );
                 PropertyKey {
                     expression,
@@ -1885,8 +1925,10 @@ impl Parser<'_> {
                     let is_proto = value == proto_name;
                     // C++ uses the object expression start position for identifier-name keys.
                     let key_start = ident_pos_override.unwrap_or(start);
-                    let expression =
-                        self.expression(key_start, ExpressionKind::StringLiteral(value.clone()));
+                    let expression = self.expression(
+                        key_start,
+                        ExpressionKind::StringLiteral(Box::new(value.clone())),
+                    );
                     PropertyKey {
                         expression,
                         name: Some(value),
@@ -1897,8 +1939,10 @@ impl Parser<'_> {
                 } else {
                     self.expected("property key");
                     self.consume();
-                    let expression =
-                        self.expression(start, ExpressionKind::StringLiteral(Utf16String::new()));
+                    let expression = self.expression(
+                        start,
+                        ExpressionKind::StringLiteral(Box::new(Utf16String::new())),
+                    );
                     PropertyKey {
                         expression,
                         name: None,
@@ -1939,7 +1983,7 @@ impl Parser<'_> {
         }
 
         self.consume_token(TokenType::BracketClose);
-        self.expression(start, ExpressionKind::Array(elements))
+        self.expression(start, ExpressionKind::Array(Box::new(elements)))
     }
 
     /// Parse a template literal (`` `...${expression}...` ``).
@@ -1961,10 +2005,10 @@ impl Parser<'_> {
             let template = self.parse_template_literal(true);
             expression = self.expression(
                 tag_start,
-                ExpressionKind::TaggedTemplateLiteral {
+                ExpressionKind::TaggedTemplateLiteral(Box::new(TaggedTemplateData {
                     tag: Box::new(expression),
                     template_literal: Box::new(template),
-                },
+                })),
             );
         }
         expression
@@ -1982,8 +2026,10 @@ impl Parser<'_> {
             if is_tagged {
                 raw_strings.push(Utf16String::new());
             }
-            expressions
-                .push(self.expression(start, ExpressionKind::StringLiteral(Utf16String::new())));
+            expressions.push(self.expression(
+                start,
+                ExpressionKind::StringLiteral(Box::new(Utf16String::new())),
+            ));
         }
 
         // For non-tagged templates, we collect parts as expressions (alternating
@@ -2005,9 +2051,10 @@ impl Parser<'_> {
                     let raw_value = raw_template_value(&raw);
                     raw_strings.push(raw_value);
                     match self.process_template_escape_sequences(&raw) {
-                        Some(cooked) => expressions.push(
-                            self.expression(string_pos, ExpressionKind::StringLiteral(cooked)),
-                        ),
+                        Some(cooked) => expressions.push(self.expression(
+                            string_pos,
+                            ExpressionKind::StringLiteral(Box::new(cooked)),
+                        )),
                         // C++ uses rule_start (template literal start) for NullLiteral.
                         None => {
                             expressions.push(self.expression(start, ExpressionKind::NullLiteral));
@@ -2018,8 +2065,9 @@ impl Parser<'_> {
                     if has_octal {
                         self.syntax_error("Octal escape sequence not allowed in template literal");
                     }
-                    expressions
-                        .push(self.expression(string_pos, ExpressionKind::StringLiteral(value)));
+                    expressions.push(
+                        self.expression(string_pos, ExpressionKind::StringLiteral(Box::new(value))),
+                    );
                 }
             } else if self.match_token(TokenType::TemplateLiteralExprStart) {
                 self.consume();
@@ -2028,9 +2076,10 @@ impl Parser<'_> {
                 self.consume_token(TokenType::TemplateLiteralExprEnd);
                 // After an expression, if no template string follows, insert empty.
                 if !self.match_token(TokenType::TemplateLiteralString) {
-                    expressions.push(
-                        self.expression(start, ExpressionKind::StringLiteral(Utf16String::new())),
-                    );
+                    expressions.push(self.expression(
+                        start,
+                        ExpressionKind::StringLiteral(Box::new(Utf16String::new())),
+                    ));
                     if is_tagged {
                         raw_strings.push(Utf16String::new());
                     }
@@ -2045,10 +2094,10 @@ impl Parser<'_> {
 
         self.expression(
             start,
-            ExpressionKind::TemplateLiteral(TemplateLiteralData {
+            ExpressionKind::TemplateLiteral(Box::new(TemplateLiteralData {
                 expressions,
                 raw_strings,
-            }),
+            })),
         )
     }
 
@@ -2442,8 +2491,12 @@ impl Parser<'_> {
             self.scope_collector.close_scope();
             self.pattern_bound_names = saved_pattern_bound_names;
 
-            if has_use_strict || fn_kind != FunctionKind::Normal {
-                self.check_parameters_post_body(&parameter_info, has_use_strict, fn_kind);
+            if has_use_strict || fn_kind != FunctionKind::Normal || self.flags.strict_mode {
+                self.check_parameters_post_body(
+                    &parameter_info,
+                    has_use_strict || self.flags.strict_mode,
+                    fn_kind,
+                );
             }
 
             self.flags.await_expression_is_valid = saved_await_body;
@@ -2490,6 +2543,10 @@ impl Parser<'_> {
             self.scope_collector.close_scope();
             self.pattern_bound_names = saved_pattern_bound_names;
 
+            if self.flags.strict_mode || fn_kind != FunctionKind::Normal {
+                self.check_parameters_post_body(&parameter_info, self.flags.strict_mode, fn_kind);
+            }
+
             self.flags.await_expression_is_valid = saved_await_body;
             self.flags.in_class_static_init_block = saved_static_init;
             self.flags.in_formal_parameter_context = saved_formal_parameter_ctx;
@@ -2532,6 +2589,7 @@ impl Parser<'_> {
         let saved_field_init = self.flags.in_class_field_initializer;
         let saved_allow_super_call = self.flags.allow_super_constructor_call;
         let saved_allow_super_lookup = self.flags.allow_super_property_lookup;
+        let saved_new_target = self.flags.new_target_is_valid;
         self.flags.in_generator_function_context = is_generator;
         self.flags.await_expression_is_valid = is_async;
         self.flags.in_class_static_init_block = false;
@@ -2539,6 +2597,7 @@ impl Parser<'_> {
         self.flags.allow_super_constructor_call =
             method_kind == MethodKind::Constructor && self.class_has_super_class;
         self.flags.allow_super_property_lookup = true;
+        self.flags.new_target_is_valid = true;
 
         // Save pattern_bound_names so that destructuring patterns in the
         // method body don't steal names from an outer binding context.
@@ -2569,12 +2628,16 @@ impl Parser<'_> {
         self.scope_collector.close_scope();
         self.pattern_bound_names = saved_pattern_bound_names;
 
-        self.flags.in_class_static_init_block = saved_static_init;
-        self.flags.in_class_field_initializer = saved_field_init;
-
+        // Check parameters before restoring flags so that the method's
+        // context is used (e.g. in_class_static_init_block must remain
+        // false to allow `await` as a parameter name in generators).
         if has_use_strict || fn_kind != FunctionKind::Normal {
             self.check_parameters_post_body(&parsed.parameter_info, has_use_strict, fn_kind);
         }
+
+        self.flags.in_class_static_init_block = saved_static_init;
+        self.flags.in_class_field_initializer = saved_field_init;
+        self.flags.new_target_is_valid = saved_new_target;
 
         insights.might_need_arguments_object = self.flags.function_might_need_arguments_object;
         self.flags.function_might_need_arguments_object = saved_might_need_arguments;

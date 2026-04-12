@@ -10,6 +10,7 @@
 #pragma once
 
 #include <AK/Checked.h>
+#include <AK/Span.h>
 #include <LibJS/Bytecode/BasicBlock.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
@@ -24,7 +25,7 @@ using ScriptOrModule = Variant<Empty, GC::Ref<Script>, GC::Ref<Module>>;
 
 // 9.4 Execution Contexts, https://tc39.es/ecma262/#sec-execution-contexts
 struct JS_API ExecutionContext {
-    static NonnullOwnPtr<ExecutionContext> create(u32 registers_and_locals_count, u32 constants_count, u32 arguments_count);
+    static NonnullOwnPtr<ExecutionContext> create(u32 registers_and_locals_count, ReadonlySpan<Value> constants, u32 arguments_count);
     [[nodiscard]] NonnullOwnPtr<ExecutionContext> copy() const;
 
     ~ExecutionContext() = default;
@@ -36,15 +37,16 @@ private:
 
 public:
     // NB: The layout is: [registers | locals | constants | arguments]
-    //     We only initialize registers and locals to empty, since constants are copied in right after.
-    ALWAYS_INLINE ExecutionContext(u32 registers_and_locals_count, u32 constants_count, u32 arguments_count_)
+    ALWAYS_INLINE ExecutionContext(u32 registers_and_locals_count, ReadonlySpan<Value> constants, u32 arguments_count_)
     {
-        VERIFY(!Checked<u32>::addition_would_overflow(registers_and_locals_count, constants_count, arguments_count_));
-        registers_and_constants_and_locals_and_arguments_count = registers_and_locals_count + constants_count + arguments_count_;
+        VERIFY(!Checked<u32>::addition_would_overflow(registers_and_locals_count, constants.size(), arguments_count_));
+        registers_and_constants_and_locals_and_arguments_count = registers_and_locals_count + constants.size() + arguments_count_;
         argument_count = arguments_count_;
         auto* values = registers_and_constants_and_locals_and_arguments();
         for (size_t i = 0; i < registers_and_locals_count; ++i)
             values[i] = js_special_empty_value();
+        for (size_t i = 0; i < constants.size(); ++i)
+            values[registers_and_locals_count + i] = constants[i];
     }
 
     void operator delete(void* ptr);
@@ -61,6 +63,15 @@ public:
     // https://html.spec.whatwg.org/multipage/webappapis.html#skip-when-determining-incumbent-counter
     // FIXME: Move this out of LibJS (e.g. by using the CustomData concept), as it's used exclusively by LibWeb.
     u32 skip_when_determining_incumbent_counter { 0 };
+
+    // Non-standard: Used by generators/async generators to communicate yield/await
+    // state back to the caller without allocating a GC cell.
+    // UINT32_MAX means "no continuation" (generator is done).
+    static constexpr u32 no_yield_continuation = UINT32_MAX;
+    u32 yield_continuation { no_yield_continuation };
+
+    bool yield_is_await { false };
+    bool caller_is_construct { false };
 
     Optional<Value> this_value;
 
@@ -110,7 +121,6 @@ public:
     u32 passed_argument_count { 0 };
     u32 caller_return_pc { 0 };
     u32 caller_dst_raw { 0 };
-    bool caller_is_construct { false };
 
 private:
     friend class Bytecode::Interpreter;

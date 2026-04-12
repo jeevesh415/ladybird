@@ -15,17 +15,20 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
+#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RatioStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Canvas/SerializeBitmap.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
+#include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/Layout/CanvasBox.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/WebGL/WebGL2RenderingContext.h>
 #include <LibWeb/WebGL/WebGLRenderingContext.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -101,7 +104,7 @@ void HTMLCanvasElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperti
         cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::AspectRatio,
             CSS::StyleValueList::create(CSS::StyleValueVector {
                                             CSS::KeywordStyleValue::create(CSS::Keyword::Auto),
-                                            CSS::RatioStyleValue::create(CSS::Ratio { static_cast<double>(w.value()), static_cast<double>(h.value()) }) },
+                                            CSS::RatioStyleValue::create(CSS::NumberStyleValue::create(w.value()), CSS::NumberStyleValue::create(h.value())) },
 
                 CSS::StyleValueList::Separator::Space));
 }
@@ -162,6 +165,40 @@ void HTMLCanvasElement::reset_context_to_default_state()
         [](Empty) {
             // Do nothing.
         });
+}
+
+CSS::ComputationContext HTMLCanvasElement::canvas_font_computation_context()
+{
+    DOM::AbstractElement abstract_element { *this };
+    Optional<CSS::Length::ResolutionContext> length_resolution_context;
+
+    if (is_connected() && this->navigable()) {
+        length_resolution_context = CSS::Length::ResolutionContext::for_element(abstract_element);
+    } else {
+        // NB: This is similar to the document's LRC but using the default canvas context font size of 10px
+        CSS::Length::FontMetrics font_metrics { 10, Platform::FontPlugin::the().default_font(8)->pixel_metrics(), CSS::InitialValues::line_height() };
+
+        CSSPixelRect viewport_rect;
+        if (auto navigable = this->navigable())
+            viewport_rect = navigable->viewport_rect();
+
+        length_resolution_context = {
+            .viewport_rect = viewport_rect,
+            .font_metrics = font_metrics,
+            .root_font_metrics = font_metrics
+        };
+    }
+
+    return CSS::ComputationContext {
+        .length_resolution_context = length_resolution_context.value(),
+
+        // NB: We require a abstract element here since tree counting functions are allowed in font values unlike for
+        //     OffscreenCanvas
+        .abstract_element = abstract_element,
+
+        // FIXME: Do we require a color scheme to resolve light-dark()?
+        .color_scheme = {}
+    };
 }
 
 void HTMLCanvasElement::notify_context_about_canvas_size_change()

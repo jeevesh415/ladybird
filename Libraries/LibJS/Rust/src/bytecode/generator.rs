@@ -141,6 +141,7 @@ pub struct Generator {
     undefined_constant: Option<ScopedOperand>,
     empty_constant: Option<ScopedOperand>,
     int32_constants: HashMap<i32, ScopedOperand>,
+    double_constants: HashMap<u64, ScopedOperand>,
     string_constants: HashMap<Utf16String, ScopedOperand>,
 
     // --- String/identifier/property tables (with deduplication) ---
@@ -171,6 +172,7 @@ pub struct Generator {
     pub next_global_variable_cache: u32,
     pub next_template_object_cache: u32,
     pub next_object_shape_cache: u32,
+    pub next_object_property_iterator_cache: u32,
 
     // --- Codegen state ---
     pub strict: bool,
@@ -294,6 +296,7 @@ impl Generator {
             undefined_constant: None,
             empty_constant: None,
             int32_constants: HashMap::new(),
+            double_constants: HashMap::new(),
             string_constants: HashMap::new(),
             string_table: Vec::new(),
             string_table_index: HashMap::new(),
@@ -314,6 +317,7 @@ impl Generator {
             next_global_variable_cache: 0,
             next_template_object_cache: 0,
             next_object_shape_cache: 0,
+            next_object_property_iterator_cache: 0,
             strict: false,
             function_environment_needed: true,
             enclosing_function_kind: FunctionKind::Normal,
@@ -477,7 +481,14 @@ impl Generator {
             self.int32_constants.insert(as_i32, op.clone());
             return op;
         }
-        self.append_constant(ConstantValue::Number(value))
+        // Deduplicate double values by their bit representation
+        let as_bits = value.to_bits();
+        if let Some(op) = self.double_constants.get(&as_bits) {
+            return op.clone();
+        }
+        let op = self.append_constant(ConstantValue::Number(value));
+        self.double_constants.insert(as_bits, op.clone());
+        op
     }
 
     pub fn add_constant_boolean(&mut self, value: bool) -> ScopedOperand {
@@ -680,8 +691,8 @@ impl Generator {
     }
 
     pub fn emit_mov_raw(&mut self, dst: Operand, src: Operand) {
-        // NB: Unlike emit_mov (ScopedOperand version), this does NOT skip self-moves.
-        //     This matches C++ emit_mov(Operand, Operand) which also emits unconditionally.
+        // NB: Unlike emit_mov (ScopedOperand version), this does NOT skip
+        //     self-moves and emits unconditionally.
         self.emit(Instruction::Mov { dst, src });
     }
 
@@ -806,6 +817,10 @@ impl Generator {
     next_cache_method!(next_global_variable_cache, next_global_variable_cache);
     next_cache_method!(next_template_object_cache, next_template_object_cache);
     next_cache_method!(next_object_shape_cache, next_object_shape_cache);
+    next_cache_method!(
+        next_object_property_iterator_cache,
+        next_object_property_iterator_cache
+    );
 
     // --- Lexical environment helpers ---
 
@@ -1288,7 +1303,7 @@ impl Generator {
         // If any block is unterminated, ensure the undefined constant exists
         // for the assembly-time End(undefined) fallthrough. This must happen
         // before computing number_of_constants so operand rewriting accounts
-        // for it (matching C++ compile()).
+        // for it.
         let has_unterminated = self.basic_blocks.iter().any(|b| !b.terminated);
         let undefined_constant_operand = if has_unterminated {
             Some(self.add_constant_undefined().operand())
@@ -1408,8 +1423,7 @@ impl Generator {
             }
         }
 
-        // Phase 2: Compute block byte offsets, applying assembly-time optimizations.
-        // These match the C++ Generator.cpp:compile() optimizations:
+        // Phase 2: Compute block byte offsets, applying assembly-time optimizations:
         //   - Skip Jump-to-next-block
         //   - Replace Jump-to-Return/End-only-block with inline Return/End
         //   - Replace JumpIf-where-one-target-is-next-block with JumpTrue/JumpFalse
@@ -1439,8 +1453,7 @@ impl Generator {
                         // OPTIMIZATION: Don't emit jumps that just jump to the next block.
                         if target_block == block_index + 1 {
                             // If this block would become empty, we handle it by
-                            // not advancing offset (matching C++ behavior of removing
-                            // the block_start_offset entry and reusing it).
+                            // not advancing offset.
                             block_actions.push(InstAction::Skip);
                             continue;
                         }
@@ -1519,10 +1532,8 @@ impl Generator {
             actions.push(block_actions);
         }
 
-        // Check if any block became empty due to skip, and adjust its offset
-        // to match the next block's offset (C++ pops basic_block_start_offsets.last()).
-        // We handle this by keeping block_offsets as-is since labels referencing
-        // an empty block will resolve to the same byte offset as the next block.
+        // NB: Empty blocks (from skipped jumps) have the same byte offset as
+        // the next block, so labels referencing them resolve correctly.
 
         // Phase 3: Patch labels (block index → byte offset)
         for block in &mut self.basic_blocks {
@@ -1538,8 +1549,7 @@ impl Generator {
         let mut bytecode: Vec<u8> = Vec::with_capacity(offset);
         let mut source_map: Vec<SourceMapEntry> = Vec::new();
         let mut exception_handlers: Vec<ExceptionHandler> = Vec::new();
-        // Track which blocks actually produced instructions (matching C++ behavior
-        // of popping basic_block_start_offsets when a block becomes empty).
+        // Track which blocks actually produced instructions.
         let mut basic_block_start_offsets: Vec<usize> = Vec::with_capacity(num_blocks);
 
         for (block_index, block) in self.basic_blocks.iter().enumerate() {
@@ -1553,7 +1563,7 @@ impl Generator {
                 match action {
                     InstAction::Skip => {
                         // If this skip makes the block empty, remove it from
-                        // basic_block_start_offsets (matching C++ take_last()).
+                        // basic_block_start_offsets.
                         if basic_block_start_offsets.last() == Some(&bytecode.len()) {
                             basic_block_start_offsets.pop();
                         }
@@ -1650,8 +1660,7 @@ impl Generator {
             }
         }
 
-        // Merge adjacent exception handlers with the same handler offset
-        // (matching C++ Generator.cpp behavior).
+        // Merge adjacent exception handlers with the same handler offset.
         let mut merged_handlers: Vec<ExceptionHandler> = Vec::new();
         for handler in &exception_handlers {
             if let Some(last) = merged_handlers.last_mut()

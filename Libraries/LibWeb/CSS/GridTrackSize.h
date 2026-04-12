@@ -19,8 +19,7 @@ namespace Web::CSS {
 
 class GridSize {
 public:
-    GridSize(Size);
-    GridSize(Flex);
+    GridSize(NonnullRefPtr<StyleValue const>);
     ~GridSize();
 
     static GridSize make_auto();
@@ -32,8 +31,10 @@ public:
     bool is_max_content() const;
     bool is_min_content() const;
 
-    Size css_size() const { return m_value.get<Size>(); }
-    double flex_factor() const { return m_value.get<Flex>().to_fr(); }
+    Size css_size() const { return Size::from_style_value(m_value); }
+    double flex_factor() const { return Flex::from_style_value(m_value).to_fr(); }
+
+    NonnullRefPtr<StyleValue const> style_value() const { return m_value; }
 
     // https://www.w3.org/TR/css-grid-2/#layout-algorithm
     // An intrinsic sizing function (min-content, max-content, auto, fit-content()).
@@ -46,8 +47,10 @@ public:
     GridSize absolutized(ComputationContext const&) const;
     bool operator==(GridSize const& other) const = default;
 
+    bool is_computationally_independent() const { return m_value->is_computationally_independent(); }
+
 private:
-    Variant<Size, Flex> m_value;
+    ValueComparingNonnullRefPtr<StyleValue const> m_value;
 };
 
 class GridMinMax {
@@ -61,6 +64,11 @@ public:
     String to_string(SerializationMode) const;
     GridMinMax absolutized(ComputationContext const&) const;
     bool operator==(GridMinMax const& other) const = default;
+
+    bool is_computationally_independent() const
+    {
+        return m_min_grid_size.is_computationally_independent() && m_max_grid_size.is_computationally_independent();
+    }
 
 private:
     GridSize m_min_grid_size;
@@ -125,6 +133,8 @@ public:
 
     GridTrackSizeList absolutized(ComputationContext const&) const;
 
+    bool is_computationally_independent() const;
+
 private:
     Vector<Variant<ExplicitGridTrack, GridLineNames>> m_list;
 };
@@ -137,12 +147,12 @@ enum class GridRepeatType {
 
 struct GridRepeatParams {
     GridRepeatType type;
-    size_t count { 0 };
+    RefPtr<StyleValue const> count { nullptr };
 };
 
 class GridRepeat {
 public:
-    GridRepeat(GridRepeatType, GridTrackSizeList&&, size_t repeat_count);
+    GridRepeat(GridRepeatType, GridTrackSizeList&&, RefPtr<StyleValue const> repeat_count);
     GridRepeat(GridTrackSizeList&&, GridRepeatParams const&);
 
     bool is_auto_fill() const { return m_type == GridRepeatType::AutoFill; }
@@ -151,7 +161,7 @@ public:
     size_t repeat_count() const
     {
         VERIFY(is_fixed());
-        return m_repeat_count;
+        return int_from_style_value(*m_repeat_count);
     }
     GridTrackSizeList const& grid_track_size_list() const& { return m_grid_track_size_list; }
     GridRepeatType type() const& { return m_type; }
@@ -161,10 +171,12 @@ public:
     GridRepeat absolutized(ComputationContext const&) const;
     bool operator==(GridRepeat const& other) const = default;
 
+    bool is_computationally_independent() const { return m_grid_track_size_list.is_computationally_independent() && (!m_repeat_count || m_repeat_count->is_computationally_independent()); }
+
 private:
     GridRepeatType m_type;
     GridTrackSizeList m_grid_track_size_list;
-    size_t m_repeat_count { 0 };
+    ValueComparingRefPtr<StyleValue const> m_repeat_count;
 };
 
 class ExplicitGridTrack {
@@ -184,6 +196,11 @@ public:
     String to_string(SerializationMode) const;
     ExplicitGridTrack absolutized(ComputationContext const&) const;
     bool operator==(ExplicitGridTrack const& other) const = default;
+
+    bool is_computationally_independent() const
+    {
+        return m_value.visit([](auto const& value) { return value.is_computationally_independent(); });
+    }
 
 private:
     Variant<GridRepeat, GridMinMax, GridSize> m_value;

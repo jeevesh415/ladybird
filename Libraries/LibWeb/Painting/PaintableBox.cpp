@@ -438,7 +438,7 @@ Optional<CSSPixelRect> PaintableBox::get_clip_rect() const
     auto clip = computed_values().clip();
     if (clip.is_rect() && layout_node_with_style_and_box_metrics().is_absolutely_positioned()) {
         auto border_box = absolute_border_box_rect();
-        return clip.to_rect().resolved(layout_node(), border_box);
+        return clip.to_rect().resolved(border_box);
     }
     return {};
 }
@@ -759,6 +759,16 @@ void PaintableBox::invalidate_stacking_context()
     m_stacking_context = nullptr;
 }
 
+Optional<int> PaintableBox::effective_z_index() const
+{
+    // https://drafts.csswg.org/css2/#z-index
+    // Applies to: positioned elements
+    if (is_positioned())
+        return computed_values().z_index();
+
+    return {};
+}
+
 BordersData PaintableBox::remove_element_kind_from_borders_data(PaintableBox::BordersDataWithElementKind borders_data)
 {
     return {
@@ -882,7 +892,7 @@ Optional<CSSPixelPoint> PaintableBox::transform_point_to_local(CSSPixelPoint scr
         return screen_position;
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
     auto const& scroll_state = document().paintable()->scroll_state_snapshot();
-    auto const& visual_context_tree = *document().paintable()->visual_context_tree();
+    auto const& visual_context_tree = document().paintable()->visual_context_tree();
     auto result = visual_context_tree.transform_point_for_hit_test(m_accumulated_visual_context_index, screen_position.to_type<float>() * pixel_ratio, scroll_state);
     if (!result.has_value())
         return {};
@@ -895,7 +905,7 @@ Optional<CSSPixelPoint> PaintableBox::transform_point_to_local_for_descendants(C
         return screen_position;
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
     auto const& scroll_state = document().paintable()->scroll_state_snapshot();
-    auto const& visual_context_tree = *document().paintable()->visual_context_tree();
+    auto const& visual_context_tree = document().paintable()->visual_context_tree();
     auto result = visual_context_tree.transform_point_for_hit_test(m_accumulated_visual_context_for_descendants_index, screen_position.to_type<float>() * pixel_ratio, scroll_state);
     if (!result.has_value())
         return {};
@@ -908,7 +918,7 @@ CSSPixelRect PaintableBox::transform_rect_to_viewport(CSSPixelRect const& rect) 
         return rect;
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
     auto const& scroll_state = document().paintable()->scroll_state_snapshot();
-    auto const& visual_context_tree = *document().paintable()->visual_context_tree();
+    auto const& visual_context_tree = document().paintable()->visual_context_tree();
     auto result = visual_context_tree.transform_rect_to_viewport(m_accumulated_visual_context_index, rect.to_type<float>() * pixel_ratio, scroll_state);
     return (result * (1.f / pixel_ratio)).to_type<CSSPixels>();
 }
@@ -918,7 +928,7 @@ CSSPixelPoint PaintableBox::inverse_transform_point(CSSPixelPoint screen_positio
     if (!m_accumulated_visual_context_index.value())
         return screen_position;
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
-    auto const& visual_context_tree = *document().paintable()->visual_context_tree();
+    auto const& visual_context_tree = document().paintable()->visual_context_tree();
     auto result = visual_context_tree.inverse_transform_point(m_accumulated_visual_context_index, screen_position.to_type<float>() * pixel_ratio);
     return (result / pixel_ratio).to_type<CSSPixels>();
 }
@@ -1191,7 +1201,7 @@ BorderRadiiData PaintableBox::border_radii_data() const
     if (!computed_values.has_noninitial_border_radii())
         return {};
     CSSPixelRect const border_rect { 0, 0, border_box_width(), border_box_height() };
-    return normalize_border_radii_data(layout_node(), border_rect,
+    return normalize_border_radii_data(layout_node(), border_rect, border_rect,
         computed_values.border_top_left_radius(), computed_values.border_top_right_radius(),
         computed_values.border_bottom_right_radius(), computed_values.border_bottom_left_radius());
 }

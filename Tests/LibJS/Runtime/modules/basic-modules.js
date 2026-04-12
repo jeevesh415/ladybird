@@ -148,6 +148,16 @@ describe("in- and exports", () => {
         expect(result).toHaveProperty("namedVarValue", 3 + 3);
     });
 
+    test("for-in can enumerate module namespace objects", () => {
+        const result = expectModulePassed("./basic-export-types.mjs");
+        const keys = [];
+        for (const key in result) {
+            keys.push(key);
+        }
+
+        expect(keys).toEqual(Object.keys(result));
+    });
+
     test("default exports", () => {
         const result = expectModulePassed("./module-with-default.mjs");
         expect(result).toHaveProperty("defaultValue");
@@ -217,6 +227,21 @@ describe("in- and exports", () => {
         const result = expectModulePassed("./default-regexp-export.mjs");
         expect(result.default).toBeInstanceOf(RegExp);
         expect(result.default.toString()).toBe(/foo/.toString());
+    });
+
+    test("hoisted var declarations can be exported", () => {
+        const result = expectModulePassed("./hoisted-var-export.mjs");
+        expect(result.forVar).toBe(1);
+        expect(result.ifVar).toBe(2);
+        expect(result.blockVar).toBe(3);
+        expect(result.doWhileVar).toBe(5);
+        expect(result.tryVar).toBe(6);
+        expect(result.finallyVar).toBe(8);
+        expect(result.switchVar).toBe(9);
+        expect(result.labelVar).toBe(10);
+        expect(result.multiA).toBe(11);
+        expect(result.multiB).toBe(12);
+        expect(result.multiC).toBe(13);
     });
 
     test("importing a non-existent file results in a SyntaxError", () => {

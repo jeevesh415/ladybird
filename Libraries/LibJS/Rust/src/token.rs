@@ -7,6 +7,7 @@
 //! Token types and Token struct for the lexer.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub enum TokenCategory {
     Invalid,
     Trivia,
@@ -25,6 +26,7 @@ pub enum TokenCategory {
 macro_rules! define_tokens {
     ( $( $variant:ident => $category:ident ),* $(,)? ) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(C)]
         pub enum TokenType {
             $( $variant, )*
         }
@@ -194,6 +196,8 @@ pub struct Token {
     /// Decoded identifier value, set when the identifier contains unicode
     /// escape sequences (e.g. `l\u0065t` → `let`).
     pub identifier_value: Option<crate::ast::Utf16String>,
+    /// Shared identifier spelling supplied by the lexer for identifier-like tokens.
+    pub shared_identifier_value: Option<crate::ast::SharedUtf16String>,
     /// Error message for Invalid tokens (e.g. "Unterminated multi-line comment").
     pub message: Option<String>,
 }
@@ -211,6 +215,7 @@ impl Token {
             offset: 0,
             trivia_has_line_terminator: false,
             identifier_value: None,
+            shared_identifier_value: None,
             message: None,
         }
     }

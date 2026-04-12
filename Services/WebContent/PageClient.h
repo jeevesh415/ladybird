@@ -9,6 +9,7 @@
 #pragma once
 
 #include <LibGfx/Rect.h>
+#include <LibGfx/SharedImage.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWeb/HTML/FileFilter.h>
@@ -45,7 +46,7 @@ public:
     virtual Web::Page& page() override { return *m_page; }
     virtual Web::Page const& page() const override { return *m_page; }
 
-    ErrorOr<void> connect_to_webdriver(ByteString const& webdriver_ipc_path);
+    ErrorOr<void> connect_to_webdriver(ByteString const& webdriver_endpoint);
     ErrorOr<void> connect_to_web_ui(IPC::TransportHandle);
 
     virtual Queue<Web::QueuedInputEvent>& input_event_queue() override;
@@ -187,7 +188,7 @@ private:
     virtual void page_did_insert_clipboard_entry(Web::Clipboard::SystemClipboardRepresentation const&, StringView presentation_style) override;
     virtual void page_did_request_clipboard_entries(u64 request_id) override;
     virtual void page_did_change_audio_play_state(Web::HTML::AudioPlayState) override;
-    virtual void page_did_allocate_backing_stores(i32 front_bitmap_id, Gfx::ShareableBitmap front_bitmap, i32 back_bitmap_id, Gfx::ShareableBitmap back_bitmap) override;
+    virtual void page_did_allocate_backing_stores(i32 front_bitmap_id, Gfx::SharedImage front_backing_store, i32 back_bitmap_id, Gfx::SharedImage back_backing_store) override;
     virtual WorkerAgentResponse request_worker_agent(Web::Bindings::AgentType) override;
     virtual void page_did_mutate_dom(FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node> previous_sibling, GC::Ptr<Web::DOM::Node> next_sibling, Optional<String> const& attribute_name) override;
     virtual void page_did_paint(Gfx::IntRect const& content_rect, i32 bitmap_id) override;

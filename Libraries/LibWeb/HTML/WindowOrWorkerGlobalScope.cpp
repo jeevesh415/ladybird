@@ -23,6 +23,7 @@
 #include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/Fetch/FetchMethod.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
+#include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/ErrorEvent.h>
 #include <LibWeb/HTML/ErrorInformation.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
@@ -40,8 +41,11 @@
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 #include <LibWeb/HighResolutionTime/Performance.h>
 #include <LibWeb/HighResolutionTime/SupportedPerformanceTypes.h>
+#include <LibWeb/IndexedDB/IDBDatabase.h>
 #include <LibWeb/IndexedDB/IDBFactory.h>
+#include <LibWeb/IndexedDB/Internal/Algorithms.h>
 #include <LibWeb/Infra/Strings.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/PerformanceTimeline/EntryTypes.h>
 #include <LibWeb/PerformanceTimeline/EventNames.h>
 #include <LibWeb/PerformanceTimeline/PerformanceObserver.h>
@@ -636,10 +640,10 @@ i32 WindowOrWorkerGlobalScopeMixin::run_timer_initialization_steps(TimerHandler 
                     //            done by eval(). That is, module script fetches via import() will behave the same in both contexts.
                 }
 
-                // 8. Let script be the result of creating a classic script given handler, realm, base URL, and fetch options.
+                // 8. Let script be the result of creating a classic script given handler, settings object, base URL, and fetch options.
                 // FIXME: Pass fetch options.
                 auto basename = base_url.basename();
-                auto script = ClassicScript::create(basename, source, this_impl().realm(), move(base_url));
+                auto script = ClassicScript::create(basename, source, settings_object, move(base_url));
 
                 // 9. Run the classic script script.
                 (void)script->run();
@@ -1063,6 +1067,18 @@ void WindowOrWorkerGlobalScopeMixin::forcibly_close_all_event_sources()
         event_source->forcibly_close();
 }
 
+void WindowOrWorkerGlobalScopeMixin::close_all_idb_connections()
+{
+    IndexedDB::Database::for_each_database([&](IndexedDB::Database& database) {
+        for (auto& connection : database.associated_connections_as_root_vector()) {
+            if (connection->close_pending())
+                continue;
+            if (&as<WindowOrWorkerGlobalScopeMixin>(relevant_global_object(*connection)) == this)
+                IndexedDB::close_a_database_connection(connection);
+        }
+    });
+}
+
 void WindowOrWorkerGlobalScopeMixin::register_web_socket(Badge<WebSockets::WebSocket>, GC::Ref<WebSockets::WebSocket> web_socket)
 {
     m_registered_web_sockets.append(web_socket);
@@ -1248,17 +1264,16 @@ void WindowOrWorkerGlobalScopeMixin::report_an_exception(JS::Value exception, Om
         // 1. Set errorInfo[error] to null.
         error_info.error = JS::js_null();
 
-        // FIXME: 2. If global implements DedicatedWorkerGlobalScope, queue a global task on the DOM manipulation
-        //        task source with the global's associated Worker's relevant global object to run these steps:
-        if (false) {
-            // FIXME: 1. Let workerObject be the Worker object associated with global.
-
-            // FIXME: 2. Set notHandled to the result of firing an event named error at workerObject, using ErrorEvent,
-            //    with the cancelable attribute initialized to true, and additional attributes initialized
-            //    according to errorInfo.
-
-            // FIXME: 3. If notHandled is true, then report exception for workerObject's relevant global object with
-            //    omitError set to true.
+        // 2. If global implements DedicatedWorkerGlobalScope, queue a global task on the DOM manipulation
+        //    task source with the global's associated Worker's relevant global object to run these steps:
+        if (auto* dedicated_worker_global_scope = as_if<DedicatedWorkerGlobalScope>(target)) {
+            if (auto* page = dedicated_worker_global_scope->page()) {
+                page->client().page_did_report_worker_exception(
+                    error_info.message,
+                    error_info.filename,
+                    error_info.lineno,
+                    error_info.colno);
+            }
         }
         // 3. Otherwise, the user agent may report exception to a developer console.
         else {

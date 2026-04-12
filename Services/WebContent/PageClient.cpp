@@ -726,9 +726,9 @@ void PageClient::page_did_change_audio_play_state(Web::HTML::AudioPlayState play
     client().async_did_change_audio_play_state(m_id, play_state);
 }
 
-void PageClient::page_did_allocate_backing_stores(i32 front_bitmap_id, Gfx::ShareableBitmap front_bitmap, i32 back_bitmap_id, Gfx::ShareableBitmap back_bitmap)
+void PageClient::page_did_allocate_backing_stores(i32 front_bitmap_id, Gfx::SharedImage front_backing_store, i32 back_bitmap_id, Gfx::SharedImage back_backing_store)
 {
-    client().async_did_allocate_backing_stores(m_id, front_bitmap_id, front_bitmap, back_bitmap_id, back_bitmap);
+    client().async_did_allocate_backing_stores(m_id, front_bitmap_id, move(front_backing_store), back_bitmap_id, move(back_backing_store));
 }
 
 Web::PageClient::WorkerAgentResponse PageClient::request_worker_agent(Web::Bindings::AgentType type)
@@ -790,10 +790,10 @@ void PageClient::page_did_take_screenshot(Gfx::ShareableBitmap const& screenshot
     client().async_did_take_screenshot(m_id, screenshot);
 }
 
-ErrorOr<void> PageClient::connect_to_webdriver(ByteString const& webdriver_ipc_path)
+ErrorOr<void> PageClient::connect_to_webdriver(ByteString const& webdriver_endpoint)
 {
     VERIFY(!m_webdriver);
-    m_webdriver = TRY(WebDriverConnection::connect(*this, webdriver_ipc_path));
+    m_webdriver = TRY(WebDriverConnection::connect(*this, webdriver_endpoint));
 
     return {};
 }
@@ -887,10 +887,10 @@ void PageClient::run_javascript(StringView js_source)
     // Let baseURL be settings's API base URL.
     auto base_url = settings.api_base_url();
 
-    // Let script be the result of creating a classic script given scriptSource, setting's realm, baseURL, and the default classic script fetch options.
+    // Let script be the result of creating a classic script given scriptSource, settings, baseURL, and the default classic script fetch options.
     // FIXME: This doesn't pass in "default classic script fetch options"
     // FIXME: What should the filename be here?
-    auto script = Web::HTML::ClassicScript::create("(client connection run_javascript)", js_source, settings.realm(), move(base_url));
+    auto script = Web::HTML::ClassicScript::create("(client connection run_javascript)", js_source, settings, move(base_url));
 
     // Let evaluationStatus be the result of running the classic script script.
     auto evaluation_status = script->run();
