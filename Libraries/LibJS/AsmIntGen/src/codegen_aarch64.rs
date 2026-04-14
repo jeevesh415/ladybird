@@ -197,11 +197,11 @@ fn generate_exit_point(out: &mut String, fmt: ObjectFormat) {
 }
 
 fn generate_entry_point(out: &mut String, program: &Program) {
-    // void asm_interpreter_entry(u8 const* bytecode, u32 entry_point, Value* values, Interpreter* interp)
-    // AAPCS64: x0=bytecode, w1=entry_point, x2=values, x3=interp
+    // void asm_interpreter_entry(u8 const* bytecode, u32 entry_point, Value* values, VM* vm)
+    // AAPCS64: x0=bytecode, w1=entry_point, x2=values, x3=vm
 
     // Save callee-saved registers and link register.
-    // Pinned: x19(dispatch), x20(interp), x21(ip), x26(pb), x27(values), x28(exec_ctx)
+    // Pinned: x19(dispatch), x20(vm), x21(ip), x26(pb), x27(values), x28(exec_ctx)
     // x21 = ip (instruction pointer = pb + pc), the primary dispatch register.
     // x25 is only used when DSL code writes to pc directly (rare).
     // x22 = INT32_TAG, x23 = BOOLEAN_TAG, x24 = NAN_BASE_TAG (pinned constants).
@@ -231,12 +231,12 @@ fn generate_entry_point(out: &mut String, program: &Program) {
     w!(out, "    .cfi_offset d8, -16");
 
     // Set up pinned registers
-    // x0=bytecode (pb), w1=entry_point (pc), x2=values, x3=interp
+    // x0=bytecode (pb), w1=entry_point (pc), x2=values, x3=vm
     let interp_ctx = program
         .constants
-        .get("INTERPRETER_RUNNING_EXECUTION_CONTEXT")
+        .get("VM_RUNNING_EXECUTION_CONTEXT")
         .copied()
-        .expect("INTERPRETER_RUNNING_EXECUTION_CONTEXT constant required");
+        .expect("VM_RUNNING_EXECUTION_CONTEXT constant required");
     let canon_nan = program
         .constants
         .get("CANON_NAN_BITS")
@@ -244,8 +244,8 @@ fn generate_entry_point(out: &mut String, program: &Program) {
         .expect("CANON_NAN_BITS constant required");
     w!(out, "    mov x26, x0              // pb = bytecode base");
     w!(out, "    mov x27, x2              // values = values array");
-    // Store Interpreter* in x20 (callee-saved) for C++ calls, pin exec_ctx in x28
-    w!(out, "    mov x20, x3              // interp = Interpreter*");
+    // Store VM* in x20 (callee-saved) for C++ calls, pin exec_ctx in x28
+    w!(out, "    mov x20, x3              // vm = VM*");
     emit_ldr64(out, "x28", "x3", interp_ctx);
     w!(out, "    // x28 = exec_ctx");
     emit_symbol_addr(out, "x19", "asm_dispatch_table", program.object_format);
@@ -276,7 +276,7 @@ fn generate_entry_point(out: &mut String, program: &Program) {
 fn generate_fallback_handler(out: &mut String, program: &Program, _pinned: &PinnedConstants) {
     w!(out, ".p2align 4");
     w!(out, "asm_handler_fallback:");
-    // Set up args: x0=interp (x20), w1=pc (ip - pb)
+    // Set up args: x0=vm (x20), w1=pc (ip - pb)
     w!(out, "    mov x0, x20");
     w!(out, "    sub w1, w21, w26");
     w!(out, "    bl CSYM(asm_fallback_handler)");
@@ -294,13 +294,13 @@ fn generate_fallback_handler(out: &mut String, program: &Program, _pinned: &Pinn
 }
 
 /// Emit instructions to reload exec_ctx (x28), pb (x26), and values (x27)
-/// from the Interpreter* in x20. Uses x9 as scratch.
+/// from the VM* in x20. Uses x9 as scratch.
 fn emit_state_reload(out: &mut String, program: &Program) {
     let interp_ctx = program
         .constants
-        .get("INTERPRETER_RUNNING_EXECUTION_CONTEXT")
+        .get("VM_RUNNING_EXECUTION_CONTEXT")
         .copied()
-        .expect("INTERPRETER_RUNNING_EXECUTION_CONTEXT constant required");
+        .expect("VM_RUNNING_EXECUTION_CONTEXT constant required");
     let exec_executable = program
         .constants
         .get("EXECUTION_CONTEXT_EXECUTABLE")
@@ -657,6 +657,13 @@ fn emit_str64(out: &mut String, src: &str, base: &str, offset: i64) {
 fn emit_mov_imm(out: &mut String, dst: &str, val: i64) {
     let uval = val as u64;
 
+    // Writing a w-register zero-extends into the corresponding x-register.
+    // Prefer the 32-bit materialization when the upper half is known zero.
+    if dst.starts_with('x') && uval <= 0xFFFF_FFFF {
+        emit_mov_imm32(out, &to_w_reg(dst), val);
+        return;
+    }
+
     // Check if it fits in a single movz (16-bit value at any position)
     if uval == 0 {
         w!(out, "    mov {dst}, #0");
@@ -921,14 +928,32 @@ fn emit_instruction(
             }
         }
 
-        // reload_exec_ctx: reload the pinned exec_ctx register from Interpreter* (x20)
+        // reload_exec_ctx: reload the pinned exec_ctx register from VM* (x20)
         "reload_exec_ctx" => {
             let interp_ctx = program
                 .constants
-                .get("INTERPRETER_RUNNING_EXECUTION_CONTEXT")
+                .get("VM_RUNNING_EXECUTION_CONTEXT")
                 .copied()
-                .expect("INTERPRETER_RUNNING_EXECUTION_CONTEXT constant required");
+                .expect("VM_RUNNING_EXECUTION_CONTEXT constant required");
             emit_ldr64(out, "x28", "x20", interp_ctx);
+        }
+
+        // load_vm dst: copy the hidden VM* from the pinned x20 register.
+        "load_vm" => {
+            if let Some(op) = insn.operands.first() {
+                let dst = resolve_op(op, handler, program);
+                w!(out, "    mov {dst}, x20");
+            }
+        }
+
+        // inc32_mem [base, offset]: increment a 32-bit memory slot by 1.
+        "inc32_mem" => {
+            if let Some(op) = insn.operands.first() {
+                let mem_str = resolve_op(op, handler, program);
+                if let Some(mem) = parse_mem(&mem_str) {
+                    emit_inc32_mem(out, &mem);
+                }
+            }
         }
 
         // dispatch_variable: advance ip by value in register and dispatch
@@ -951,7 +976,7 @@ fn emit_instruction(
         // call_slow_path: TERMINAL call to C++ slow path
         "call_slow_path" => {
             if let Some(Operand::Register(func_name)) = insn.operands.first() {
-                w!(out, "    mov x0, x20"); // interp
+                w!(out, "    mov x0, x20"); // vm
                 w!(out, "    sub w1, w21, w26"); // pc = ip - pb
                 w!(out, "    bl CSYM({func_name})");
                 w!(out, "    tbnz x0, #63, .Lexit");
@@ -973,7 +998,7 @@ fn emit_instruction(
             }
         }
 
-        // call_interp: NON-TERMINAL call with (Interpreter*, u32 pc)
+        // call_interp: NON-TERMINAL call with (VM*, u32 pc)
         "call_interp" => {
             if let Some(Operand::Register(func_name)) = insn.operands.first() {
                 w!(out, "    mov x0, x20");
@@ -1217,10 +1242,19 @@ fn emit_instruction(
         "store8" => {
             if insn.operands.len() >= 2 {
                 let mem_str = resolve_op(&insn.operands[0], handler, program);
-                let src = resolve_op(&insn.operands[1], handler, program);
                 if let Some(mem) = parse_mem(&mem_str) {
-                    let wsrc = to_w_reg(&src);
-                    emit_mem_store(out, &wsrc, &mem, 1);
+                    if let Some(val) = get_immediate_value(&insn.operands[1], program) {
+                        if val == 0 {
+                            emit_mem_store(out, "wzr", &mem, 1);
+                        } else {
+                            emit_mov_imm32(out, "w9", val);
+                            emit_mem_store(out, "w9", &mem, 1);
+                        }
+                    } else {
+                        let src = resolve_op(&insn.operands[1], handler, program);
+                        let wsrc = to_w_reg(&src);
+                        emit_mem_store(out, &wsrc, &mem, 1);
+                    }
                 }
             }
         }
@@ -1229,10 +1263,19 @@ fn emit_instruction(
         "store16" => {
             if insn.operands.len() >= 2 {
                 let mem_str = resolve_op(&insn.operands[0], handler, program);
-                let src = resolve_op(&insn.operands[1], handler, program);
                 if let Some(mem) = parse_mem(&mem_str) {
-                    let wsrc = to_w_reg(&src);
-                    emit_mem_store(out, &wsrc, &mem, 2);
+                    if let Some(val) = get_immediate_value(&insn.operands[1], program) {
+                        if val == 0 {
+                            emit_mem_store(out, "wzr", &mem, 2);
+                        } else {
+                            emit_mov_imm32(out, "w9", val);
+                            emit_mem_store(out, "w9", &mem, 2);
+                        }
+                    } else {
+                        let src = resolve_op(&insn.operands[1], handler, program);
+                        let wsrc = to_w_reg(&src);
+                        emit_mem_store(out, &wsrc, &mem, 2);
+                    }
                 }
             }
         }
@@ -1241,10 +1284,19 @@ fn emit_instruction(
         "store32" => {
             if insn.operands.len() >= 2 {
                 let mem_str = resolve_op(&insn.operands[0], handler, program);
-                let src = resolve_op(&insn.operands[1], handler, program);
                 if let Some(mem) = parse_mem(&mem_str) {
-                    let wsrc = to_w_reg(&src);
-                    emit_mem_store(out, &wsrc, &mem, 4);
+                    if let Some(val) = get_immediate_value(&insn.operands[1], program) {
+                        if val == 0 {
+                            emit_mem_store(out, "wzr", &mem, 4);
+                        } else {
+                            emit_mov_imm32(out, "w9", val);
+                            emit_mem_store(out, "w9", &mem, 4);
+                        }
+                    } else {
+                        let src = resolve_op(&insn.operands[1], handler, program);
+                        let wsrc = to_w_reg(&src);
+                        emit_mem_store(out, &wsrc, &mem, 4);
+                    }
                 }
             }
         }
@@ -1253,9 +1305,18 @@ fn emit_instruction(
         "store64" => {
             if insn.operands.len() >= 2 {
                 let mem_str = resolve_op(&insn.operands[0], handler, program);
-                let src = resolve_op(&insn.operands[1], handler, program);
                 if let Some(mem) = parse_mem(&mem_str) {
-                    emit_mem_store(out, &src, &mem, 8);
+                    if let Some(val) = get_immediate_value(&insn.operands[1], program) {
+                        if val == 0 {
+                            emit_mem_store(out, "xzr", &mem, 8);
+                        } else {
+                            emit_mov_imm(out, "x9", val);
+                            emit_mem_store(out, "x9", &mem, 8);
+                        }
+                    } else {
+                        let src = resolve_op(&insn.operands[1], handler, program);
+                        emit_mem_store(out, &src, &mem, 8);
+                    }
                 }
             }
         }
@@ -1317,7 +1378,7 @@ fn emit_instruction(
                 let src = resolve_op(&insn.operands[1], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
                     emit_mov_imm(out, &dst, val);
-                } else {
+                } else if dst != src {
                     w!(out, "    mov {dst}, {src}");
                 }
             }
@@ -1921,15 +1982,18 @@ fn emit_instruction(
         "branch_bits_set" | "branch_bits_clear" => {
             if insn.operands.len() == 3 {
                 let a = resolve_op(&insn.operands[0], handler, program);
-                let mask = resolve_op(&insn.operands[1], handler, program);
                 let label = resolve_label(&insn.operands[2], handler);
-                let cc = match m.as_str() {
-                    "branch_bits_set" => "b.ne",
-                    "branch_bits_clear" => "b.eq",
-                    _ => unreachable!(),
-                };
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
                     let uval = val as u64;
+                    if uval != 0 && uval.is_power_of_two() {
+                        let cc = match m.as_str() {
+                            "branch_bits_set" => "tbnz",
+                            "branch_bits_clear" => "tbz",
+                            _ => unreachable!(),
+                        };
+                        w!(out, "    {cc} {a}, #{}, {label}", uval.trailing_zeros());
+                        return;
+                    }
                     if is_logical_immediate(uval) {
                         w!(out, "    tst {a}, #0x{uval:x}");
                     } else {
@@ -1937,8 +2001,14 @@ fn emit_instruction(
                         w!(out, "    tst {a}, x9");
                     }
                 } else {
+                    let mask = resolve_op(&insn.operands[1], handler, program);
                     w!(out, "    tst {a}, {mask}");
                 }
+                let cc = match m.as_str() {
+                    "branch_bits_set" => "b.ne",
+                    "branch_bits_clear" => "b.eq",
+                    _ => unreachable!(),
+                };
                 w!(out, "    {cc} {label}");
             }
         }
@@ -2206,6 +2276,135 @@ fn emit_mem_store(out: &mut String, src: &str, mem: &MemOp, size: u32) {
                     2 => emit_strh(out, src, "x9", *offset),
                     1 => emit_strb(out, src, "x9", *offset),
                     _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn choose_scratch_register<'a>(forbidden: &[&str], candidates: &'a [&'a str]) -> &'a str {
+    candidates
+        .iter()
+        .copied()
+        .find(|reg| !forbidden.iter().any(|forbidden_reg| forbidden_reg == reg))
+        .expect("no scratch register available")
+}
+
+fn emit_inc32_mem(out: &mut String, mem: &MemOp) {
+    let candidates = ["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17"];
+    let mut forbidden = vec![mem.base.as_str()];
+    match &mem.index {
+        MemIndex::Reg(idx) | MemIndex::RegScale(idx, _) | MemIndex::RegImm(idx, _) => {
+            forbidden.push(idx.as_str());
+        }
+        MemIndex::None | MemIndex::Imm(_) => {}
+    }
+
+    let value_reg = choose_scratch_register(&forbidden, &candidates);
+    forbidden.push(value_reg);
+    let addr_reg = choose_scratch_register(&forbidden, &candidates);
+    let value_wreg = to_w_reg(value_reg);
+
+    match &mem.index {
+        MemIndex::None => {
+            w!(out, "    ldr {value_wreg}, [{}]", mem.base);
+            w!(out, "    add {value_wreg}, {value_wreg}, #1");
+            w!(out, "    str {value_wreg}, [{}]", mem.base);
+        }
+        MemIndex::Imm(offset) => {
+            if *offset == 0 {
+                w!(out, "    ldr {value_wreg}, [{}]", mem.base);
+                w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                w!(out, "    str {value_wreg}, [{}]", mem.base);
+            } else if (0..16380).contains(offset) && offset % 4 == 0 {
+                w!(out, "    ldr {value_wreg}, [{}, #{offset}]", mem.base);
+                w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                w!(out, "    str {value_wreg}, [{}, #{offset}]", mem.base);
+            } else if (-256..=255).contains(offset) {
+                w!(out, "    ldur {value_wreg}, [{}, #{offset}]", mem.base);
+                w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                w!(out, "    stur {value_wreg}, [{}, #{offset}]", mem.base);
+            } else {
+                emit_mov_imm(out, addr_reg, *offset);
+                w!(out, "    ldr {value_wreg}, [{}, {addr_reg}]", mem.base);
+                w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                w!(out, "    str {value_wreg}, [{}, {addr_reg}]", mem.base);
+            }
+        }
+        MemIndex::Reg(idx) => {
+            w!(out, "    ldr {value_wreg}, [{}, {idx}]", mem.base);
+            w!(out, "    add {value_wreg}, {value_wreg}, #1");
+            w!(out, "    str {value_wreg}, [{}, {idx}]", mem.base);
+        }
+        MemIndex::RegScale(idx, scale) => {
+            let shift = match scale {
+                1 => None,
+                2 => Some(1),
+                4 => Some(2),
+                8 => Some(3),
+                _ => None,
+            };
+            if let Some(shift_amt) = shift {
+                w!(
+                    out,
+                    "    ldr {value_wreg}, [{}, {idx}, lsl #{shift_amt}]",
+                    mem.base
+                );
+                w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                w!(
+                    out,
+                    "    str {value_wreg}, [{}, {idx}, lsl #{shift_amt}]",
+                    mem.base
+                );
+            } else {
+                emit_mov_imm(out, addr_reg, *scale);
+                w!(out, "    madd {addr_reg}, {idx}, {addr_reg}, {}", mem.base);
+                w!(out, "    ldr {value_wreg}, [{addr_reg}]");
+                w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                w!(out, "    str {value_wreg}, [{addr_reg}]");
+            }
+        }
+        MemIndex::RegImm(idx, offset) => {
+            if mem.base == "x26" && idx == "x25" {
+                if *offset == 0 {
+                    w!(out, "    ldr {value_wreg}, [x21]");
+                    w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                    w!(out, "    str {value_wreg}, [x21]");
+                } else if (0..16380).contains(offset) && offset % 4 == 0 {
+                    w!(out, "    ldr {value_wreg}, [x21, #{offset}]");
+                    w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                    w!(out, "    str {value_wreg}, [x21, #{offset}]");
+                } else if (-256..=255).contains(offset) {
+                    w!(out, "    ldur {value_wreg}, [x21, #{offset}]");
+                    w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                    w!(out, "    stur {value_wreg}, [x21, #{offset}]");
+                } else {
+                    emit_mov_imm(out, addr_reg, *offset);
+                    w!(out, "    add {addr_reg}, x21, {addr_reg}");
+                    w!(out, "    ldr {value_wreg}, [{addr_reg}]");
+                    w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                    w!(out, "    str {value_wreg}, [{addr_reg}]");
+                }
+            } else {
+                w!(out, "    add {addr_reg}, {}, {idx}", mem.base);
+                if *offset == 0 {
+                    w!(out, "    ldr {value_wreg}, [{addr_reg}]");
+                    w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                    w!(out, "    str {value_wreg}, [{addr_reg}]");
+                } else if (0..16380).contains(offset) && offset % 4 == 0 {
+                    w!(out, "    ldr {value_wreg}, [{addr_reg}, #{offset}]");
+                    w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                    w!(out, "    str {value_wreg}, [{addr_reg}, #{offset}]");
+                } else if (-256..=255).contains(offset) {
+                    w!(out, "    ldur {value_wreg}, [{addr_reg}, #{offset}]");
+                    w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                    w!(out, "    stur {value_wreg}, [{addr_reg}, #{offset}]");
+                } else {
+                    emit_mov_imm(out, value_reg, *offset);
+                    w!(out, "    add {addr_reg}, {addr_reg}, {value_reg}");
+                    w!(out, "    ldr {value_wreg}, [{addr_reg}]");
+                    w!(out, "    add {value_wreg}, {value_wreg}, #1");
+                    w!(out, "    str {value_wreg}, [{addr_reg}]");
                 }
             }
         }
