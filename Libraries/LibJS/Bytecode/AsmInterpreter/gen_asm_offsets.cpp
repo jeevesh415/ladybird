@@ -21,6 +21,7 @@
 #include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/IndexedProperties.h>
+#include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/Realm.h>
@@ -65,6 +66,7 @@ int main()
     outln("const OBJECT_FLAG_IS_TYPED_ARRAY = {}", Object::Flag::IsTypedArray);
     outln("const OBJECT_FLAG_IS_FUNCTION = {}", Object::Flag::IsFunction);
     outln("const OBJECT_FLAG_IS_ECMASCRIPT_FUNCTION_OBJECT = {}", Object::Flag::IsECMAScriptFunctionObject);
+    outln("const OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION = {}", Object::Flag::IsRawNativeFunction);
 
     // Shape layout
     outln("\n# Shape layout");
@@ -131,6 +133,9 @@ int main()
     EMIT_OFFSET(EXECUTABLE_CONSTANTS, Executable, constants);
     EMIT_OFFSET(EXECUTABLE_PROPERTY_LOOKUP_CACHES, Executable, property_lookup_caches);
     EMIT_OFFSET(EXECUTABLE_REGISTERS_AND_LOCALS_COUNT, Executable, registers_and_locals_count);
+    EMIT_OFFSET(EXECUTABLE_REGISTERS_AND_LOCALS_AND_CONSTANTS_COUNT, Executable, registers_and_locals_and_constants_count);
+    EMIT_OFFSET(EXECUTABLE_ASM_CONSTANTS_SIZE, Executable, asm_constants_size);
+    EMIT_OFFSET(EXECUTABLE_ASM_CONSTANTS_DATA, Executable, asm_constants_data);
 
     // ExecutionContext layout
     outln("\n# ExecutionContext layout");
@@ -174,8 +179,18 @@ int main()
     outln("\n# VM layout");
     EMIT_OFFSET(VM_RUNNING_EXECUTION_CONTEXT, VM, m_running_execution_context);
     EMIT_OFFSET(VM_INTERPRETER_STACK, VM, m_interpreter_stack);
+    EMIT_OFFSET(VM_STACK_INFO, VM, m_stack_info);
     EMIT_OFFSET(VM_EXECUTION_GENERATION, VM, m_execution_generation);
     outln("const VM_INTERPRETER_STACK_TOP = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_top));
+#if defined(HAS_ADDRESS_SANITIZER)
+    outln("const VM_STACK_SPACE_LIMIT = {}", 96 * KiB);
+#else
+    outln("const VM_STACK_SPACE_LIMIT = {}", 32 * KiB);
+#endif
+
+    // StackInfo layout
+    outln("\n# StackInfo layout");
+    EMIT_OFFSET(STACK_INFO_BASE, StackInfo, m_base);
 
     // IndexedStorageKind enum values
     outln("\n# IndexedStorageKind enum values");
@@ -256,6 +271,10 @@ int main()
         outln("const FUNCTION_OBJECT_BUILTIN_HAS_VALUE = {}", base + 1);
     }
 
+    // RawNativeFunction layout
+    outln("\n# RawNativeFunction layout");
+    EMIT_OFFSET(RAW_NATIVE_FUNCTION_NATIVE_FUNCTION, RawNativeFunction, m_native_function);
+
     // ECMAScriptFunctionObject layout
     outln("\n# ECMAScriptFunctionObject layout");
     EMIT_OFFSET(ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA, ECMAScriptFunctionObject, m_shared_data);
@@ -266,11 +285,16 @@ int main()
     // SharedFunctionInstanceData layout
     outln("\n# SharedFunctionInstanceData layout");
     EMIT_OFFSET(SHARED_FUNCTION_INSTANCE_DATA_EXECUTABLE, SharedFunctionInstanceData, m_executable);
+    EMIT_OFFSET(SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA, SharedFunctionInstanceData, m_asm_call_metadata);
     EMIT_OFFSET(SHARED_FUNCTION_INSTANCE_DATA_FORMAL_PARAMETER_COUNT, SharedFunctionInstanceData, m_formal_parameter_count);
     EMIT_OFFSET(SHARED_FUNCTION_INSTANCE_DATA_STRICT, SharedFunctionInstanceData, m_strict);
     EMIT_OFFSET(SHARED_FUNCTION_INSTANCE_DATA_FUNCTION_ENVIRONMENT_NEEDED, SharedFunctionInstanceData, m_function_environment_needed);
     EMIT_OFFSET(SHARED_FUNCTION_INSTANCE_DATA_USES_THIS, SharedFunctionInstanceData, m_uses_this);
     EMIT_OFFSET(SHARED_FUNCTION_INSTANCE_DATA_CAN_INLINE_CALL, SharedFunctionInstanceData, m_can_inline_call);
+    outln("const SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_CAN_INLINE_CALL = {}", SharedFunctionInstanceData::asm_call_metadata_can_inline_call);
+    outln("const SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_FUNCTION_ENVIRONMENT_NEEDED = {}", SharedFunctionInstanceData::asm_call_metadata_function_environment_needed);
+    outln("const SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_USES_THIS = {}", SharedFunctionInstanceData::asm_call_metadata_uses_this);
+    outln("const SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_STRICT = {}", SharedFunctionInstanceData::asm_call_metadata_strict);
 
     // GlobalEnvironment layout
     outln("\n# GlobalEnvironment layout");
@@ -379,7 +403,12 @@ int main()
     outln("const NEGATIVE_ZERO = 0x{:X}", static_cast<u64>(NEGATIVE_ZERO_BITS));
     outln("const CELL_TAG_SHIFTED = 0x{:X}", static_cast<u64>(GC::SHIFTED_IS_CELL_PATTERN));
 
+    outln("const ACCUMULATOR_REG_OFFSET = {}", static_cast<size_t>(Register::accumulator().index()) * sizeof(Value));
+    outln("const EXCEPTION_REG_OFFSET = {}", static_cast<size_t>(Register::exception().index()) * sizeof(Value));
     outln("const THIS_VALUE_REG_OFFSET = {}", static_cast<size_t>(Register::this_value().index()) * sizeof(Value));
+    outln("const RETURN_VALUE_REG_OFFSET = {}", static_cast<size_t>(Register::return_value().index()) * sizeof(Value));
+    outln("const SAVED_LEXICAL_ENVIRONMENT_REG_OFFSET = {}", static_cast<size_t>(Register::saved_lexical_environment().index()) * sizeof(Value));
+    outln("const RESERVED_REGISTERS_SIZE = {}", static_cast<size_t>(Register::reserved_register_count) * sizeof(Value));
 
     return 0;
 }
