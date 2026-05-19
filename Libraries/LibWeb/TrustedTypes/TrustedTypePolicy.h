@@ -9,7 +9,7 @@
 #include <AK/FlyString.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Bindings/TrustedTypePolicyPrototype.h>
+#include <LibWeb/Bindings/TrustedTypePolicy.h>
 #include <LibWeb/TrustedTypes/InjectionSink.h>
 
 namespace Web::TrustedTypes {
@@ -35,12 +35,6 @@ enum class ThrowIfCallbackMissing {
     No
 };
 
-struct TrustedTypePolicyOptions {
-    GC::Root<WebIDL::CallbackType> create_html;
-    GC::Root<WebIDL::CallbackType> create_script;
-    GC::Root<WebIDL::CallbackType> create_script_url;
-};
-
 class TrustedTypePolicy final : public Bindings::PlatformObject {
     WEB_PLATFORM_OBJECT(TrustedTypePolicy, Bindings::PlatformObject);
     GC_DECLARE_ALLOCATOR(TrustedTypePolicy);
@@ -59,7 +53,7 @@ public:
     virtual void visit_edges(Visitor&) override;
 
 private:
-    explicit TrustedTypePolicy(JS::Realm&, Utf16String const&, TrustedTypePolicyOptions const&);
+    explicit TrustedTypePolicy(JS::Realm&, Utf16String const&, Bindings::TrustedTypePolicyOptions const&);
     virtual void initialize(JS::Realm&) override;
 
     TrustedTypesVariants create_a_trusted_type(TrustedTypeName, Utf16String const&, GC::RootVector<JS::Value> const& values);

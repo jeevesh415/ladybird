@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ * Copyright (c) 2024-2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -27,29 +27,42 @@
 
 namespace Gfx {
 
-static RefPtr<SkiaBackendContext> s_the;
+#if defined(AK_OS_MACOS) || USE_VULKAN
+static constexpr size_t skia_resource_cache_limit = 256 * MiB;
+#endif
+
+static RefPtr<SkiaBackendContext> s_main_thread_context;
 
 void SkiaBackendContext::initialize_gpu_backend()
 {
-    VERIFY(!s_the);
+    VERIFY(!s_main_thread_context);
 
+    s_main_thread_context = create_independent_gpu_backend();
+}
+
+RefPtr<SkiaBackendContext> SkiaBackendContext::create_independent_gpu_backend()
+{
 #ifdef AK_OS_MACOS
     auto metal_context = get_metal_context();
-    s_the = create_metal_context(*metal_context);
+    if (!metal_context)
+        return {};
+    return create_metal_context(*metal_context);
 #elif USE_VULKAN
     auto maybe_vulkan_context = Gfx::create_vulkan_context();
     if (maybe_vulkan_context.is_error()) {
         dbgln("Vulkan context creation failed: {}", maybe_vulkan_context.error());
-        return;
+        return {};
     }
     auto vulkan_context = maybe_vulkan_context.release_value();
-    s_the = create_vulkan_context(vulkan_context);
+    return create_vulkan_context(vulkan_context);
+#else
+    return {};
 #endif
 }
 
-RefPtr<SkiaBackendContext> SkiaBackendContext::the()
+RefPtr<SkiaBackendContext> SkiaBackendContext::the_main_thread_context()
 {
-    return s_the;
+    return s_main_thread_context;
 }
 
 #ifdef USE_VULKAN
@@ -65,7 +78,18 @@ public:
     {
     }
 
-    ~SkiaVulkanBackendContext() override { }
+    ~SkiaVulkanBackendContext() override
+    {
+        m_context.reset();
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+        if (m_vulkan_context.command_pool != VK_NULL_HANDLE)
+            vkDestroyCommandPool(m_vulkan_context.logical_device, m_vulkan_context.command_pool, nullptr);
+#    endif
+        if (m_vulkan_context.logical_device != VK_NULL_HANDLE)
+            vkDestroyDevice(m_vulkan_context.logical_device, nullptr);
+        if (m_vulkan_context.instance != VK_NULL_HANDLE)
+            vkDestroyInstance(m_vulkan_context.instance, nullptr);
+    }
 
     void flush_and_submit(SkSurface* surface) override
     {
@@ -110,6 +134,7 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
 
     sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeVulkan(backend_context);
     VERIFY(ctx);
+    ctx->setResourceCacheLimit(skia_resource_cache_limit);
     return adopt_ref(*new SkiaVulkanBackendContext(ctx, vulkan_context, move(extensions)));
 }
 #endif
@@ -126,7 +151,10 @@ public:
     {
     }
 
-    ~SkiaMetalBackendContext() override { }
+    ~SkiaMetalBackendContext() override
+    {
+        m_context.reset();
+    }
 
     void flush_and_submit(SkSurface* surface) override
     {
@@ -152,6 +180,8 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_metal_context(NonnullRefPt
     backend_context.fDevice.retain(metal_context->device());
     backend_context.fQueue.retain(metal_context->queue());
     sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeMetal(backend_context);
+    VERIFY(ctx);
+    ctx->setResourceCacheLimit(skia_resource_cache_limit);
     return adopt_ref(*new SkiaMetalBackendContext(move(ctx), move(metal_context)));
 }
 #endif

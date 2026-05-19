@@ -14,10 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::basic_block::{BasicBlock, SourceMapEntry};
+use super::ffi::{AbstractOperationKind, WellKnownSymbolKind};
 use super::instruction::Instruction;
 use super::operand::*;
-use crate::ast::{LocalType, Utf16String};
+use crate::ast::{AstArena, FunctionData, FunctionId, FunctionTable, IdentifierId, LocalType, Position, Utf16String};
 use crate::u32_from_usize;
+use std::sync::Arc;
 
 /// Identifies an operand that auto-frees its register when the last
 /// clone is dropped.
@@ -34,6 +36,85 @@ pub(crate) struct ScopedOperandInner {
     operand: Operand,
     free_register_pool: Rc<RefCell<Vec<Register>>>,
 }
+
+pub struct PendingSharedFunctionData {
+    pub function_data: Option<Box<FunctionData>>,
+    pub subtable: Option<FunctionTable>,
+    pub arena: Option<Arc<AstArena>>,
+    pub name_override: Option<Utf16String>,
+    pub class_field_initializer_name: Option<(Utf16String, bool)>,
+    pub should_eager_compile: bool,
+    pub precompiled_function: Option<Box<PrecompiledFunction>>,
+}
+
+/// Metadata computed from scope analysis for a SharedFunctionInstanceData.
+pub struct FunctionSfdMetadata {
+    pub uses_this: bool,
+    pub this_value_needs_environment_resolution: bool,
+    pub function_environment_needed: bool,
+    pub function_environment_bindings_count: usize,
+    pub var_environment_bindings_count: usize,
+    pub might_need_arguments: bool,
+    pub contains_eval: bool,
+}
+
+/// GC-free compiled bytecode for a function that top-level code will immediately invoke.
+pub struct PrecompiledFunction {
+    pub generator: Box<Generator>,
+    pub assembled: AssembledBytecode,
+    pub metadata: FunctionSfdMetadata,
+}
+
+#[derive(Clone, Copy)]
+pub enum PendingLiteralValueKind {
+    None,
+    Number,
+    BooleanTrue,
+    BooleanFalse,
+    Null,
+    String,
+}
+
+pub struct PendingClassElement {
+    pub kind: u8,
+    pub is_static: bool,
+    pub is_private: bool,
+    pub private_identifier: Option<Utf16String>,
+    pub shared_function_data_index: Option<u32>,
+    pub has_initializer: bool,
+    pub literal_value_kind: PendingLiteralValueKind,
+    pub literal_value_number: f64,
+    pub literal_value_string: Option<Utf16String>,
+}
+
+pub struct PendingClassBlueprint {
+    pub name: Option<Utf16String>,
+    pub source_text_offset: usize,
+    pub source_text_length: usize,
+    pub constructor_sfd_index: u32,
+    pub has_super_class: bool,
+    pub has_name: bool,
+    pub elements: Vec<PendingClassElement>,
+}
+
+struct EnvironmentCoordinateScope {
+    bindings: HashMap<Utf16String, u32>,
+    next_binding_index: u32,
+    kind: EnvironmentCoordinateScopeKind,
+}
+
+#[derive(PartialEq)]
+enum EnvironmentCoordinateScopeKind {
+    // A declarative environment whose bindings are created by bytecode we emit.
+    // The binding indexes are therefore known while generating the instruction
+    // stream and can be embedded in EnvironmentCoordinate operands.
+    Static,
+    // An object environment, such as `with`, can intercept any name. Once one
+    // is between the current point and a binding, resolution must stay dynamic.
+    Dynamic,
+}
+
+const ENVIRONMENT_MODE_LEXICAL: u32 = 0;
 
 impl std::fmt::Debug for ScopedOperandInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -159,6 +240,14 @@ pub struct Generator {
     pub breakable_scopes: Vec<LabelableScope>,
     pub pending_labels: Vec<Utf16String>,
     pub lexical_environment_register_stack: Vec<ScopedOperand>,
+    // Mirrors lexical_environment_register_stack for environments whose binding
+    // layout is known to codegen. This lets us emit immutable coordinates
+    // instead of runtime-updated caches in common lexical lookup instructions.
+    environment_coordinate_scope_stack: Vec<EnvironmentCoordinateScope>,
+    // `var` binding instructions start from vm.variable_environment(), not the
+    // current lexical environment. Keep a separate anchor so a var write inside
+    // a nested block does not accidentally count the block as a hop.
+    variable_environment_coordinate_scope_index: Option<usize>,
     pub home_objects: Vec<ScopedOperand>,
 
     // --- Finally context ---
@@ -170,13 +259,14 @@ pub struct Generator {
     // --- Various counters ---
     pub next_property_lookup_cache: u32,
     pub next_global_variable_cache: u32,
+    pub next_environment_coordinate_cache: u32,
     pub next_template_object_cache: u32,
     pub next_object_shape_cache: u32,
     pub next_object_property_iterator_cache: u32,
 
     // --- Codegen state ---
     pub strict: bool,
-    pub function_environment_needed: bool,
+    pub this_value_needs_environment_resolution: bool,
     pub enclosing_function_kind: FunctionKind,
     pub local_variables: Vec<LocalVariable>,
     pub initialized_locals: Vec<bool>,
@@ -187,8 +277,8 @@ pub struct Generator {
     pub pending_lhs_name: Option<IdentifierTableIndex>,
 
     // Source location tracking
-    pub current_source_start: u32,
-    pub current_source_end: u32,
+    pub current_source_start: Position,
+    pub current_source_end: Position,
 
     // --- Completion register ---
     pub current_completion_register: Option<ScopedOperand>,
@@ -199,13 +289,17 @@ pub struct Generator {
     this_value: ScopedOperand,
 
     // --- Shared function data ---
-    // Opaque pointers to SharedFunctionInstanceData objects.
-    pub shared_function_data: Vec<*mut std::ffi::c_void>,
+    // Pending descriptors for SharedFunctionInstanceData objects. These are
+    // materialized at the C++ boundary so bytecode generation can run without
+    // allocating GC cells.
+    pub shared_function_data: Vec<PendingSharedFunctionData>,
+    pub eager_compile_function_ids: HashSet<FunctionId>,
+    pub eager_compile_direct_iifes: bool,
 
     // --- Class blueprints ---
-    // Opaque pointers to heap-allocated ClassBlueprint objects.
-    // Ownership transfers to the Executable during creation.
-    pub class_blueprints: Vec<*mut std::ffi::c_void>,
+    // Pending descriptors for ClassBlueprint objects. Ownership transfers to
+    // the Executable after materialization.
+    pub class_blueprints: Vec<PendingClassBlueprint>,
 
     // --- Length identifier cache ---
     pub length_identifier: Option<PropertyKeyTableIndex>,
@@ -236,6 +330,20 @@ pub struct Generator {
     // Side table owning all FunctionData from the parser. Codegen
     // takes ownership of individual entries via `take()`.
     pub function_table: crate::ast::FunctionTable,
+
+    // --- AST arena ---
+    // Shared (read-only post-parse) storage for identifiers, scopes, and
+    // interned strings. Cloning is a refcount bump — multiple generators
+    // (top-level + nested IIFE + lazy children) share the same arena.
+    pub arena: Arc<AstArena>,
+}
+
+impl Generator {
+    /// Convenience: look up an identifier by ID in this generator's arena.
+    #[inline]
+    pub fn identifier(&self, id: IdentifierId) -> &crate::ast::Identifier {
+        &self.arena.identifiers[id]
+    }
 }
 
 macro_rules! singleton_constant {
@@ -310,23 +418,34 @@ impl Generator {
             breakable_scopes: Vec::new(),
             pending_labels: Vec::new(),
             lexical_environment_register_stack: Vec::new(),
+            environment_coordinate_scope_stack: Vec::new(),
+            variable_environment_coordinate_scope_index: None,
             home_objects: Vec::new(),
             finally_contexts: Vec::new(),
             current_finally_context: None,
             next_property_lookup_cache: 0,
             next_global_variable_cache: 0,
+            next_environment_coordinate_cache: 0,
             next_template_object_cache: 0,
             next_object_shape_cache: 0,
             next_object_property_iterator_cache: 0,
             strict: false,
-            function_environment_needed: true,
+            this_value_needs_environment_resolution: true,
             enclosing_function_kind: FunctionKind::Normal,
             local_variables: Vec::new(),
             initialized_locals: Vec::new(),
             initialized_arguments: Vec::new(),
             pending_lhs_name: None,
-            current_source_start: 0,
-            current_source_end: 0,
+            current_source_start: Position {
+                line: 0,
+                column: 0,
+                offset: 0,
+            },
+            current_source_end: Position {
+                line: 0,
+                column: 0,
+                offset: 0,
+            },
             current_completion_register: None,
             must_propagate_completion: false,
             accumulator: ScopedOperand {
@@ -342,6 +461,8 @@ impl Generator {
                 }),
             },
             shared_function_data: Vec::new(),
+            eager_compile_function_ids: HashSet::new(),
+            eager_compile_direct_iifes: false,
             class_blueprints: Vec::new(),
             length_identifier: None,
             current_unwind_handler: None,
@@ -351,6 +472,7 @@ impl Generator {
             source_code_ptr: std::ptr::null(),
             source_len: 0,
             function_table: crate::ast::FunctionTable::new(),
+            arena: Arc::new(AstArena::new()),
             free_register_pool,
         }
     }
@@ -386,18 +508,16 @@ impl Generator {
     // --- Register management ---
 
     /// Allocate a new register (or reuse a freed one).
-    /// Always picks the lowest-numbered free register to ensure deterministic
-    /// allocation regardless of operand drop order.
     pub fn allocate_register(&mut self) -> ScopedOperand {
         let reg = {
             let mut pool = self.free_register_pool.borrow_mut();
-            if pool.is_empty() {
-                let r = Register(self.next_register);
-                self.next_register += 1;
-                r
-            } else {
-                let min_index = pool.iter().enumerate().min_by_key(|(_, r)| r.0).unwrap().0;
-                pool.remove(min_index)
+            match pool.pop() {
+                Some(r) => r,
+                None => {
+                    let r = Register(self.next_register);
+                    self.next_register += 1;
+                    r
+                }
             }
         };
         self.scoped_operand(Operand::register(reg))
@@ -435,10 +555,7 @@ impl Generator {
     /// Copy a local variable into a fresh register to prevent later
     /// side effects from changing its value. Returns the operand unchanged
     /// if it is not a local.
-    pub fn copy_if_needed_to_preserve_evaluation_order(
-        &mut self,
-        operand: &ScopedOperand,
-    ) -> ScopedOperand {
+    pub fn copy_if_needed_to_preserve_evaluation_order(&mut self, operand: &ScopedOperand) -> ScopedOperand {
         match operand.operand().operand_type() {
             OperandType::Register | OperandType::Constant => operand.clone(),
             OperandType::Local | OperandType::Argument => {
@@ -524,8 +641,12 @@ impl Generator {
         self.append_constant(ConstantValue::BigInt(value))
     }
 
-    pub fn add_constant_raw_value(&mut self, value: u64) -> ScopedOperand {
-        self.append_constant(ConstantValue::RawValue(value))
+    pub fn add_constant_well_known_symbol(&mut self, symbol: WellKnownSymbolKind) -> ScopedOperand {
+        self.append_constant(ConstantValue::WellKnownSymbol(symbol))
+    }
+
+    pub fn add_constant_abstract_operation(&mut self, operation: AbstractOperationKind) -> ScopedOperand {
+        self.append_constant(ConstantValue::AbstractOperation(operation))
     }
 
     /// Get the constant value for a constant operand.
@@ -539,12 +660,7 @@ impl Generator {
 
     // --- Table interning ---
 
-    define_intern_method!(
-        intern_string,
-        StringTableIndex,
-        string_table,
-        string_table_index
-    );
+    define_intern_method!(intern_string, StringTableIndex, string_table, string_table_index);
     define_intern_method!(
         intern_identifier,
         IdentifierTableIndex,
@@ -558,13 +674,34 @@ impl Generator {
         property_key_table_index
     );
 
+    /// Convenience: look up a `StringId` in the AST interner and intern the
+    /// resulting slice into the bytecode identifier table.
+    pub fn intern_identifier_id(&mut self, id: crate::ast::StringId) -> IdentifierTableIndex {
+        let arena = self.arena.clone();
+        let slice = arena.strings[id].as_slice();
+        self.intern_identifier(slice)
+    }
+
+    /// Convenience: look up a `StringId` in the AST interner and intern the
+    /// resulting slice into the bytecode property key table.
+    pub fn intern_property_key_id(&mut self, id: crate::ast::StringId) -> PropertyKeyTableIndex {
+        let arena = self.arena.clone();
+        let slice = arena.strings[id].as_slice();
+        self.intern_property_key(slice)
+    }
+
+    /// Convenience: look up a `StringId` in the AST interner and intern the
+    /// resulting slice into the bytecode string table.
+    pub fn intern_string_id(&mut self, id: crate::ast::StringId) -> StringTableIndex {
+        let arena = self.arena.clone();
+        let slice = arena.strings[id].as_slice();
+        self.intern_string(slice)
+    }
+
     /// If `operand` is a constant string that is not an array index, intern it
     /// as a property key and return the index. Uses split borrows to avoid
     /// cloning the string when it is already interned (the common case).
-    pub fn try_constant_string_to_property_key(
-        &mut self,
-        operand: &ScopedOperand,
-    ) -> Option<PropertyKeyTableIndex> {
+    pub fn try_constant_string_to_property_key(&mut self, operand: &ScopedOperand) -> Option<PropertyKeyTableIndex> {
         if !operand.operand().is_constant() {
             return None;
         }
@@ -585,17 +722,23 @@ impl Generator {
         Some(key_index)
     }
 
-    /// Register a SharedFunctionInstanceData (opaque pointer) and return its index.
-    pub fn register_shared_function_data(&mut self, ptr: *mut std::ffi::c_void) -> u32 {
+    /// Register a pending SharedFunctionInstanceData descriptor and return its index.
+    pub fn register_shared_function_data(&mut self, data: PendingSharedFunctionData) -> u32 {
         let index = u32_from_usize(self.shared_function_data.len());
-        self.shared_function_data.push(ptr);
+        self.shared_function_data.push(data);
         index
     }
 
-    /// Register a ClassBlueprint (opaque pointer) and return its index.
-    pub fn register_class_blueprint(&mut self, ptr: *mut std::ffi::c_void) -> u32 {
+    pub fn set_class_field_initializer_name(&mut self, index: u32, name: Utf16String, is_private: bool) {
+        if let Some(data) = self.shared_function_data.get_mut(index as usize) {
+            data.class_field_initializer_name = Some((name, is_private));
+        }
+    }
+
+    /// Register a pending ClassBlueprint descriptor and return its index.
+    pub fn register_class_blueprint(&mut self, data: PendingClassBlueprint) -> u32 {
         let index = u32_from_usize(self.class_blueprints.len());
-        self.class_blueprints.push(ptr);
+        self.class_blueprints.push(data);
         index
     }
 
@@ -671,10 +814,37 @@ impl Generator {
         if self.is_current_block_terminated() {
             return;
         }
+        // Keep coordinate scopes in lockstep with the actual declarative
+        // environment shape. Most bindings are created explicitly, while
+        // CreateArguments can implicitly create an `arguments` binding.
+        if let Instruction::CreateVariable {
+            identifier,
+            mode,
+            is_global,
+            ..
+        } = &instruction
+            && !is_global
+        {
+            let name = self.identifier_table[identifier.0 as usize].clone();
+            if *mode == ENVIRONMENT_MODE_LEXICAL {
+                self.record_environment_binding(name);
+            } else {
+                self.record_variable_environment_binding(name);
+            }
+        }
+        if let Instruction::CreateMutableBinding { identifier, .. }
+        | Instruction::CreateImmutableBinding { identifier, .. } = &instruction
+        {
+            let name = self.identifier_table[identifier.0 as usize].clone();
+            self.record_environment_binding(name);
+        }
+        if let Instruction::CreateArguments { dst: None, .. } = &instruction {
+            self.record_environment_binding(Utf16String::from(utf16!("arguments")));
+        }
         let source_map = SourceMapEntry {
             bytecode_offset: 0, // filled during flattening
-            source_start: self.current_source_start,
-            source_end: self.current_source_end,
+            line: self.current_source_start.line,
+            column: self.current_source_start.column,
         };
         let block = &mut self.basic_blocks[self.current_block_index.basic_block_index()];
         block.append(instruction, source_map);
@@ -697,12 +867,7 @@ impl Generator {
     }
 
     /// Emit a conditional jump, with comparison fusion and constant folding.
-    pub fn emit_jump_if(
-        &mut self,
-        condition: &ScopedOperand,
-        true_target: Label,
-        false_target: Label,
-    ) {
+    pub fn emit_jump_if(&mut self, condition: &ScopedOperand, true_target: Label, false_target: Label) {
         // OPTIMIZATION: If condition is a constant, emit an unconditional jump.
         if let Some(constant) = self.get_constant(condition)
             && let Some(is_truthy) = constant_to_boolean(constant)
@@ -727,9 +892,7 @@ impl Generator {
                             false_target,
                         })
                     }
-                    Instruction::LessThanEquals { dst, lhs, rhs }
-                        if *dst == condition.operand() =>
-                    {
+                    Instruction::LessThanEquals { dst, lhs, rhs } if *dst == condition.operand() => {
                         Some(Instruction::JumpLessThanEquals {
                             lhs: *lhs,
                             rhs: *rhs,
@@ -745,9 +908,7 @@ impl Generator {
                             false_target,
                         })
                     }
-                    Instruction::GreaterThanEquals { dst, lhs, rhs }
-                        if *dst == condition.operand() =>
-                    {
+                    Instruction::GreaterThanEquals { dst, lhs, rhs } if *dst == condition.operand() => {
                         Some(Instruction::JumpGreaterThanEquals {
                             lhs: *lhs,
                             rhs: *rhs,
@@ -763,9 +924,7 @@ impl Generator {
                             false_target,
                         })
                     }
-                    Instruction::LooselyInequals { dst, lhs, rhs }
-                        if *dst == condition.operand() =>
-                    {
+                    Instruction::LooselyInequals { dst, lhs, rhs } if *dst == condition.operand() => {
                         Some(Instruction::JumpLooselyInequals {
                             lhs: *lhs,
                             rhs: *rhs,
@@ -773,9 +932,7 @@ impl Generator {
                             false_target,
                         })
                     }
-                    Instruction::StrictlyEquals { dst, lhs, rhs }
-                        if *dst == condition.operand() =>
-                    {
+                    Instruction::StrictlyEquals { dst, lhs, rhs } if *dst == condition.operand() => {
                         Some(Instruction::JumpStrictlyEquals {
                             lhs: *lhs,
                             rhs: *rhs,
@@ -783,9 +940,7 @@ impl Generator {
                             false_target,
                         })
                     }
-                    Instruction::StrictlyInequals { dst, lhs, rhs }
-                        if *dst == condition.operand() =>
-                    {
+                    Instruction::StrictlyInequals { dst, lhs, rhs } if *dst == condition.operand() => {
                         Some(Instruction::JumpStrictlyInequals {
                             lhs: *lhs,
                             rhs: *rhs,
@@ -815,12 +970,10 @@ impl Generator {
 
     next_cache_method!(next_property_lookup_cache, next_property_lookup_cache);
     next_cache_method!(next_global_variable_cache, next_global_variable_cache);
+    next_cache_method!(next_environment_coordinate_cache, next_environment_coordinate_cache);
     next_cache_method!(next_template_object_cache, next_template_object_cache);
     next_cache_method!(next_object_shape_cache, next_object_shape_cache);
-    next_cache_method!(
-        next_object_property_iterator_cache,
-        next_object_property_iterator_cache
-    );
+    next_cache_method!(next_object_property_iterator_cache, next_object_property_iterator_cache);
 
     // --- Lexical environment helpers ---
 
@@ -828,22 +981,25 @@ impl Generator {
         self.lexical_environment_register_stack
             .last()
             .cloned()
-            .unwrap_or_else(|| {
-                self.scoped_operand(Operand::register(Register::SAVED_LEXICAL_ENVIRONMENT))
-            })
+            .unwrap_or_else(|| self.scoped_operand(Operand::register(Register::SAVED_LEXICAL_ENVIRONMENT)))
     }
 
     pub fn capture_saved_lexical_environment(&mut self) {
         let env_reg = self.scoped_operand(Operand::register(Register::SAVED_LEXICAL_ENVIRONMENT));
-        self.emit(Instruction::GetLexicalEnvironment {
-            dst: env_reg.operand(),
-        });
-        self.lexical_environment_register_stack.push(env_reg);
+        self.emit(Instruction::GetLexicalEnvironment { dst: env_reg.operand() });
+        self.push_untracked_lexical_environment(env_reg);
+    }
+
+    pub fn capture_saved_lexical_environment_with_coordinates(&mut self) {
+        let env_reg = self.scoped_operand(Operand::register(Register::SAVED_LEXICAL_ENVIRONMENT));
+        self.emit(Instruction::GetLexicalEnvironment { dst: env_reg.operand() });
+        self.push_static_lexical_environment(env_reg);
+        self.variable_environment_coordinate_scope_index = self.environment_coordinate_scope_stack.len().checked_sub(1);
     }
 
     pub fn end_variable_scope(&mut self) {
         self.end_boundary(BlockBoundaryType::LeaveLexicalEnvironment);
-        self.lexical_environment_register_stack.pop();
+        self.pop_tracked_lexical_environment();
         if !self.is_current_block_terminated() {
             let parent = self.current_lexical_environment();
             self.emit(Instruction::SetLexicalEnvironment {
@@ -864,16 +1020,140 @@ impl Generator {
     }
 
     pub fn push_new_lexical_environment(&mut self, capacity: u32) -> ScopedOperand {
+        self.push_new_lexical_environment_impl(capacity, false)
+    }
+
+    pub fn push_new_catch_lexical_environment(&mut self, capacity: u32) -> ScopedOperand {
+        self.push_new_lexical_environment_impl(capacity, true)
+    }
+
+    fn push_new_lexical_environment_impl(&mut self, capacity: u32, is_catch_environment: bool) -> ScopedOperand {
         let parent = self.current_lexical_environment();
         let new_env = self.allocate_register();
         self.emit(Instruction::CreateLexicalEnvironment {
             dst: new_env.operand(),
             parent: parent.operand(),
             capacity,
+            is_catch_environment,
         });
-        self.lexical_environment_register_stack
-            .push(new_env.clone());
+        self.push_static_lexical_environment(new_env.clone());
         new_env
+    }
+
+    pub fn push_untracked_lexical_environment(&mut self, environment: ScopedOperand) {
+        self.lexical_environment_register_stack.push(environment);
+    }
+
+    pub fn push_static_lexical_environment(&mut self, environment: ScopedOperand) {
+        self.push_untracked_lexical_environment(environment);
+        self.push_environment_coordinate_scope(EnvironmentCoordinateScopeKind::Static);
+    }
+
+    pub fn push_dynamic_lexical_environment(&mut self, environment: ScopedOperand) {
+        self.push_untracked_lexical_environment(environment);
+        self.push_environment_coordinate_scope(EnvironmentCoordinateScopeKind::Dynamic);
+    }
+
+    pub fn push_static_variable_environment(&mut self, environment: ScopedOperand) {
+        self.push_static_lexical_environment(environment);
+        self.variable_environment_coordinate_scope_index = self.environment_coordinate_scope_stack.len().checked_sub(1);
+    }
+
+    pub fn pop_untracked_lexical_environment(&mut self) -> Option<ScopedOperand> {
+        self.lexical_environment_register_stack.pop()
+    }
+
+    pub fn pop_tracked_lexical_environment(&mut self) -> Option<ScopedOperand> {
+        self.pop_environment_coordinate_scope();
+        self.pop_untracked_lexical_environment()
+    }
+
+    fn push_environment_coordinate_scope(&mut self, kind: EnvironmentCoordinateScopeKind) {
+        self.environment_coordinate_scope_stack
+            .push(EnvironmentCoordinateScope {
+                bindings: HashMap::new(),
+                next_binding_index: 0,
+                kind,
+            });
+    }
+
+    fn pop_environment_coordinate_scope(&mut self) {
+        self.environment_coordinate_scope_stack.pop();
+    }
+
+    fn record_environment_binding(&mut self, name: Utf16String) {
+        let Some(scope_index) = self.environment_coordinate_scope_stack.len().checked_sub(1) else {
+            return;
+        };
+        self.record_environment_binding_at_scope_index(name, scope_index);
+    }
+
+    fn record_variable_environment_binding(&mut self, name: Utf16String) {
+        let Some(scope_index) = self.variable_environment_coordinate_scope_index else {
+            return;
+        };
+        self.record_environment_binding_at_scope_index(name, scope_index);
+    }
+
+    fn record_environment_binding_at_scope_index(&mut self, name: Utf16String, scope_index: usize) {
+        let Some(scope) = self.environment_coordinate_scope_stack.get_mut(scope_index) else {
+            return;
+        };
+        if scope.kind == EnvironmentCoordinateScopeKind::Dynamic {
+            return;
+        }
+        // DeclarativeEnvironment appends duplicate bindings and resolves the
+        // name to the newest slot, so mirror that layout here.
+        scope.bindings.insert(name, scope.next_binding_index);
+        scope.next_binding_index += 1;
+    }
+
+    pub fn environment_coordinate_for(&self, name: &[u16]) -> Option<EnvironmentCoordinate> {
+        self.environment_coordinate_for_from_scope_index(
+            name,
+            self.environment_coordinate_scope_stack.len().checked_sub(1)?,
+        )
+    }
+
+    fn environment_coordinate_for_from_scope_index(
+        &self,
+        name: &[u16],
+        scope_index: usize,
+    ) -> Option<EnvironmentCoordinate> {
+        // Coordinates are only safe through fully-known declarative scopes. If
+        // any dynamic scope is crossed, preserve the runtime lookup semantics.
+        for (hops, scope) in self.environment_coordinate_scope_stack[..=scope_index]
+            .iter()
+            .rev()
+            .enumerate()
+        {
+            if scope.kind == EnvironmentCoordinateScopeKind::Dynamic {
+                return None;
+            }
+            if let Some(index) = scope.bindings.get(name) {
+                return Some(EnvironmentCoordinate {
+                    hops: u32_from_usize(hops),
+                    index: *index,
+                });
+            }
+        }
+        None
+    }
+
+    pub fn environment_coordinate_for_identifier(
+        &self,
+        identifier: IdentifierTableIndex,
+    ) -> Option<EnvironmentCoordinate> {
+        let name = &self.identifier_table[identifier.0 as usize];
+        self.environment_coordinate_for(name)
+    }
+
+    pub fn variable_environment_coordinate_for_identifier(
+        &self,
+        identifier: IdentifierTableIndex,
+    ) -> Option<EnvironmentCoordinate> {
+        let name = &self.identifier_table[identifier.0 as usize];
+        self.environment_coordinate_for_from_scope_index(name, self.variable_environment_coordinate_scope_index?)
     }
 
     // --- Boundary management ---
@@ -972,9 +1252,7 @@ impl Generator {
     fn has_outer_finally_before_target(&self, is_break: bool, boundary_index: usize) -> bool {
         for j in (0..boundary_index.saturating_sub(1)).rev() {
             let inner = self.boundaries[j];
-            if (is_break && inner == BlockBoundaryType::Break)
-                || (!is_break && inner == BlockBoundaryType::Continue)
-            {
+            if (is_break && inner == BlockBoundaryType::Break) || (!is_break && inner == BlockBoundaryType::Continue) {
                 return false;
             }
             if inner == BlockBoundaryType::ReturnToFinally {
@@ -987,9 +1265,7 @@ impl Generator {
     /// Register a jump target with the current FinallyContext.
     /// Assigns a unique completion_type index and emits code to set it and jump to finally.
     pub fn register_jump_in_finally_context(&mut self, target: Label) {
-        let index = self
-            .current_finally_context
-            .expect("no active finally context");
+        let index = self.current_finally_context.expect("no active finally context");
         let ctx = &mut self.finally_contexts[index];
         let jump_index = ctx.next_jump_index;
         ctx.next_jump_index += 1;
@@ -1001,9 +1277,7 @@ impl Generator {
         let finally_body = ctx.finally_body;
         let index_const = self.add_constant_i32(jump_index);
         self.emit_mov(&completion_type, &index_const);
-        self.emit(Instruction::Jump {
-            target: finally_body,
-        });
+        self.emit(Instruction::Jump { target: finally_body });
     }
 
     /// For break/continue through nested finally: create a trampoline block.
@@ -1012,9 +1286,7 @@ impl Generator {
         self.register_jump_in_finally_context(trampoline_block);
         self.switch_to_basic_block(trampoline_block);
         // Pop to the parent FinallyContext (simulating the inner finally completing).
-        let index = self
-            .current_finally_context
-            .expect("no active finally context");
+        let index = self.current_finally_context.expect("no active finally context");
         self.current_unwind_handler = self.finally_contexts[index].saved_unwind_handler;
         self.current_finally_context = self.finally_contexts[index].parent_index;
     }
@@ -1049,14 +1321,10 @@ impl Generator {
             let boundary = self.boundaries[i];
             match boundary {
                 BlockBoundaryType::Break if is_break => {
-                    let target_scope = self
-                        .breakable_scopes
-                        .last()
-                        .expect("no active breakable scope");
+                    let target_scope = self.breakable_scopes.last().expect("no active breakable scope");
                     let target = target_scope.bytecode_target;
                     let completion = target_scope.completion_register.clone();
-                    if let (Some(cur), Some(tgt)) =
-                        (self.current_completion_register.clone(), completion)
+                    if let (Some(cur), Some(tgt)) = (self.current_completion_register.clone(), completion)
                         && cur != tgt
                     {
                         self.emit_mov(&tgt, &cur);
@@ -1066,14 +1334,10 @@ impl Generator {
                     return;
                 }
                 BlockBoundaryType::Continue if !is_break => {
-                    let target_scope = self
-                        .continuable_scopes
-                        .last()
-                        .expect("no active continuable scope");
+                    let target_scope = self.continuable_scopes.last().expect("no active continuable scope");
                     let target = target_scope.bytecode_target;
                     let completion = target_scope.completion_register.clone();
-                    if let (Some(cur), Some(tgt)) =
-                        (self.current_completion_register.clone(), completion)
+                    if let (Some(cur), Some(tgt)) = (self.current_completion_register.clone(), completion)
                         && cur != tgt
                     {
                         self.emit_mov(&tgt, &cur);
@@ -1092,18 +1356,13 @@ impl Generator {
                 BlockBoundaryType::ReturnToFinally => {
                     if !self.has_outer_finally_before_target(is_break, i + 1) {
                         let target_scope = if is_break {
-                            self.breakable_scopes
-                                .last()
-                                .expect("no active breakable scope")
+                            self.breakable_scopes.last().expect("no active breakable scope")
                         } else {
-                            self.continuable_scopes
-                                .last()
-                                .expect("no active continuable scope")
+                            self.continuable_scopes.last().expect("no active continuable scope")
                         };
                         let target = target_scope.bytecode_target;
                         let completion = target_scope.completion_register.clone();
-                        if let (Some(cur), Some(tgt)) =
-                            (self.current_completion_register.clone(), completion)
+                        if let (Some(cur), Some(tgt)) = (self.current_completion_register.clone(), completion)
                             && cur != tgt
                         {
                             self.emit_mov(&tgt, &cur);
@@ -1192,8 +1451,7 @@ impl Generator {
             }
 
             if label_set.iter().any(|l| l == label) {
-                if let (Some(cur), Some(tgt)) =
-                    (self.current_completion_register.clone(), completion.clone())
+                if let (Some(cur), Some(tgt)) = (self.current_completion_register.clone(), completion.clone())
                     && cur != tgt
                 {
                     self.emit_mov(&tgt, &cur);
@@ -1216,8 +1474,7 @@ impl Generator {
             match self.boundaries[i] {
                 BlockBoundaryType::LeaveLexicalEnvironment => {
                     env_stack_offset -= 1;
-                    let parent_env =
-                        self.lexical_environment_register_stack[env_stack_offset - 1].clone();
+                    let parent_env = self.lexical_environment_register_stack[env_stack_offset - 1].clone();
                     self.emit(Instruction::SetLexicalEnvironment {
                         environment: parent_env.operand(),
                     });
@@ -1241,18 +1498,14 @@ impl Generator {
             self.emit_mov(&completion_value, value);
             let ret_const = self.add_constant_i32(FinallyContext::RETURN);
             self.emit_mov(&completion_type, &ret_const);
-            self.emit(Instruction::Jump {
-                target: finally_body,
-            });
+            self.emit(Instruction::Jump { target: finally_body });
         } else if self.is_in_generator_or_async_function() {
             self.emit(Instruction::Yield {
                 continuation_label: None,
                 value: value.operand(),
             });
         } else {
-            self.emit(Instruction::Return {
-                value: value.operand(),
-            });
+            self.emit(Instruction::Return { value: value.operand() });
         }
     }
 
@@ -1263,10 +1516,7 @@ impl Generator {
     // --- Local variable initialization tracking ---
 
     pub fn is_local_initialized(&self, index: u32) -> bool {
-        self.initialized_locals
-            .get(index as usize)
-            .copied()
-            .unwrap_or(false)
+        self.initialized_locals.get(index as usize).copied().unwrap_or(false)
     }
 
     pub fn is_local_lexically_declared(&self, index: u32) -> bool {
@@ -1284,10 +1534,7 @@ impl Generator {
     }
 
     pub fn is_argument_initialized(&self, index: u32) -> bool {
-        self.initialized_arguments
-            .get(index as usize)
-            .copied()
-            .unwrap_or(false)
+        self.initialized_arguments.get(index as usize).copied().unwrap_or(false)
     }
 
     pub fn mark_argument_initialized(&mut self, index: u32) {
@@ -1322,27 +1569,25 @@ impl Generator {
         });
 
         if let Some(load_block_index) = synthetic_load_block {
-            let saved_environment_is_used =
-                self.basic_blocks
+            let saved_environment_is_used = self.basic_blocks.iter().enumerate().any(|(block_index, block)| {
+                block
+                    .instructions
                     .iter()
                     .enumerate()
-                    .any(|(block_index, block)| {
-                        block.instructions.iter().enumerate().any(
-                            |(instruction_index, (instruction, _))| {
-                                if block_index == load_block_index && instruction_index == 0 {
-                                    return false;
-                                }
-                                let mut instruction = instruction.clone();
-                                let mut mentions_saved_environment = false;
-                                instruction.visit_operands(&mut |operand: &mut Operand| {
-                                    if *operand == saved_environment {
-                                        mentions_saved_environment = true;
-                                    }
-                                });
-                                mentions_saved_environment
-                            },
-                        )
-                    });
+                    .any(|(instruction_index, (instruction, _))| {
+                        if block_index == load_block_index && instruction_index == 0 {
+                            return false;
+                        }
+                        let mut instruction = instruction.clone();
+                        let mut mentions_saved_environment = false;
+                        instruction.visit_operands(&mut |operand: &mut Operand| {
+                            if *operand == saved_environment {
+                                mentions_saved_environment = true;
+                            }
+                        });
+                        mentions_saved_environment
+                    })
+            });
 
             if !saved_environment_is_used {
                 self.basic_blocks[load_block_index].instructions.remove(0);
@@ -1365,6 +1610,7 @@ impl Generator {
         let number_of_constants = u32_from_usize(self.constants.len());
 
         // Phase 1: Operand rewriting
+        let mut max_argument_index: Option<u32> = None;
         for block in &mut self.basic_blocks {
             for (instruction, _) in &mut block.instructions {
                 instruction.visit_operands(&mut |op: &mut Operand| {
@@ -1374,13 +1620,16 @@ impl Generator {
                         OperandType::Constant => {
                             op.offset_index_by(number_of_registers + number_of_locals);
                         }
-                        OperandType::Argument => op.offset_index_by(
-                            number_of_registers + number_of_locals + number_of_constants,
-                        ),
+                        OperandType::Argument => {
+                            let index = op.index();
+                            max_argument_index = Some(max_argument_index.map_or(index, |m| m.max(index)));
+                            op.offset_index_by(number_of_registers + number_of_locals + number_of_constants);
+                        }
                     }
                 });
             }
         }
+        let number_of_arguments = max_argument_index.map_or(0, |m| m + 1);
 
         // Phase 1b: Peephole optimization - merge consecutive Mov instructions into Mov2/Mov3.
         for block in &mut self.basic_blocks {
@@ -1410,8 +1659,7 @@ impl Generator {
                     {
                         let (dst3, src3) = (*dst, *src);
                         let mov2_is_dup = dst2 == dst1 && src2 == src1;
-                        let mov3_is_dup =
-                            (dst3 == dst1 && src3 == src1) || (dst3 == dst2 && src3 == src2);
+                        let mov3_is_dup = (dst3 == dst1 && src3 == src1) || (dst3 == dst2 && src3 == src2);
                         if mov2_is_dup && mov3_is_dup {
                             // All three identical: keep single Mov.
                             block.instructions.remove(i + 2);
@@ -1431,12 +1679,7 @@ impl Generator {
                             continue;
                         } else if mov3_is_dup {
                             // mov3 is dup: Mov2(mov1, mov2).
-                            block.instructions[i].0 = Instruction::Mov2 {
-                                dst1,
-                                src1,
-                                dst2,
-                                src2,
-                            };
+                            block.instructions[i].0 = Instruction::Mov2 { dst1, src1, dst2, src2 };
                             block.instructions.remove(i + 2);
                             block.instructions.remove(i + 1);
                             i += 1;
@@ -1458,12 +1701,7 @@ impl Generator {
                         }
                     }
                     // Only two unique Movs: Mov2.
-                    block.instructions[i].0 = Instruction::Mov2 {
-                        dst1,
-                        src1,
-                        dst2,
-                        src2,
-                    };
+                    block.instructions[i].0 = Instruction::Mov2 { dst1, src1, dst2, src2 };
                     block.instructions.remove(i + 1);
                     i += 1;
                     continue;
@@ -1598,6 +1836,15 @@ impl Generator {
         let mut bytecode: Vec<u8> = Vec::with_capacity(offset);
         let mut source_map: Vec<SourceMapEntry> = Vec::new();
         let mut exception_handlers: Vec<ExceptionHandler> = Vec::new();
+        fn push_source_map_entry(source_map: &mut Vec<SourceMapEntry>, entry: SourceMapEntry) {
+            let should_push = source_map
+                .last()
+                .is_none_or(|previous| previous.line != entry.line || previous.column != entry.column);
+            if should_push {
+                source_map.push(entry);
+            }
+        }
+
         // Track which blocks actually produced instructions.
         let mut basic_block_start_offsets: Vec<usize> = Vec::with_capacity(num_blocks);
 
@@ -1619,61 +1866,70 @@ impl Generator {
                     }
                     InstAction::Emit => {
                         let instruction_offset = bytecode.len();
-                        source_map.push(SourceMapEntry {
-                            bytecode_offset: u32_from_usize(instruction_offset),
-                            source_start: sm.source_start,
-                            source_end: sm.source_end,
-                        });
+                        push_source_map_entry(
+                            &mut source_map,
+                            SourceMapEntry {
+                                bytecode_offset: u32_from_usize(instruction_offset),
+                                line: sm.line,
+                                column: sm.column,
+                            },
+                        );
                         instruction.encode(self.strict, &mut bytecode);
                     }
                     InstAction::JumpToReturn(value) => {
                         let instruction_offset = bytecode.len();
-                        source_map.push(SourceMapEntry {
-                            bytecode_offset: u32_from_usize(instruction_offset),
-                            source_start: sm.source_start,
-                            source_end: sm.source_end,
-                        });
+                        push_source_map_entry(
+                            &mut source_map,
+                            SourceMapEntry {
+                                bytecode_offset: u32_from_usize(instruction_offset),
+                                line: sm.line,
+                                column: sm.column,
+                            },
+                        );
                         let replacement = Instruction::Return { value };
                         replacement.encode(self.strict, &mut bytecode);
                     }
                     InstAction::JumpToEnd(value) => {
                         let instruction_offset = bytecode.len();
-                        source_map.push(SourceMapEntry {
-                            bytecode_offset: u32_from_usize(instruction_offset),
-                            source_start: sm.source_start,
-                            source_end: sm.source_end,
-                        });
+                        push_source_map_entry(
+                            &mut source_map,
+                            SourceMapEntry {
+                                bytecode_offset: u32_from_usize(instruction_offset),
+                                line: sm.line,
+                                column: sm.column,
+                            },
+                        );
                         let replacement = Instruction::End { value };
                         replacement.encode(self.strict, &mut bytecode);
                     }
-                    InstAction::EmitJumpFalse {
-                        condition,
-                        mut target,
-                    } => {
+                    InstAction::EmitJumpFalse { condition, mut target } => {
                         // Patch label for the target
                         let target_block = target.0 as usize;
                         target.0 = u32_from_usize(block_offsets[target_block]);
                         let instruction_offset = bytecode.len();
-                        source_map.push(SourceMapEntry {
-                            bytecode_offset: u32_from_usize(instruction_offset),
-                            source_start: sm.source_start,
-                            source_end: sm.source_end,
-                        });
+                        push_source_map_entry(
+                            &mut source_map,
+                            SourceMapEntry {
+                                bytecode_offset: u32_from_usize(instruction_offset),
+                                line: sm.line,
+                                column: sm.column,
+                            },
+                        );
                         let replacement = Instruction::JumpFalse { condition, target };
                         replacement.encode(self.strict, &mut bytecode);
                     }
-                    InstAction::EmitJumpTrue {
-                        condition,
-                        mut target,
-                    } => {
+                    InstAction::EmitJumpTrue { condition, mut target } => {
                         let target_block = target.0 as usize;
                         target.0 = u32_from_usize(block_offsets[target_block]);
                         let instruction_offset = bytecode.len();
-                        source_map.push(SourceMapEntry {
-                            bytecode_offset: u32_from_usize(instruction_offset),
-                            source_start: sm.source_start,
-                            source_end: sm.source_end,
-                        });
+                        push_source_map_entry(
+                            &mut source_map,
+                            SourceMapEntry {
+                                bytecode_offset: u32_from_usize(instruction_offset),
+                                line: sm.line,
+                                column: sm.column,
+                            },
+                        );
                         let replacement = Instruction::JumpTrue { condition, target };
                         replacement.encode(self.strict, &mut bytecode);
                     }
@@ -1682,18 +1938,18 @@ impl Generator {
 
             // Unterminated blocks get an implicit End(undefined).
             if !block.terminated {
-                let mut undef_rewritten =
-                    undefined_constant_operand.expect("undefined constant must exist");
+                let mut undef_rewritten = undefined_constant_operand.expect("undefined constant must exist");
                 undef_rewritten.offset_index_by(number_of_registers + number_of_locals);
-                let end_instruction = Instruction::End {
-                    value: undef_rewritten,
-                };
+                let end_instruction = Instruction::End { value: undef_rewritten };
                 let instruction_offset = bytecode.len();
-                source_map.push(SourceMapEntry {
-                    bytecode_offset: u32_from_usize(instruction_offset),
-                    source_start: 0,
-                    source_end: 0,
-                });
+                push_source_map_entry(
+                    &mut source_map,
+                    SourceMapEntry {
+                        bytecode_offset: u32_from_usize(instruction_offset),
+                        line: 0,
+                        column: 0,
+                    },
+                );
                 end_instruction.encode(self.strict, &mut bytecode);
             }
 
@@ -1702,9 +1958,7 @@ impl Generator {
                 exception_handlers.push(ExceptionHandler {
                     start_offset: u32_from_usize(block_start),
                     end_offset: u32_from_usize(bytecode.len()),
-                    handler_offset: u32_from_usize(
-                        block_offsets[handler_label.basic_block_index()],
-                    ),
+                    handler_offset: u32_from_usize(block_offsets[handler_label.basic_block_index()]),
                 });
             }
         }
@@ -1729,6 +1983,7 @@ impl Generator {
             exception_handlers: merged_handlers,
             basic_block_start_offsets,
             number_of_registers,
+            number_of_arguments,
         }
     }
 }
@@ -1740,6 +1995,10 @@ pub struct AssembledBytecode {
     pub exception_handlers: Vec<ExceptionHandler>,
     pub basic_block_start_offsets: Vec<usize>,
     pub number_of_registers: u32,
+    /// One past the highest `Operand::argument` index referenced by any
+    /// instruction, or 0 if the bytecode never reads an argument. Used by
+    /// the validator as the upper bound for argument operands.
+    pub number_of_arguments: u32,
 }
 
 /// Exception handler range (with byte offsets, post-linking).
@@ -1763,13 +2022,15 @@ pub enum ConstantValue {
     Empty,
     String(Utf16String),
     BigInt(String),
-    /// An opaque pre-encoded JS::Value (e.g. well-known symbol, intrinsic function).
-    RawValue(u64),
+    /// A VM-specific well-known symbol resolved when the Executable is materialized.
+    WellKnownSymbol(WellKnownSymbolKind),
+    /// A NativeJavaScriptBackedFunction intrinsic resolved when the Executable is materialized.
+    AbstractOperation(AbstractOperationKind),
 }
 
 /// Convert a constant value to a boolean, matching JS `ToBoolean`.
-/// Returns `None` for opaque `RawValue` constants whose truthiness
-/// cannot be determined at compile time.
+/// Returns `None` for VM-specific constants whose truthiness cannot be
+/// determined until the Executable is materialized.
 pub fn constant_to_boolean(value: &ConstantValue) -> Option<bool> {
     match value {
         ConstantValue::Boolean(b) => Some(*b),
@@ -1777,7 +2038,7 @@ pub fn constant_to_boolean(value: &ConstantValue) -> Option<bool> {
         ConstantValue::Number(n) => Some(*n != 0.0 && !n.is_nan()),
         ConstantValue::String(s) => Some(!s.is_empty()),
         ConstantValue::BigInt(s) => parse_bigint(s).map(|bi| bi != num_bigint::BigInt::ZERO),
-        ConstantValue::RawValue(_) => None,
+        ConstantValue::WellKnownSymbol(_) | ConstantValue::AbstractOperation(_) => None,
     }
 }
 
@@ -1798,10 +2059,7 @@ pub fn parse_bigint(s: &str) -> Option<num_bigint::BigInt> {
 }
 
 /// Use `preferred_dst` if available, otherwise allocate a fresh register.
-pub fn choose_dst(
-    generator: &mut Generator,
-    preferred_dst: Option<&ScopedOperand>,
-) -> ScopedOperand {
+pub fn choose_dst(generator: &mut Generator, preferred_dst: Option<&ScopedOperand>) -> ScopedOperand {
     match preferred_dst {
         Some(dst) => dst.clone(),
         None => generator.allocate_register(),

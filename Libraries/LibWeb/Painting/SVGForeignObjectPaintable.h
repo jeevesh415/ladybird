@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <LibGfx/ImmutableBitmap.h>
 #include <LibWeb/Layout/SVGForeignObjectBox.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/Painting/SVGMaskable.h>
@@ -15,11 +14,9 @@ namespace Web::Painting {
 
 class SVGForeignObjectPaintable final : public PaintableWithLines
     , public SVGMaskable {
-    GC_CELL(SVGForeignObjectPaintable, PaintableWithLines);
-    GC_DECLARE_ALLOCATOR(SVGForeignObjectPaintable);
-
 public:
-    static GC::Ref<SVGForeignObjectPaintable> create(Layout::SVGForeignObjectBox const&);
+    static NonnullRefPtr<SVGForeignObjectPaintable> create(Layout::SVGForeignObjectBox const&);
+    virtual StringView class_name() const override { return "SVGForeignObjectPaintable"sv; }
 
     virtual TraversalDecision hit_test(CSSPixelPoint, HitTestType, Function<TraversalDecision(HitTestResult)> const& callback) const override;
 

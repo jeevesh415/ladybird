@@ -8,13 +8,14 @@
 #include <AK/StringBuilder.h>
 #include <LibJS/Runtime/ErrorData.h>
 #include <LibJS/Runtime/ExecutionContext.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/VM.h>
 
 namespace JS {
 
-static SourceRange dummy_source_range { SourceCode::create({}, {}), {}, {} };
+static SourceRange dummy_source_range { SourceCode::create({}, Utf16String {}), {} };
 
 SourceRange const& TracebackFrame::source_range() const
 {
@@ -31,6 +32,14 @@ ErrorData::ErrorData(VM& vm)
 void ErrorData::visit_edges(Cell::Visitor& visitor)
 {
     visitor.visit(m_cached_string);
+}
+
+size_t ErrorData::external_memory_size() const
+{
+    size_t size = vector_external_memory_size(m_traceback);
+    for (auto const& frame : m_traceback)
+        size = saturating_add_external_memory_size(size, utf16_string_external_memory_size(frame.function_name));
+    return size;
 }
 
 void ErrorData::populate_stack(VM& vm)
@@ -58,7 +67,7 @@ Utf16String ErrorData::stack_string(CompactTraceback compact) const
         auto const& function_name = frame.function_name;
         auto const& source_range = frame.source_range();
         // Note: Since we don't know whether we have a valid SourceRange here we just check for some default values.
-        if (!source_range.filename().is_empty() || source_range.start.offset != 0 || source_range.end.offset != 0) {
+        if (!source_range.filename().is_empty() || source_range.start.line != 0 || source_range.start.column != 0) {
 
             if (function_name.is_empty())
                 stack_string_builder.appendff("    at {}:{}:{}\n", source_range.filename(), source_range.start.line, source_range.start.column);

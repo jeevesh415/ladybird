@@ -9,7 +9,7 @@
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibWeb/Bindings/InstancePrototype.h>
+#include <LibWeb/Bindings/Instance.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/WebAssembly/Global.h>
 #include <LibWeb/WebAssembly/Instance.h>
@@ -32,7 +32,7 @@ WebIDL::ExceptionOr<GC::Ref<Instance>> Instance::construct_impl(JS::Realm& realm
     return realm.create<Instance>(realm, move(module_instance));
 }
 
-Instance::Instance(JS::Realm& realm, NonnullOwnPtr<Wasm::ModuleInstance> module_instance)
+Instance::Instance(JS::Realm& realm, NonnullRefPtr<Wasm::ModuleInstance> module_instance)
     : Bindings::PlatformObject(realm)
     , m_exports(Object::create(realm, nullptr))
     , m_module_instance(move(module_instance))

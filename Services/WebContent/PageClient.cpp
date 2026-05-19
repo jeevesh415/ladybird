@@ -9,6 +9,7 @@
 
 #include <AK/JsonObjectSerializer.h>
 #include <AK/JsonValue.h>
+#include <AK/Math.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ShareableBitmap.h>
@@ -28,6 +29,7 @@
 #include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/TraversableNavigable.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableBox.h>
@@ -45,6 +47,7 @@ namespace WebContent {
 
 static PageClient::UseSkiaPainter s_use_skia_painter = PageClient::UseSkiaPainter::GPUBackendIfAvailable;
 static bool s_is_headless { false };
+static bool s_async_scrolling_enabled { false };
 
 GC_DEFINE_ALLOCATOR(PageClient);
 
@@ -63,6 +66,11 @@ void PageClient::set_is_headless(bool is_headless)
     s_is_headless = is_headless;
 }
 
+void PageClient::set_async_scrolling_enabled(bool enabled)
+{
+    s_async_scrolling_enabled = enabled;
+}
+
 GC::Ref<PageClient> PageClient::create(JS::VM& vm, PageHost& page_host, u64 id)
 {
     return vm.heap().allocate<PageClient>(page_host, id);
@@ -73,18 +81,13 @@ PageClient::PageClient(PageHost& owner, u64 id)
     , m_page(Web::Page::create(Web::Bindings::main_thread_vm(), *this))
     , m_id(id)
 {
+    m_page->set_async_scrolling_enabled(s_async_scrolling_enabled);
     setup_palette();
 
-    // FIXME: This removes the decimal part, so the refresh interval will actually be higher than the maximum FPS.
-    //        For example, 60 FPS = 1000ms / 60 = 16.6666...ms, but it will become 16ms, making the interval equivalent
-    //        to 62.5 FPS.
-    int refresh_interval = static_cast<int>(1000.0 / m_maximum_frames_per_second);
-
-    m_paint_refresh_timer = Core::Timer::create_repeating(refresh_interval, [] {
+    m_frame_timer = Core::Timer::create_single_shot(0, [this] {
+        m_last_frame_dispatch_time = Web::HighResolutionTime::unsafe_shared_current_time();
         Web::HTML::main_thread_event_loop().queue_task_to_update_the_rendering();
     });
-
-    m_paint_refresh_timer->start();
 }
 
 PageClient::~PageClient() = default;
@@ -192,11 +195,6 @@ void PageClient::set_window_size(Web::DevicePixelSize size)
     page().set_window_size(size);
 }
 
-void PageClient::ready_to_paint()
-{
-    page().top_level_traversable()->ready_to_paint();
-}
-
 Queue<Web::QueuedInputEvent>& PageClient::input_event_queue()
 {
     return client().input_event_queue();
@@ -225,17 +223,24 @@ void PageClient::set_zoom_level(double zoom_level)
     page().top_level_traversable()->set_viewport_size(page().device_to_css_size(m_viewport_size), Web::InvalidateDisplayList::Yes);
 }
 
-void PageClient::set_maximum_frames_per_second(u64 maximum_frames_per_second)
+void PageClient::request_frame()
+{
+    if (m_frame_timer->is_active())
+        return;
+
+    auto delay = 0.0;
+    if (m_last_frame_dispatch_time.has_value()) {
+        auto now = Web::HighResolutionTime::unsafe_shared_current_time();
+        auto minimum_frame_interval = 1000.0 / m_maximum_frames_per_second;
+        delay = max(0.0, *m_last_frame_dispatch_time + minimum_frame_interval - now);
+    }
+
+    m_frame_timer->restart(static_cast<int>(AK::ceil(delay)));
+}
+
+void PageClient::set_maximum_frames_per_second(double maximum_frames_per_second)
 {
     m_maximum_frames_per_second = maximum_frames_per_second;
-
-    // FIXME: This removes the decimal part, so the refresh interval will actually be higher than the maximum FPS.
-    //        For example, 60 FPS = 1000ms / 60 = 16.6666...ms, but it will become 16ms, making the interval equivalent
-    //        to 62.5 FPS.
-    int refresh_interval = static_cast<int>(1000.0 / m_maximum_frames_per_second);
-
-    VERIFY(m_paint_refresh_timer);
-    m_paint_refresh_timer->set_interval(refresh_interval);
 }
 
 void PageClient::page_did_request_cursor_change(Gfx::Cursor const& cursor)
@@ -400,9 +405,9 @@ void PageClient::page_did_set_device_pixel_ratio_for_testing(double ratio)
     set_viewport(m_viewport_size, ratio);
 }
 
-void PageClient::page_did_request_context_menu(Web::CSSPixelPoint content_position)
+void PageClient::page_did_request_context_menu(Web::CSSPixelPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
 {
-    client().async_did_request_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>());
+    client().async_did_request_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target);
 }
 
 void PageClient::page_did_request_link_context_menu(Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers)
@@ -678,6 +683,8 @@ void PageClient::page_did_request_activate_tab()
 
 void PageClient::page_did_close_top_level_traversable()
 {
+    page().top_level_traversable()->compositor_context().stop_presenting_to_client();
+
     // FIXME: Rename this IPC call
     client().async_did_close_browsing_context(m_id);
 
@@ -726,14 +733,14 @@ void PageClient::page_did_request_clipboard_entries(u64 request_id)
     client().async_did_request_clipboard_entries(m_id, request_id);
 }
 
+void PageClient::page_did_request_paste()
+{
+    client().async_did_request_paste(m_id);
+}
+
 void PageClient::page_did_change_audio_play_state(Web::HTML::AudioPlayState play_state)
 {
     client().async_did_change_audio_play_state(m_id, play_state);
-}
-
-void PageClient::page_did_allocate_backing_stores(i32 front_bitmap_id, Gfx::SharedImage front_backing_store, i32 back_bitmap_id, Gfx::SharedImage back_backing_store)
-{
-    client().async_did_allocate_backing_stores(m_id, front_bitmap_id, move(front_backing_store), back_bitmap_id, move(back_backing_store));
 }
 
 Web::PageClient::WorkerAgentResponse PageClient::request_worker_agent(Web::Bindings::AgentType type)
@@ -783,11 +790,6 @@ void PageClient::page_did_mutate_dom(FlyString const& type, Web::DOM::Node const
     auto serialized_target = MUST(builder.to_string());
 
     client().async_did_mutate_dom(m_id, { type.to_string(), target.unique_id(), move(serialized_target), mutation.release_value() });
-}
-
-void PageClient::page_did_paint(Gfx::IntRect const& content_rect, i32 bitmap_id)
-{
-    client().async_did_paint(m_id, content_rect, bitmap_id);
 }
 
 void PageClient::page_did_take_screenshot(Gfx::ShareableBitmap const& screenshot)
@@ -1009,6 +1011,21 @@ Web::DisplayListPlayerType PageClient::display_list_player_type() const
     default:
         VERIFY_NOT_REACHED();
     }
+}
+
+void PageClient::ensure_compositor_thread()
+{
+    m_owner.ensure_compositor_thread(display_list_player_type());
+}
+
+Web::Compositor::CompositorThread* PageClient::compositor_thread()
+{
+    return m_owner.compositor_thread();
+}
+
+Web::Compositor::CompositorThread const* PageClient::compositor_thread() const
+{
+    return m_owner.compositor_thread();
 }
 
 void PageClient::queue_screenshot_task(Optional<Web::UniqueNodeID> node_id)

@@ -10,7 +10,7 @@
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/NavigatorPrototype.h>
+#include <LibWeb/Bindings/Navigator.h>
 #include <LibWeb/Clipboard/Clipboard.h>
 #include <LibWeb/CredentialManagement/CredentialsContainer.h>
 #include <LibWeb/Geolocation/Geolocation.h>
@@ -19,7 +19,9 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Internals/XRTest.h>
 #include <LibWeb/Loader/ResourceLoader.h>
+#include <LibWeb/MediaCapture/MediaDevices.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/PermissionsAPI/Permissions.h>
 #include <LibWeb/ServiceWorker/ServiceWorkerContainer.h>
 #include <LibWeb/WebXR/XRSystem.h>
 
@@ -77,9 +79,11 @@ void Navigator::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_user_activation);
     visitor.visit(m_service_worker_container);
     visitor.visit(m_media_capabilities);
+    visitor.visit(m_media_devices);
     visitor.visit(m_credentials);
     visitor.visit(m_battery_promise);
     visitor.visit(m_xr);
+    visitor.visit(m_permissions);
 }
 
 GC::Ref<MimeTypeArray> Navigator::mime_types()
@@ -163,6 +167,13 @@ GC::Ref<MediaCapabilitiesAPI::MediaCapabilities> Navigator::media_capabilities()
     return *m_media_capabilities;
 }
 
+GC::Ref<MediaCapture::MediaDevices> Navigator::media_devices()
+{
+    if (!m_media_devices)
+        m_media_devices = realm().create<MediaCapture::MediaDevices>(realm());
+    return *m_media_devices;
+}
+
 // https://w3c.github.io/battery/#the-getbattery-method
 GC::Ref<WebIDL::Promise> Navigator::get_battery()
 {
@@ -186,6 +197,13 @@ GC::Ref<WebIDL::Promise> Navigator::get_battery()
 
     // 4. Return this.[[BatteryPromise]].
     return *m_battery_promise;
+}
+
+GC::Ref<PermissionsAPI::Permissions> Navigator::permissions()
+{
+    if (!m_permissions)
+        m_permissions = realm().create<PermissionsAPI::Permissions>(realm());
+    return *m_permissions;
 }
 
 }

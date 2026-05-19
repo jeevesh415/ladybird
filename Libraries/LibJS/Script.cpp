@@ -6,6 +6,7 @@
 
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Runtime/ECMAScriptFunctionObject.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/SharedFunctionInstanceData.h>
 #include <LibJS/Runtime/VM.h>
@@ -35,6 +36,28 @@ Result<GC::Ref<Script>, Vector<ParserError>> Script::create_from_parsed(FFI::Par
 {
     auto filename = source_code->filename();
     auto rust_compilation = RustIntegration::compile_parsed_script(parsed, move(source_code), realm);
+    if (!rust_compilation.has_value())
+        return Vector<ParserError> {};
+    if (rust_compilation->is_error())
+        return rust_compilation->release_error();
+    return realm.heap().allocate<Script>(realm, filename, move(rust_compilation->value()), host_defined);
+}
+
+Result<GC::Ref<Script>, Vector<ParserError>> Script::create_from_compiled(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm, HostDefined* host_defined)
+{
+    auto filename = source_code->filename();
+    auto rust_compilation = RustIntegration::materialize_compiled_script(compiled, move(source_code), realm);
+    if (!rust_compilation.has_value())
+        return Vector<ParserError> {};
+    if (rust_compilation->is_error())
+        return rust_compilation->release_error();
+    return realm.heap().allocate<Script>(realm, filename, move(rust_compilation->value()), host_defined);
+}
+
+Result<GC::Ref<Script>, Vector<ParserError>> Script::create_from_bytecode_cache(FFI::DecodedBytecodeCacheBlob* bytecode_cache, NonnullRefPtr<SourceCode const> source_code, Realm& realm, HostDefined* host_defined)
+{
+    auto filename = source_code->filename();
+    auto rust_compilation = RustIntegration::materialize_bytecode_cache_script(bytecode_cache, move(source_code), realm);
     if (!rust_compilation.has_value())
         return Vector<ParserError> {};
     if (rust_compilation->is_error())
@@ -168,9 +191,7 @@ ThrowCompletionOr<void> Script::global_declaration_instantiation(VM& vm, GlobalE
     }
 
     // 16. For each Parse Node f of functionsToInitialize, do
-    // NB: We iterate in reverse order since we appended the functions
-    //     instead of prepending during pre-computation.
-    for (auto const& function_to_initialize : m_functions_to_initialize.in_reverse()) {
+    for (auto const& function_to_initialize : m_functions_to_initialize) {
         // a. Let fn be the sole element of the BoundNames of f.
         // b. Let fo be InstantiateFunctionObject of f with arguments env and privateEnv.
         auto function = ECMAScriptFunctionObject::create_from_function_data(
@@ -208,6 +229,19 @@ void Script::visit_edges(Cell::Visitor& visitor)
         m_host_defined->visit_host_defined_self(visitor);
     for (auto const& loaded_module : m_loaded_modules)
         visitor.visit(loaded_module.module);
+}
+
+size_t Script::external_memory_size() const
+{
+    size_t size = vector_external_memory_size(m_loaded_modules);
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_lexical_names));
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_var_names));
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_functions_to_initialize));
+    size = saturating_add_external_memory_size(size, m_declared_function_names.capacity() * sizeof(Utf16FlyString));
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_var_scoped_names));
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_annex_b_candidate_names));
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_lexical_bindings));
+    return size;
 }
 
 }

@@ -9,7 +9,7 @@
 #include <AK/Optional.h>
 #include <AK/RedBlackTree.h>
 #include <LibWeb/Animations/AnimationEffect.h>
-#include <LibWeb/Bindings/KeyframeEffectPrototype.h>
+#include <LibWeb/Bindings/KeyframeEffect.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
@@ -17,12 +17,6 @@
 namespace Web::Animations {
 
 using EasingValue = Variant<String, CSS::EasingFunction>;
-
-// https://www.w3.org/TR/web-animations-1/#the-keyframeeffectoptions-dictionary
-struct KeyframeEffectOptions : public EffectTiming {
-    Bindings::CompositeOperation composite { Bindings::CompositeOperation::Replace };
-    Optional<String> pseudo_element {};
-};
 
 Bindings::CompositeOperation css_animation_composition_to_bindings_composite_operation(CSS::AnimationComposition composition);
 Bindings::CompositeOperationOrAuto css_animation_composition_to_bindings_composite_operation_or_auto(CSS::AnimationComposition composition);
@@ -84,7 +78,7 @@ public:
         JS::Realm&,
         GC::Root<DOM::Element> const& target,
         Optional<GC::Root<JS::Object>> const& keyframes,
-        Variant<double, KeyframeEffectOptions> options = KeyframeEffectOptions {});
+        Variant<double, Bindings::KeyframeEffectOptions> options = Bindings::KeyframeEffectOptions {});
 
     static WebIDL::ExceptionOr<GC::Ref<KeyframeEffect>> construct_impl(JS::Realm&, GC::Ref<KeyframeEffect> source);
 

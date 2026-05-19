@@ -73,21 +73,61 @@ Duration Duration::from_time_units(i64 time_units, u32 numerator, u32 denominato
     VERIFY(numerator != 0);
     VERIFY(denominator != 0);
 
-    auto seconds_checked = Checked<i64>(time_units);
-    seconds_checked.mul(numerator);
-    seconds_checked.div(denominator);
-    if (time_units < 0)
-        seconds_checked.sub(1);
-
-    if (seconds_checked.has_overflow())
+    if (Checked<i64>::multiplication_would_overflow(time_units, numerator))
         return Duration(time_units >= 0 ? NumericLimits<i64>::max() : NumericLimits<i64>::min(), 0);
-    auto seconds = seconds_checked.value_unchecked();
-    auto seconds_in_time_units = seconds * denominator / numerator;
-    auto remainder_in_time_units = time_units - seconds_in_time_units;
-    auto nanoseconds = ((remainder_in_time_units * 1'000'000'000 * numerator) + (denominator / 2)) / denominator;
+    auto time_units_product = time_units * numerator;
+    auto seconds = time_units_product / denominator;
+    auto time_units_remainder = time_units_product % denominator;
+    if (time_units_remainder < 0) {
+        if (seconds == NumericLimits<i64>::min())
+            return Duration(NumericLimits<i64>::min(), 0);
+        seconds--;
+        time_units_remainder += denominator;
+    }
+
+    auto nanoseconds = ((time_units_remainder * 1'000'000'000) + (denominator / 2)) / denominator;
     if (nanoseconds == 1'000'000'000) {
         seconds++;
         nanoseconds = 0;
+    }
+    VERIFY(nanoseconds >= 0);
+    VERIFY(nanoseconds < 1'000'000'000);
+    return Duration(seconds, static_cast<u32>(nanoseconds));
+}
+
+Duration Duration::scaled_by(u32 numerator, u32 denominator) const
+{
+    VERIFY(denominator != 0);
+
+    if (numerator == 0)
+        return Duration::zero();
+    if (numerator == denominator)
+        return *this;
+
+    if (Checked<i64>::multiplication_would_overflow(m_seconds, numerator))
+        return Duration(m_seconds < 0 ? NumericLimits<i64>::min() : NumericLimits<i64>::max(), 0);
+    auto seconds_product = m_seconds * static_cast<i64>(numerator);
+    auto seconds = seconds_product / static_cast<i64>(denominator);
+    auto seconds_remainder = seconds_product % static_cast<i64>(denominator);
+    if (seconds_remainder < 0) {
+        if (seconds == NumericLimits<i64>::min())
+            return Duration(NumericLimits<i64>::min(), 0);
+        seconds--;
+        seconds_remainder += denominator;
+    }
+
+    auto numerator_ns = seconds_remainder * 1'000'000'000;
+    numerator_ns += m_nanoseconds * static_cast<i64>(numerator);
+    auto total_ns = (numerator_ns + denominator / 2) / static_cast<i64>(denominator);
+
+    auto extra_seconds = total_ns / 1'000'000'000;
+    auto nanoseconds = total_ns % 1'000'000'000;
+    if (extra_seconds > 0) {
+        Checked<i64> total_seconds = seconds;
+        total_seconds += extra_seconds;
+        if (total_seconds.has_overflow())
+            return Duration(NumericLimits<i64>::max(), 999'999'999);
+        seconds = total_seconds.value();
     }
     VERIFY(nanoseconds >= 0);
     VERIFY(nanoseconds < 1'000'000'000);
@@ -230,11 +270,17 @@ i64 Duration::to_time_units(u32 numerator, u32 denominator) const
 
     auto seconds_product = saturating_mul(m_seconds, static_cast<i64>(denominator));
     auto time_units = seconds_product / numerator;
-    auto remainder = seconds_product % numerator;
+    auto seconds_remainder_dividend = seconds_product % numerator;
 
-    auto remainder_in_nanoseconds = remainder * 1'000'000'000;
-    auto rounding_half = static_cast<i64>(numerator) * 500'000'000;
-    time_units = saturating_add(time_units, ((static_cast<i64>(m_nanoseconds) * denominator + remainder_in_nanoseconds + rounding_half) / numerator) / 1'000'000'000);
+    auto seconds_remainder_nanosecond_dividend = seconds_remainder_dividend * 1'000'000'000;
+    auto rounding_half_nanosecond_dividend = static_cast<i64>(numerator) * 500'000'000;
+    auto sub_seconds_nanosecond_dividend = (static_cast<i64>(m_nanoseconds) * denominator) + seconds_remainder_nanosecond_dividend;
+
+    auto sub_seconds_nanosecond_units = sub_seconds_nanosecond_dividend / numerator;
+    auto sub_seconds_units_remainder_nanosecond_dividend = sub_seconds_nanosecond_dividend % numerator;
+    auto rounding_adjustment_nanosecond_units = (rounding_half_nanosecond_dividend + sub_seconds_units_remainder_nanosecond_dividend) / numerator;
+
+    time_units = saturating_add(time_units, (sub_seconds_nanosecond_units + rounding_adjustment_nanosecond_units) / 1'000'000'000);
 
     return time_units;
 }

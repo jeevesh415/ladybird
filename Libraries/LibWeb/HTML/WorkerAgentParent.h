@@ -8,17 +8,11 @@
 
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/AgentType.h>
-#include <LibWeb/Bindings/RequestPrototype.h>
-#include <LibWeb/Bindings/WorkerPrototype.h>
+#include <LibWeb/Bindings/Request.h>
+#include <LibWeb/Bindings/Worker.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::HTML {
-
-struct WorkerOptions {
-    String name { String {} };
-    Bindings::WorkerType type { Bindings::WorkerType::Classic };
-    Bindings::RequestCredentials credentials { Bindings::RequestCredentials::SameOrigin };
-};
 
 // FIXME: Figure out a better naming convention for this type of parent/child process pattern.
 class WorkerAgentParent : public JS::Cell {
@@ -26,14 +20,15 @@ class WorkerAgentParent : public JS::Cell {
     GC_DECLARE_ALLOCATOR(WorkerAgentParent);
 
 protected:
-    WorkerAgentParent(URL::URL url, WorkerOptions const& options, GC::Ptr<MessagePort> outside_port, GC::Ref<EnvironmentSettingsObject> outside_settings, GC::Ref<DOM::EventTarget> worker_event_target, Bindings::AgentType);
+    WorkerAgentParent(URL::URL url, Bindings::WorkerOptions const& options, GC::Ptr<MessagePort> outside_port, GC::Ref<EnvironmentSettingsObject> outside_settings, GC::Ref<DOM::EventTarget> worker_event_target, Bindings::AgentType);
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
 private:
     void setup_worker_ipc_callbacks(JS::Realm&);
+    void release_startup_keep_alive();
 
-    WorkerOptions m_worker_options;
+    Bindings::WorkerOptions m_worker_options;
     Bindings::AgentType m_agent_type { Bindings::AgentType::DedicatedWorker };
     URL::URL m_url;
 

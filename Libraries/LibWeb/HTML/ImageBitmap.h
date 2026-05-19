@@ -8,7 +8,7 @@
 
 #include <AK/OwnPtr.h>
 #include <LibGfx/Forward.h>
-#include <LibWeb/Bindings/ImageBitmapPrototype.h>
+#include <LibWeb/Bindings/ImageBitmap.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/Bindings/Serializable.h>
 #include <LibWeb/Bindings/Transferable.h>
@@ -65,6 +65,7 @@ private:
 
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual size_t external_memory_size() const override;
 
     WebIDL::UnsignedLong m_width = 0;
     WebIDL::UnsignedLong m_height = 0;

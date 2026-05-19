@@ -54,7 +54,7 @@ public:
     void set_origin_clean(bool origin_clean) { m_origin_clean = origin_clean; }
 
     bool disabled() const { return m_disabled; }
-    void set_disabled(bool disabled) { m_disabled = disabled; }
+    virtual void set_disabled(bool disabled) { m_disabled = disabled; }
 
     CSSStyleSheet* parent_style_sheet() { return m_parent_style_sheet; }
     void set_parent_css_style_sheet(CSSStyleSheet*);
@@ -62,6 +62,7 @@ public:
 protected:
     explicit StyleSheet(JS::Realm&, MediaList& media);
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual size_t external_memory_size() const override;
 
     GC::Ref<MediaList> m_media;
 

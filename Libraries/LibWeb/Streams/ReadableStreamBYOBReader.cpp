@@ -8,7 +8,7 @@
 #include <LibJS/Runtime/PromiseCapability.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/ReadableStreamBYOBReaderPrototype.h>
+#include <LibWeb/Bindings/ReadableStreamBYOBReader.h>
 #include <LibWeb/Streams/ReadableStream.h>
 #include <LibWeb/Streams/ReadableStreamBYOBReader.h>
 #include <LibWeb/Streams/ReadableStreamOperations.h>
@@ -107,7 +107,7 @@ private:
 GC_DEFINE_ALLOCATOR(BYOBReaderReadIntoRequest);
 
 // https://streams.spec.whatwg.org/#byob-reader-read
-GC::Ref<WebIDL::Promise> ReadableStreamBYOBReader::read(GC::Root<WebIDL::ArrayBufferView>& view, ReadableStreamBYOBReaderReadOptions options)
+GC::Ref<WebIDL::Promise> ReadableStreamBYOBReader::read(GC::Root<WebIDL::ArrayBufferView>& view, Bindings::ReadableStreamBYOBReaderReadOptions options)
 {
     auto& realm = this->realm();
 

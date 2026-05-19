@@ -6,16 +6,20 @@
 
 #include <LibJS/RustIntegration.h>
 
+#include <AK/NumericLimits.h>
+#include <AK/TemporaryChange.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <AK/kmalloc.h>
 #include <LibGC/DeferGC.h>
 #include <LibJS/Bytecode/ClassBlueprint.h>
+#include <LibJS/Bytecode/Debug.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/IdentifierTable.h>
 #include <LibJS/Bytecode/PropertyKeyTable.h>
 #include <LibJS/Bytecode/RegexTable.h>
 #include <LibJS/Bytecode/StringTable.h>
+#include <LibJS/Bytecode/Validator.h>
 #include <LibJS/Runtime/BigInt.h>
 #include <LibJS/Runtime/Intrinsics.h>
 #include <LibJS/Runtime/NativeJavaScriptBackedFunction.h>
@@ -35,6 +39,11 @@ using namespace JS::FFI;
 namespace JS::RustIntegration {
 
 // --- Shared helpers ---
+
+// Bytecode cache materialization rebuilds executables from disk, which is untrusted input. Materialization paths flip
+// this flag for the duration of their work so that the in-process bytecode validator runs even in release builds; the
+// normal Rust pipeline path leaves it off and keeps the existing debug/sanitizer-only behavior.
+static thread_local bool s_validate_materialized_bytecode_cache_executables = false;
 
 static Utf16View utf16_view_from_bytes(uint16_t const* data, size_t len)
 {
@@ -70,7 +79,7 @@ static void collect_parse_errors(void* ctx, uint8_t const* message, size_t messa
     auto& errors = *static_cast<Vector<ParserError>*>(ctx);
     errors.append({
         MUST(String::from_utf8({ message, message_len })),
-        Position { line, column, 0 },
+        Position { line, column },
     });
 }
 
@@ -359,6 +368,16 @@ ParsedProgram* parse_program(u16 const* utf16_data, size_t length_in_code_units,
     return rust_parse_program(utf16_data, length_in_code_units, static_cast<u8>(type), line_number_offset, g_dump_ast, g_dump_ast_use_color);
 }
 
+CompiledProgram* compile_parsed_program_off_thread(ParsedProgram* parsed, size_t length_in_code_units)
+{
+    return rust_compile_parsed_program_off_thread(parsed, length_in_code_units);
+}
+
+CompiledProgram* compile_parsed_program_fully_off_thread(ParsedProgram* parsed, size_t length_in_code_units)
+{
+    return rust_compile_parsed_program_fully_off_thread(parsed, length_in_code_units);
+}
+
 bool parsed_program_has_errors(ParsedProgram const* parsed)
 {
     return rust_parsed_program_has_errors(const_cast<ParsedProgram*>(parsed));
@@ -367,6 +386,48 @@ bool parsed_program_has_errors(ParsedProgram const* parsed)
 void free_parsed_program(ParsedProgram* parsed)
 {
     rust_free_parsed_program(parsed);
+}
+
+void free_compiled_program(CompiledProgram* compiled)
+{
+    rust_free_compiled_program(compiled);
+}
+
+ByteBuffer serialize_compiled_program_for_bytecode_cache(CompiledProgram const& compiled, ProgramType type, ReadonlyBytes source_hash)
+{
+    auto blob = rust_serialize_compiled_program_for_bytecode_cache(&compiled, static_cast<u8>(type), source_hash.data(), source_hash.size());
+    if (!blob.data || blob.length == 0)
+        return {};
+
+    auto bytes = ByteBuffer::copy({ blob.data, blob.length }).release_value_but_fixme_should_propagate_errors();
+    rust_free_bytecode_cache_blob(blob.data, blob.length);
+    return bytes;
+}
+
+DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(ReadonlyBytes bytes, ProgramType expected_type, ReadonlyBytes source_hash)
+{
+    return rust_decode_bytecode_cache_blob(bytes.data(), bytes.size(), static_cast<u8>(expected_type), source_hash.data(), source_hash.size());
+}
+
+static void free_bytecode_cache_blob_owner(void* owner)
+{
+    delete static_cast<Core::ImmutableBytes*>(owner);
+}
+
+static void* clone_bytecode_cache_blob_owner(void const* owner)
+{
+    return new Core::ImmutableBytes(*static_cast<Core::ImmutableBytes const*>(owner));
+}
+
+DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(Core::ImmutableBytes bytes, ProgramType expected_type, ReadonlyBytes source_hash)
+{
+    auto* owner = new Core::ImmutableBytes(move(bytes));
+    return rust_decode_bytecode_cache_blob_with_owner(owner->bytes().data(), owner->bytes().size(), static_cast<u8>(expected_type), source_hash.data(), source_hash.size(), owner, clone_bytecode_cache_blob_owner, free_bytecode_cache_blob_owner);
+}
+
+void free_decoded_bytecode_cache_blob(DecodedBytecodeCacheBlob* blob)
+{
+    rust_free_decoded_bytecode_cache_blob(blob);
 }
 
 Optional<Result<ScriptResult, Vector<ParserError>>> compile_parsed_script(ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm& realm)
@@ -390,6 +451,41 @@ Optional<Result<ScriptResult, Vector<ParserError>>> compile_parsed_script(Parsed
 
     if (!exec_ptr)
         return Vector<ParserError> {};
+
+    builder.result.executable = static_cast<Bytecode::Executable*>(exec_ptr);
+    return builder.result;
+}
+
+Optional<Result<ScriptResult, Vector<ParserError>>> materialize_compiled_script(CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm)
+{
+    if (!compiled)
+        return {};
+
+    GC::DeferGC defer_gc(realm.vm().heap());
+    ScriptGdiBuilder builder;
+
+    void* exec_ptr = rust_materialize_compiled_script(compiled, &realm.vm(), source_code.ptr(), &builder);
+
+    if (!exec_ptr)
+        return Vector<ParserError> {};
+
+    builder.result.executable = static_cast<Bytecode::Executable*>(exec_ptr);
+    return builder.result;
+}
+
+Optional<Result<ScriptResult, Vector<ParserError>>> materialize_bytecode_cache_script(DecodedBytecodeCacheBlob* blob, NonnullRefPtr<SourceCode const> source_code, Realm& realm)
+{
+    if (!blob)
+        return {};
+
+    GC::DeferGC defer_gc(realm.vm().heap());
+    TemporaryChange validate_cache_executables { s_validate_materialized_bytecode_cache_executables, true };
+    ScriptGdiBuilder builder;
+
+    void* exec_ptr = rust_materialize_bytecode_cache_script(blob, &realm.vm(), source_code.ptr(), source_code->length_in_code_units(), &builder);
+
+    if (!exec_ptr)
+        return Vector<ParserError> { ParserError { "Failed to materialize bytecode cache"_string, {} } };
 
     builder.result.executable = static_cast<Bytecode::Executable*>(exec_ptr);
     return builder.result;
@@ -502,6 +598,105 @@ Optional<Result<ModuleResult, Vector<ParserError>>> compile_parsed_module(Parsed
     return builder.result;
 }
 
+Optional<Result<ModuleResult, Vector<ParserError>>> materialize_compiled_module(CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm)
+{
+    if (!compiled)
+        return {};
+
+    GC::DeferGC defer_gc(realm.vm().heap());
+    ModuleBuilder builder;
+    ModuleCallbacks callbacks {
+        .set_has_top_level_await = module_set_has_top_level_await,
+        .push_import_entry = module_push_import_entry,
+        .push_local_export = module_push_local_export,
+        .push_indirect_export = module_push_indirect_export,
+        .push_star_export = module_push_star_export,
+        .push_requested_module = module_push_requested_module,
+        .set_default_export_binding = module_set_default_export_binding,
+        .push_var_name = module_push_var_name,
+        .push_function = module_push_function,
+        .push_lexical_binding = module_push_lexical_binding,
+    };
+
+    void* tla_executable = nullptr;
+
+    void* exec_ptr = rust_materialize_compiled_module(compiled, &realm.vm(), source_code.ptr(),
+        &builder, &callbacks, &tla_executable);
+
+    if (!exec_ptr && !tla_executable)
+        return Vector<ParserError> {};
+
+    if (tla_executable) {
+        auto& vm = realm.vm();
+        auto* tla_exec = static_cast<Bytecode::Executable*>(tla_executable);
+
+        builder.result.tla_shared_data = vm.heap().allocate<SharedFunctionInstanceData>(
+            vm, FunctionKind::Async,
+            "module code with top-level await"_utf16_fly_string,
+            0, 0, true, false, true,
+            Vector<Utf16FlyString> {}, nullptr);
+        builder.result.tla_shared_data->m_is_module_wrapper = true;
+        builder.result.tla_shared_data->m_uses_this = true;
+        builder.result.tla_shared_data->m_function_environment_needed = true;
+        builder.result.tla_shared_data->update_asm_call_metadata();
+        builder.result.tla_shared_data->set_executable(tla_exec);
+    } else {
+        builder.result.executable = static_cast<Bytecode::Executable*>(exec_ptr);
+    }
+
+    return builder.result;
+}
+
+Optional<Result<ModuleResult, Vector<ParserError>>> materialize_bytecode_cache_module(DecodedBytecodeCacheBlob* blob, NonnullRefPtr<SourceCode const> source_code, Realm& realm)
+{
+    if (!blob)
+        return {};
+
+    GC::DeferGC defer_gc(realm.vm().heap());
+    TemporaryChange validate_cache_executables { s_validate_materialized_bytecode_cache_executables, true };
+    ModuleBuilder builder;
+    ModuleCallbacks callbacks {
+        .set_has_top_level_await = module_set_has_top_level_await,
+        .push_import_entry = module_push_import_entry,
+        .push_local_export = module_push_local_export,
+        .push_indirect_export = module_push_indirect_export,
+        .push_star_export = module_push_star_export,
+        .push_requested_module = module_push_requested_module,
+        .set_default_export_binding = module_set_default_export_binding,
+        .push_var_name = module_push_var_name,
+        .push_function = module_push_function,
+        .push_lexical_binding = module_push_lexical_binding,
+    };
+
+    void* tla_executable = nullptr;
+
+    void* exec_ptr = rust_materialize_bytecode_cache_module(blob, &realm.vm(), source_code.ptr(), source_code->length_in_code_units(),
+        &builder, &callbacks, &tla_executable);
+
+    if (!exec_ptr && !tla_executable)
+        return Vector<ParserError> { ParserError { "Failed to materialize bytecode cache"_string, {} } };
+
+    if (tla_executable) {
+        auto& vm = realm.vm();
+        auto* tla_exec = static_cast<Bytecode::Executable*>(tla_executable);
+
+        builder.result.tla_shared_data = vm.heap().allocate<SharedFunctionInstanceData>(
+            vm, FunctionKind::Async,
+            "module code with top-level await"_utf16_fly_string,
+            0, 0, true, false, true,
+            Vector<Utf16FlyString> {}, nullptr);
+        builder.result.tla_shared_data->m_is_module_wrapper = true;
+        builder.result.tla_shared_data->m_uses_this = true;
+        builder.result.tla_shared_data->m_function_environment_needed = true;
+        builder.result.tla_shared_data->update_asm_call_metadata();
+        builder.result.tla_shared_data->set_executable(tla_exec);
+    } else {
+        builder.result.executable = static_cast<Bytecode::Executable*>(exec_ptr);
+    }
+
+    return builder.result;
+}
+
 Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(StringView source_text, Realm& realm, StringView filename)
 {
     auto source_code = SourceCode::create(String::from_utf8(filename).release_value_but_fixme_should_propagate_errors(), Utf16String::from_utf8(source_text));
@@ -557,7 +752,6 @@ Optional<Result<GC::Ref<SharedFunctionInstanceData>, String>> compile_dynamic_fu
 
     auto& function_data = *static_cast<SharedFunctionInstanceData*>(sfd_ptr);
     function_data.m_source_text_owner = Utf16String::from_utf8(source_text);
-    function_data.m_source_text = function_data.m_source_text_owner.utf16_view();
 
     return GC::Ref<SharedFunctionInstanceData> { function_data };
 }
@@ -585,6 +779,27 @@ Optional<Vector<GC::Root<SharedFunctionInstanceData>>> compile_builtin_file(
 
 GC::Ptr<Bytecode::Executable> compile_function(VM& vm, SharedFunctionInstanceData& shared_data, bool builtin_abstract_operations_enabled)
 {
+    if (shared_data.m_precompiled_bytecode_executable) {
+        GC::DeferGC defer_gc(vm.heap());
+        auto* exec = static_cast<Bytecode::Executable*>(rust_materialize_precompiled_bytecode_function(
+            shared_data.m_precompiled_bytecode_executable,
+            &vm,
+            shared_data.m_source_code.ptr()));
+        shared_data.m_precompiled_bytecode_executable = nullptr;
+        return exec;
+    }
+
+    if (shared_data.m_cached_bytecode_executable) {
+        GC::DeferGC defer_gc(vm.heap());
+        TemporaryChange validate_cache_executables { s_validate_materialized_bytecode_cache_executables, true };
+        auto* exec = static_cast<Bytecode::Executable*>(rust_materialize_bytecode_cache_function(
+            shared_data.m_cached_bytecode_executable,
+            &vm,
+            shared_data.m_source_code.ptr()));
+        shared_data.m_cached_bytecode_executable = nullptr;
+        return exec;
+    }
+
     if (!shared_data.m_use_rust_compilation)
         return nullptr;
 
@@ -602,6 +817,39 @@ GC::Ptr<Bytecode::Executable> compile_function(VM& vm, SharedFunctionInstanceDat
     shared_data.m_rust_function_ast = nullptr;
 
     return exec;
+}
+
+void* clone_function_ast(void const* ast)
+{
+    return rust_clone_function_ast(ast);
+}
+
+CompiledFunction* compile_function_off_thread(void* function_ast, size_t length_in_code_units, bool builtin_abstract_operations_enabled)
+{
+    return rust_compile_function_off_thread(function_ast, length_in_code_units, builtin_abstract_operations_enabled);
+}
+
+void materialize_compiled_function(CompiledFunction* compiled, VM& vm, SourceCode const& source_code, SharedFunctionInstanceData& shared_data)
+{
+    GC::DeferGC defer_gc(vm.heap());
+    rust_materialize_compiled_function(compiled, &vm, &source_code, &shared_data);
+}
+
+void free_compiled_function(CompiledFunction* compiled)
+{
+    rust_free_compiled_function(compiled);
+}
+
+void free_cached_bytecode_executable(void* executable)
+{
+    if (executable)
+        rust_free_cached_bytecode_executable(executable);
+}
+
+void free_precompiled_bytecode_executable(void* executable)
+{
+    if (executable)
+        rust_free_precompiled_bytecode_executable(executable);
 }
 
 void free_function_ast(void* ast)
@@ -635,7 +883,20 @@ static Utf16FlyString utf16_fly_from_ffi(FFIUtf16Slice slice)
     return Utf16FlyString::from_utf16(view_from_ffi(slice));
 }
 
-static JS::Value decode_constant(JS::VM& vm, uint8_t const*& cursor, uint8_t const* end)
+static void align_constant_cursor(uint8_t const* begin, uint8_t const*& cursor, uint8_t const* end, size_t alignment)
+{
+    auto offset = static_cast<size_t>(cursor - begin);
+    auto aligned_offset = (offset + alignment - 1) & ~(alignment - 1);
+    VERIFY(aligned_offset <= static_cast<size_t>(end - begin));
+    cursor = begin + aligned_offset;
+}
+
+static bool constant_cursor_is_aligned(uint8_t const* cursor, size_t alignment)
+{
+    return reinterpret_cast<FlatPtr>(cursor) % alignment == 0;
+}
+
+static JS::Value decode_constant(JS::VM& vm, uint8_t const* begin, uint8_t const*& cursor, uint8_t const* end)
 {
     VERIFY(cursor < end);
     auto const tag = *cursor++;
@@ -659,19 +920,25 @@ static JS::Value decode_constant(JS::VM& vm, uint8_t const*& cursor, uint8_t con
     case ConstantTag::Empty:
         return JS::js_special_empty_value();
     case ConstantTag::String: {
+        align_constant_cursor(begin, cursor, end, alignof(char16_t));
         VERIFY(cursor + 4 <= end);
         uint32_t len;
         memcpy(&len, cursor, 4);
         cursor += 4;
-        VERIFY(cursor + len * 2 <= end);
+        VERIFY(len <= static_cast<size_t>(end - cursor) / sizeof(char16_t));
         if (len == 0)
             return JS::PrimitiveString::create(vm, Utf16String {});
-        // NB: cursor may not be 2-byte aligned, so copy to an aligned buffer.
-        Vector<char16_t> aligned_buf;
-        aligned_buf.resize(len);
-        memcpy(aligned_buf.data(), cursor, len * 2);
-        auto str = Utf16String::from_utf16(Utf16View(aligned_buf.data(), len));
-        cursor += len * 2;
+        auto string_byte_length = static_cast<size_t>(len) * sizeof(char16_t);
+        auto str = [&] {
+            if (constant_cursor_is_aligned(cursor, alignof(char16_t)))
+                return Utf16String::from_utf16(Utf16View(reinterpret_cast<char16_t const*>(cursor), len));
+
+            Vector<char16_t> code_units;
+            code_units.resize(len);
+            memcpy(code_units.data(), cursor, string_byte_length);
+            return Utf16String::from_utf16(Utf16View(code_units.data(), len));
+        }();
+        cursor += string_byte_length;
         return JS::PrimitiveString::create(vm, move(str));
     }
     case ConstantTag::BigInt: {
@@ -695,12 +962,35 @@ static JS::Value decode_constant(JS::VM& vm, uint8_t const*& cursor, uint8_t con
         }();
         return JS::BigInt::create(vm, move(integer));
     }
-    case ConstantTag::RawValue: {
-        VERIFY(cursor + 8 <= end);
-        JS::Value value;
-        memcpy(&value, cursor, 8);
-        cursor += 8;
-        return value;
+    case ConstantTag::WellKnownSymbol: {
+        VERIFY(cursor + 1 <= end);
+        auto symbol_id = static_cast<WellKnownSymbolKind>(*cursor++);
+        switch (symbol_id) {
+        case WellKnownSymbolKind::SymbolIterator:
+            return vm.well_known_symbol_iterator();
+        case WellKnownSymbolKind::SymbolAsyncIterator:
+            return vm.well_known_symbol_async_iterator();
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }
+    case ConstantTag::AbstractOperation: {
+        VERIFY(cursor + 1 <= end);
+        auto operation = static_cast<AbstractOperationKind>(*cursor++);
+        auto& intrinsics = vm.current_realm()->intrinsics();
+        switch (operation) {
+        case AbstractOperationKind::AsyncIteratorClose:
+            return JS::Value(intrinsics.async_iterator_close_abstract_operation_function().ptr());
+        case AbstractOperationKind::GetMethod:
+            return JS::Value(intrinsics.get_method_abstract_operation_function().ptr());
+        case AbstractOperationKind::GetIteratorDirect:
+            return JS::Value(intrinsics.get_iterator_direct_abstract_operation_function().ptr());
+        case AbstractOperationKind::GetIteratorFromMethod:
+            return JS::Value(intrinsics.get_iterator_from_method_abstract_operation_function().ptr());
+        case AbstractOperationKind::IteratorComplete:
+            return JS::Value(intrinsics.iterator_complete_abstract_operation_function().ptr());
+        }
+        VERIFY_NOT_REACHED();
     }
     default:
         VERIFY_NOT_REACHED();
@@ -715,24 +1005,43 @@ extern "C" void* rust_create_executable(
     auto& vm = *static_cast<JS::VM*>(vm_ptr);
     auto& source_code = *static_cast<JS::SourceCode const*>(source_code_ptr);
 
-    // Build bytecode vector
-    Vector<u8> bytecode_vec;
-    bytecode_vec.append(data->bytecode, data->bytecode_length);
+    auto bytecode = [&] {
+        if (data->bytecode_owner) {
+            auto bytecode_owner = adopt_own_if_nonnull(static_cast<Core::ImmutableBytes*>(data->bytecode_owner));
+            VERIFY(bytecode_owner);
+            auto bytes = bytecode_owner->bytes();
+            size_t offset = 0;
+            if (!bytes.is_empty()) {
+                VERIFY(data->bytecode >= bytes.data());
+                offset = static_cast<size_t>(data->bytecode - bytes.data());
+            }
+            VERIFY(data->bytecode_length <= bytes.size());
+            VERIFY(offset <= bytes.size() - data->bytecode_length);
+            return JS::Bytecode::InstructionStream { move(*bytecode_owner), offset, data->bytecode_length };
+        }
+
+        Vector<u8> bytecode_vec;
+        bytecode_vec.append(data->bytecode, data->bytecode_length);
+        return JS::Bytecode::InstructionStream { move(bytecode_vec) };
+    }();
 
     // Build identifier table
     auto ident_table = make<JS::Bytecode::IdentifierTable>();
+    ident_table->ensure_capacity(data->identifier_count);
     for (size_t i = 0; i < data->identifier_count; ++i) {
         ident_table->insert(utf16_fly_from_ffi(data->identifier_table[i]));
     }
 
     // Build property key table
     auto prop_key_table = make<JS::Bytecode::PropertyKeyTable>();
+    prop_key_table->ensure_capacity(data->property_key_count);
     for (size_t i = 0; i < data->property_key_count; ++i) {
         prop_key_table->insert(utf16_fly_from_ffi(data->property_key_table[i]));
     }
 
     // Build string table
     auto str_table = make<JS::Bytecode::StringTable>();
+    str_table->ensure_capacity(data->string_count);
     for (size_t i = 0; i < data->string_count; ++i) {
         str_table->insert(utf16_from_ffi(data->string_table[i]));
     }
@@ -752,13 +1061,13 @@ extern "C" void* rust_create_executable(
     auto const* cursor = data->constants_data;
     auto const* end = data->constants_data + data->constants_data_length;
     for (size_t i = 0; i < data->constants_count; ++i) {
-        constants_vec.append(decode_constant(vm, cursor, end));
+        constants_vec.append(decode_constant(vm, data->constants_data, cursor, end));
     }
     VERIFY(cursor == end);
 
     // Create executable
     auto executable = vm.heap().allocate<JS::Bytecode::Executable>(
-        move(bytecode_vec),
+        move(bytecode),
         move(ident_table),
         move(prop_key_table),
         move(str_table),
@@ -767,6 +1076,7 @@ extern "C" void* rust_create_executable(
         source_code,
         data->property_lookup_cache_count,
         data->global_variable_cache_count,
+        data->environment_coordinate_cache_count,
         data->template_object_cache_count,
         data->object_shape_cache_count,
         data->object_property_iterator_cache_count,
@@ -774,6 +1084,7 @@ extern "C" void* rust_create_executable(
         data->is_strict ? JS::Strict::Yes : JS::Strict::No);
 
     // Set exception handlers
+    executable->exception_handlers.ensure_capacity(data->exception_handler_count);
     for (size_t i = 0; i < data->exception_handler_count; ++i) {
         executable->exception_handlers.append({
             data->exception_handlers[i].start_offset,
@@ -783,19 +1094,26 @@ extern "C" void* rust_create_executable(
     }
 
     // Set source map
+    executable->source_map.ensure_capacity(data->source_map_count);
     for (size_t i = 0; i < data->source_map_count; ++i) {
         executable->source_map.append({
             data->source_map[i].bytecode_offset,
-            { data->source_map[i].source_start, data->source_map[i].source_end },
+            data->source_map[i].source_start_line,
+            data->source_map[i].source_start_column,
         });
     }
 
-    // Set basic block offsets
+    // Keep basic block offsets transient. They are only needed by the
+    // validator while this Executable is being constructed.
+    Vector<u32> basic_block_offsets;
+    basic_block_offsets.ensure_capacity(data->basic_block_count);
     for (size_t i = 0; i < data->basic_block_count; ++i) {
-        executable->basic_block_start_offsets.append(data->basic_block_offsets[i]);
+        VERIFY(data->basic_block_offsets[i] <= NumericLimits<u32>::max());
+        basic_block_offsets.append(static_cast<u32>(data->basic_block_offsets[i]));
     }
 
     // Set local variable names
+    executable->local_variable_names.ensure_capacity(data->local_variable_count);
     for (size_t i = 0; i < data->local_variable_count; ++i) {
         executable->local_variable_names.append({
             .name = utf16_fly_from_ffi(data->local_variable_names[i]),
@@ -808,12 +1126,14 @@ extern "C" void* rust_create_executable(
     executable->argument_index_base = data->number_of_registers + data->local_variable_count + data->constants_count;
     executable->registers_and_locals_count = data->number_of_registers + data->local_variable_count;
     executable->registers_and_locals_and_constants_count = data->number_of_registers + data->local_variable_count + data->constants_count;
+    executable->number_of_arguments = data->number_of_arguments;
 
     // Set length identifier (for GetLength optimization)
     if (data->length_identifier.has_value)
         executable->length_identifier = JS::Bytecode::PropertyKeyTableIndex(data->length_identifier.value);
 
     // Set shared function data (inner function definitions)
+    executable->shared_function_data.ensure_capacity(data->shared_function_data_count);
     for (size_t i = 0; i < data->shared_function_data_count; ++i) {
         auto* sfd = const_cast<JS::SharedFunctionInstanceData*>(
             static_cast<JS::SharedFunctionInstanceData const*>(data->shared_function_data[i]));
@@ -821,13 +1141,30 @@ extern "C" void* rust_create_executable(
     }
 
     // Set class blueprints (move from heap-allocated objects)
+    executable->class_blueprints.ensure_capacity(data->class_blueprint_count);
     for (size_t i = 0; i < data->class_blueprint_count; ++i) {
         auto* bp = static_cast<JS::Bytecode::ClassBlueprint*>(data->class_blueprints[i]);
         executable->class_blueprints.append(move(*bp));
         delete bp;
     }
 
-    executable->fixup_cache_pointers();
+    auto const is_materializing_bytecode_cache = JS::RustIntegration::s_validate_materialized_bytecode_cache_executables;
+#if !defined(NDEBUG) || defined(HAS_ADDRESS_SANITIZER)
+    auto const should_validate_bytecode = true;
+#else
+    auto const should_validate_bytecode = is_materializing_bytecode_cache;
+#endif
+    if (should_validate_bytecode) {
+        if (auto validation = JS::Bytecode::validate_bytecode(*executable, basic_block_offsets.span()); validation.is_error()) {
+            if (is_materializing_bytecode_cache)
+                return nullptr;
+#if !defined(NDEBUG) || defined(HAS_ADDRESS_SANITIZER)
+            VERIFY_NOT_REACHED();
+#else
+            return nullptr;
+#endif
+        }
+    }
 
     return executable.ptr();
 }
@@ -865,16 +1202,12 @@ extern "C" void* rust_create_sfd(
 
     // Set parsing insights that must be available before lazy compilation.
     shared->m_uses_this = data->uses_this;
-    if (data->uses_this_from_environment)
+    shared->m_this_value_needs_environment_resolution = data->uses_this_from_environment;
+    if (data->uses_this_from_environment && !data->is_arrow)
         shared->m_function_environment_needed = true;
     shared->update_asm_call_metadata();
 
-    // Set source text as a view into the original source code.
-    shared->m_source_code = &source_code;
-    if (data->source_text_length > 0) {
-        auto const& code_view = source_code.code_view();
-        shared->m_source_text = code_view.substring_view(data->source_text_offset, data->source_text_length);
-    }
+    shared->set_source_text_range(source_code, data->source_text_offset, data->source_text_length);
 
     return shared.ptr();
 }
@@ -882,16 +1215,20 @@ extern "C" void* rust_create_sfd(
 extern "C" void rust_sfd_set_metadata(
     void* sfd_ptr,
     bool uses_this,
+    bool this_value_needs_environment_resolution,
     bool function_environment_needed,
     size_t function_environment_bindings_count,
+    size_t var_environment_bindings_count,
     bool might_need_arguments_object,
     bool contains_direct_call_to_eval)
 {
     auto& shared = *static_cast<JS::SharedFunctionInstanceData*>(sfd_ptr);
     shared.m_uses_this = uses_this;
+    shared.m_this_value_needs_environment_resolution = this_value_needs_environment_resolution;
     shared.m_function_environment_needed = function_environment_needed;
     shared.update_asm_call_metadata();
     shared.m_function_environment_bindings_count = function_environment_bindings_count;
+    shared.m_var_environment_bindings_count = var_environment_bindings_count;
     shared.m_might_need_arguments_object = might_need_arguments_object;
     shared.m_contains_direct_call_to_eval = contains_direct_call_to_eval;
 }
@@ -909,6 +1246,84 @@ extern "C" void rust_sfd_set_class_field_initializer_name(
     } else {
         shared.m_class_field_initializer_name = JS::PropertyKey(utf16_name.to_utf16_string());
     }
+}
+
+extern "C" void rust_sfd_set_precompiled_executable(
+    void* sfd_ptr,
+    void* executable_ptr,
+    bool uses_this,
+    bool this_value_needs_environment_resolution,
+    bool function_environment_needed,
+    size_t function_environment_bindings_count,
+    size_t var_environment_bindings_count,
+    bool might_need_arguments_object,
+    bool contains_direct_call_to_eval)
+{
+    auto& shared = *static_cast<JS::SharedFunctionInstanceData*>(sfd_ptr);
+    auto& executable = *static_cast<JS::Bytecode::Executable*>(executable_ptr);
+
+    shared.m_uses_this = uses_this;
+    shared.m_this_value_needs_environment_resolution = this_value_needs_environment_resolution;
+    shared.m_function_environment_needed = function_environment_needed;
+    shared.m_function_environment_bindings_count = function_environment_bindings_count;
+    shared.m_var_environment_bindings_count = var_environment_bindings_count;
+    shared.m_might_need_arguments_object = might_need_arguments_object;
+    shared.m_contains_direct_call_to_eval = contains_direct_call_to_eval;
+    shared.set_executable(executable);
+    executable.name = shared.m_name;
+    if (Bytecode::g_dump_bytecode)
+        executable.dump();
+    shared.clear_compile_inputs();
+}
+
+extern "C" void rust_sfd_set_cached_bytecode_executable(
+    void* sfd_ptr,
+    void* cached_executable_ptr,
+    bool uses_this,
+    bool this_value_needs_environment_resolution,
+    bool function_environment_needed,
+    size_t function_environment_bindings_count,
+    size_t var_environment_bindings_count,
+    bool might_need_arguments_object,
+    bool contains_direct_call_to_eval)
+{
+    auto& shared = *static_cast<JS::SharedFunctionInstanceData*>(sfd_ptr);
+
+    shared.m_uses_this = uses_this;
+    shared.m_this_value_needs_environment_resolution = this_value_needs_environment_resolution;
+    shared.m_function_environment_needed = function_environment_needed;
+    shared.m_function_environment_bindings_count = function_environment_bindings_count;
+    shared.m_var_environment_bindings_count = var_environment_bindings_count;
+    shared.m_might_need_arguments_object = might_need_arguments_object;
+    shared.m_contains_direct_call_to_eval = contains_direct_call_to_eval;
+    shared.m_cached_bytecode_executable = cached_executable_ptr;
+    shared.update_asm_call_metadata();
+}
+
+extern "C" void rust_sfd_set_precompiled_bytecode_executable(
+    void* sfd_ptr,
+    void* precompiled_executable_ptr,
+    bool uses_this,
+    bool this_value_needs_environment_resolution,
+    bool function_environment_needed,
+    size_t function_environment_bindings_count,
+    size_t var_environment_bindings_count,
+    bool might_need_arguments_object,
+    bool contains_direct_call_to_eval)
+{
+    auto& shared = *static_cast<JS::SharedFunctionInstanceData*>(sfd_ptr);
+
+    shared.m_uses_this = uses_this;
+    shared.m_this_value_needs_environment_resolution = this_value_needs_environment_resolution;
+    shared.m_function_environment_needed = function_environment_needed;
+    shared.m_function_environment_bindings_count = function_environment_bindings_count;
+    shared.m_var_environment_bindings_count = var_environment_bindings_count;
+    shared.m_might_need_arguments_object = might_need_arguments_object;
+    shared.m_contains_direct_call_to_eval = contains_direct_call_to_eval;
+    shared.m_precompiled_bytecode_executable = precompiled_executable_ptr;
+    RustIntegration::free_function_ast(shared.m_rust_function_ast);
+    shared.m_rust_function_ast = nullptr;
+    shared.update_asm_call_metadata();
 }
 
 extern "C" void* rust_create_class_blueprint(
@@ -932,12 +1347,9 @@ extern "C" void* rust_create_class_blueprint(
     if (name_len > 0)
         blueprint->name = Utf16FlyString::from_utf16(JS::RustIntegration::utf16_view_from_bytes(name, name_len));
 
-    // Store source text as a view into the SourceCode buffer.
-    if (source_text_len > 0) {
-        auto& source_code = *static_cast<JS::SourceCode const*>(source_code_ptr);
-        auto const& code_view = source_code.code_view();
-        blueprint->source_text = code_view.substring_view(source_text_offset, source_text_len);
-    }
+    blueprint->source_code = static_cast<JS::SourceCode const*>(source_code_ptr);
+    blueprint->source_text_offset = source_text_offset;
+    blueprint->source_text_length = source_text_len;
 
     for (size_t i = 0; i < element_count; ++i) {
         auto const& elem = elements[i];
@@ -1096,39 +1508,6 @@ extern "C" size_t rust_format_double(double value, uint8_t* buffer, size_t buffe
     auto len = min(bytes.size(), buffer_len);
     memcpy(buffer, bytes.data(), len);
     return len;
-}
-
-extern "C" uint64_t get_well_known_symbol(void* vm_ptr, WellKnownSymbolKind symbol_id)
-{
-    auto& vm = *static_cast<JS::VM*>(vm_ptr);
-    JS::Value value;
-    switch (symbol_id) {
-    case WellKnownSymbolKind::SymbolIterator:
-        value = vm.well_known_symbol_iterator();
-        break;
-    case WellKnownSymbolKind::SymbolAsyncIterator:
-        value = vm.well_known_symbol_async_iterator();
-        break;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-    return value.encoded();
-}
-
-extern "C" uint64_t get_abstract_operation_function(void* vm_ptr, uint16_t const* name, size_t name_len)
-{
-    auto& vm = *static_cast<JS::VM*>(vm_ptr);
-    auto& intrinsics = vm.current_realm()->intrinsics();
-    auto name_view = JS::RustIntegration::utf16_view_from_bytes(name, name_len);
-    auto name_str = MUST(name_view.to_utf8());
-
-#define __JS_ENUMERATE(snake_name, functionName, length) \
-    if (name_str == #functionName##sv)                   \
-        return JS::Value(intrinsics.snake_name##_abstract_operation_function().ptr()).encoded();
-    JS_ENUMERATE_NATIVE_JAVASCRIPT_BACKED_ABSTRACT_OPERATIONS
-#undef __JS_ENUMERATE
-
-    VERIFY_NOT_REACHED();
 }
 
 }

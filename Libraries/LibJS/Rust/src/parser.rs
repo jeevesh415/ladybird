@@ -32,14 +32,12 @@
 //! save and restore the full parser state including lexer position, current
 //! token, error list, and all boolean flags.
 
-use std::collections::{HashMap, HashSet};
-
-use std::rc::Rc;
+use crate::fast_hash::{HashMap, HashSet};
 
 use crate::ast::{
-    BindingPattern, Expression, ExpressionKind, FunctionParameter, FunctionTable, Identifier,
-    PrivateIdentifier, ProgramData, ScopeData, SharedUtf16String, SourceRange, Statement,
-    StatementKind, Utf16String,
+    AstArena, BindingPattern, Expression, ExpressionKind, FunctionData, FunctionId, FunctionParameter, FunctionTable,
+    Identifier, IdentifierId, PrivateIdentifier, ProgramData, ScopeData, ScopeId, SourceRange, Statement,
+    StatementKind, StringId, Utf16String,
 };
 use crate::lexer::{Lexer, ch};
 use crate::scope_collector::{ScopeCollector, ScopeCollectorState};
@@ -75,7 +73,7 @@ pub struct ParamInfo {
     pub name: Utf16String,
     pub is_rest: bool,
     pub is_from_pattern: bool,
-    pub identifier: Option<Rc<Identifier>>,
+    pub identifier: Option<IdentifierId>,
 }
 
 /// Result of parsing a property key (object literal or class element).
@@ -151,8 +149,7 @@ impl ForbiddenTokens {
             forbid_logical: self.forbid_logical || other.forbid_logical,
             forbid_coalesce: self.forbid_coalesce || other.forbid_coalesce,
             forbid_paren_open: self.forbid_paren_open || other.forbid_paren_open,
-            forbid_question_mark_period: self.forbid_question_mark_period
-                || other.forbid_question_mark_period,
+            forbid_question_mark_period: self.forbid_question_mark_period || other.forbid_question_mark_period,
             forbid_equals: self.forbid_equals || other.forbid_equals,
         }
     }
@@ -201,10 +198,6 @@ pub(crate) struct ParserFlags {
     pub new_target_is_valid: bool,
     pub function_might_need_arguments_object: bool,
     pub previous_token_was_period: bool,
-    /// Set during property key parsing to suppress eval/arguments check.
-    /// C++ uses separate `consume()` and `consume_and_allow_division()` methods;
-    /// we emulate this by skipping the check in property key contexts.
-    pub in_property_key_context: bool,
 }
 
 /// Snapshot of parser state for speculative parsing (backtracking).
@@ -213,6 +206,7 @@ struct SavedState {
     errors_len: usize,
     flags: ParserFlags,
     scope_collector_state: ScopeCollectorState,
+    function_context_stack_lengths: Vec<usize>,
 }
 
 /// The main JavaScript parser.
@@ -256,15 +250,10 @@ pub struct Parser<'a> {
     /// Caller drains this after calling parse_binding_pattern.
     /// Each entry is (name, identifier) — allows scope analysis to annotate
     /// binding pattern identifiers with local variable info.
-    pub(crate) pattern_bound_names: Vec<(SharedUtf16String, Rc<Identifier>)>,
+    pub(crate) pattern_bound_names: Vec<(StringId, IdentifierId)>,
 
     /// Set during synthesize_binding_pattern to allow MemberExpressions as binding targets.
     allow_member_expressions: bool,
-
-    /// Position of the opening bracket/brace in binding patterns.
-    /// Used so all identifiers inside a binding pattern share the pattern's start position,
-    /// matching C++ parser behavior.
-    binding_pattern_start: Option<Position>,
 
     /// True while parsing a class body that has an `extends` clause.
     pub(crate) class_has_super_class: bool,
@@ -295,6 +284,17 @@ pub struct Parser<'a> {
     /// Side table owning all FunctionData produced during parsing.
     pub function_table: FunctionTable,
 
+    /// Bulk storage for identifiers, scopes, and interned strings. Replaces
+    /// the old per-node `Rc<Identifier>` heap allocations.
+    pub arena: AstArena,
+
+    /// Stack of nested function ids discovered while parsing each active function.
+    ///
+    /// When the parser finishes a function, the top list becomes that
+    /// FunctionData's child list. This lets lazy-compile payload extraction move
+    /// a known function subtree instead of walking the function body again.
+    function_context_stack: Vec<Vec<FunctionId>>,
+
     /// Memoization: offsets where arrow function parsing has already failed.
     /// Prevents exponential re-processing of nested expressions like
     /// `(a=(b=(c=0)))` where each failed arrow attempt would otherwise
@@ -307,11 +307,7 @@ impl<'a> Parser<'a> {
         Self::new_with_line_offset(source, program_type, 1)
     }
 
-    pub fn new_with_line_offset(
-        source: &'a [u16],
-        program_type: ProgramType,
-        initial_line_number: u32,
-    ) -> Self {
+    pub fn new_with_line_offset(source: &'a [u16], program_type: ProgramType, initial_line_number: u32) -> Self {
         let mut lexer = Lexer::new(source, initial_line_number, 0);
         if program_type == ProgramType::Module {
             lexer.disallow_html_comments();
@@ -327,7 +323,7 @@ impl<'a> Parser<'a> {
             flags: ParserFlags::default(),
             initiated_by_eval: false,
             in_eval_function_context: false,
-            labels_in_scope: HashMap::new(),
+            labels_in_scope: HashMap::default(),
             last_inner_label_is_iteration: false,
             last_primary_was_parenthesized: false,
             last_function_name: Utf16String::default(),
@@ -335,7 +331,6 @@ impl<'a> Parser<'a> {
             last_class_name: Utf16String::default(),
             pattern_bound_names: Vec::new(),
             allow_member_expressions: false,
-            binding_pattern_start: None,
             class_has_super_class: false,
             class_scope_depth: 0,
             has_default_export_name: false,
@@ -345,9 +340,11 @@ impl<'a> Parser<'a> {
             for_loop_declaration_is_var: false,
             for_loop_declaration_is_pattern: false,
             scope_collector: ScopeCollector::new(),
-            exported_names: HashSet::new(),
+            exported_names: HashSet::default(),
             function_table: FunctionTable::new(),
-            arrow_function_failed_positions: HashSet::new(),
+            arena: AstArena::new(),
+            function_context_stack: Vec::new(),
+            arrow_function_failed_positions: HashSet::default(),
         }
     }
 
@@ -368,22 +365,59 @@ impl<'a> Parser<'a> {
         Statement::new(self.range_from(start), statement)
     }
 
-    pub(crate) fn make_identifier(
-        &self,
-        start: Position,
-        name: impl Into<SharedUtf16String>,
-    ) -> Rc<Identifier> {
-        Rc::new(Identifier::new(self.range_from(start), name.into()))
+    pub(crate) fn push_function_context(&mut self) {
+        self.function_context_stack.push(Vec::new());
     }
 
-    pub(crate) fn token_identifier_name(&self, token: &Token) -> SharedUtf16String {
-        if let Some(value) = &token.shared_identifier_value {
-            value.clone()
-        } else if let Some(value) = &token.identifier_value {
-            SharedUtf16String::from(value.clone())
-        } else {
-            SharedUtf16String::from(self.token_value(token))
+    pub(crate) fn pop_function_context(&mut self) -> Vec<FunctionId> {
+        self.function_context_stack
+            .pop()
+            .expect("Parser::pop_function_context: no active function context")
+    }
+
+    pub(crate) fn insert_function_data(&mut self, data: FunctionData) -> FunctionId {
+        let function_id = self.function_table.insert(data);
+        if let Some(context) = self.function_context_stack.last_mut() {
+            // The newly parsed function belongs to the innermost function
+            // context. Top-level functions have no parent and remain reachable
+            // through their AST node, as before.
+            context.push(function_id);
         }
+        function_id
+    }
+
+    pub(crate) fn make_identifier(&mut self, start: Position, name: StringId) -> IdentifierId {
+        let identifier = Identifier::new(self.range_from(start), name);
+        self.arena.identifiers.insert(identifier)
+    }
+
+    pub(crate) fn make_identifier_from_slice(&mut self, start: Position, name: &[u16]) -> IdentifierId {
+        let id = self.arena.strings.intern(name);
+        self.make_identifier(start, id)
+    }
+
+    pub(crate) fn make_scope(&mut self, children: Vec<Statement>) -> ScopeId {
+        self.arena.scopes.insert(ScopeData {
+            children,
+            ..ScopeData::default()
+        })
+    }
+
+    pub(crate) fn make_empty_scope(&mut self) -> ScopeId {
+        self.arena.scopes.insert(ScopeData::default())
+    }
+
+    pub(crate) fn token_identifier_name(&mut self, token: &Token) -> StringId {
+        if let Some(value) = &token.identifier_value {
+            // Cheap-clone via Vec slicing because intern needs a slice but
+            // self.arena is borrowed.
+            let owned = value.clone();
+            return self.arena.strings.intern_owned(owned);
+        }
+        let start = token.value_start as usize;
+        let end = start + token.value_len as usize;
+        let slice = &self.source[start..end];
+        self.arena.strings.intern(slice)
     }
 
     pub(crate) fn register_function_parameters_with_scope(
@@ -407,11 +441,11 @@ impl<'a> Parser<'a> {
                         info_index += 1;
                         (pi.name.clone(), pi.is_rest, pi.is_from_pattern)
                     } else {
-                        (id.name.to_utf16_string(), parameter.is_rest, false)
+                        (self.arena.name_of(*id).clone(), parameter.is_rest, false)
                     };
                     entries.push(ParameterEntry {
                         name,
-                        identifier: Some(id.clone()),
+                        identifier: Some(*id),
                         is_rest,
                         is_from_pattern,
                         is_first_from_pattern: false,
@@ -431,13 +465,11 @@ impl<'a> Parser<'a> {
                         is_first_from_pattern: true,
                     });
                     // Then push bound names from this pattern.
-                    while info_index < parameter_info.len()
-                        && parameter_info[info_index].is_from_pattern
-                    {
+                    while info_index < parameter_info.len() && parameter_info[info_index].is_from_pattern {
                         let pi = &parameter_info[info_index];
                         entries.push(ParameterEntry {
                             name: pi.name.clone(),
-                            identifier: pi.identifier.clone(),
+                            identifier: pi.identifier,
                             is_rest: pi.is_rest,
                             is_from_pattern: true,
                             is_first_from_pattern: false,
@@ -447,8 +479,16 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.scope_collector
-            .set_function_parameters(&entries, has_parameter_expressions);
+        let Self {
+            scope_collector, arena, ..
+        } = self;
+        scope_collector.set_function_parameters(
+            &entries,
+            has_parameter_expressions,
+            &mut arena.identifiers,
+            &arena.strings,
+            &mut arena.scopes,
+        );
     }
 
     // === Token access ===
@@ -473,12 +513,16 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn consume(&mut self) -> Token {
         let old = std::mem::replace(&mut self.current_token, self.lexer.next());
-        // C++ checks for `arguments`/`eval` in `consume_and_allow_division()` which
-        // is used by `consume_identifier()`. We put the check here (in `consume()`)
-        // but skip it when parsing property keys, matching C++'s behavior.
-        if !self.flags.in_property_key_context {
-            self.check_arguments_or_eval(&old);
-        }
+        self.check_arguments_or_eval(&old);
+        self.flags.previous_token_was_period = old.token_type == TokenType::Period;
+        old
+    }
+
+    /// Like `consume()` but skips the `arguments`/`eval` reference check.
+    /// Use this when consuming a token that is syntactically a property key
+    /// rather than an identifier reference (e.g. `{ arguments: 1 }`).
+    pub(crate) fn consume_property_key_token(&mut self) -> Token {
+        let old = std::mem::replace(&mut self.current_token, self.lexer.next());
         self.flags.previous_token_was_period = old.token_type == TokenType::Period;
         old
     }
@@ -556,11 +600,7 @@ impl<'a> Parser<'a> {
             // https://tc39.es/ecma262/#sec-additional-syntax-numeric-literals
             // In strict mode, legacy octal literals (0-prefixed) are not permitted.
             let value = self.token_value(&token);
-            if value.len() > 1
-                && value[0] == ch(b'0')
-                && value[1] >= ch(b'0')
-                && value[1] <= ch(b'9')
-            {
+            if value.len() > 1 && value[0] == ch(b'0') && value[1] >= ch(b'0') && value[1] <= ch(b'9') {
                 self.syntax_error("Unprefixed octal number not allowed in strict mode");
             }
         }
@@ -583,10 +623,7 @@ impl<'a> Parser<'a> {
             self.consume();
             return;
         }
-        if self.current_token.trivia_has_line_terminator
-            || self.match_token(TokenType::CurlyClose)
-            || self.done()
-        {
+        if self.current_token.trivia_has_line_terminator || self.match_token(TokenType::CurlyClose) || self.done() {
             return;
         }
         self.expected("Semicolon");
@@ -656,9 +693,7 @@ impl<'a> Parser<'a> {
         let value = self.token_value(&self.current_token).to_vec();
         if !self.register_referenced_private_name(&value) {
             let name = String::from_utf16_lossy(&value);
-            self.syntax_error(&format!(
-                "Reference to undeclared private field or method '{name}'"
-            ));
+            self.syntax_error(&format!("Reference to undeclared private field or method '{name}'"));
         }
         let token = self.consume();
         let value = self.token_value(&token).to_vec();
@@ -740,6 +775,7 @@ impl<'a> Parser<'a> {
             errors_len: self.errors.len(),
             flags: self.flags,
             scope_collector_state: self.scope_collector.save_state(),
+            function_context_stack_lengths: self.function_context_stack.iter().map(Vec::len).collect(),
         });
     }
 
@@ -749,6 +785,15 @@ impl<'a> Parser<'a> {
         self.errors.truncate(state.errors_len);
         self.flags = state.flags;
         self.scope_collector.load_state(state.scope_collector_state);
+        self.function_context_stack
+            .truncate(state.function_context_stack_lengths.len());
+        for (context, len) in self
+            .function_context_stack
+            .iter_mut()
+            .zip(state.function_context_stack_lengths)
+        {
+            context.truncate(len);
+        }
         self.lexer.load_state();
     }
 
@@ -812,16 +857,10 @@ impl<'a> Parser<'a> {
         value != utf16!("let") && value != utf16!("static")
     }
 
-    pub(crate) fn check_identifier_name_for_assignment_validity(
-        &mut self,
-        name: &[u16],
-        force_strict: bool,
-    ) {
+    pub(crate) fn check_identifier_name_for_assignment_validity(&mut self, name: &[u16], force_strict: bool) {
         if self.flags.strict_mode || force_strict {
             if name == utf16!("arguments") || name == utf16!("eval") {
-                self.syntax_error(
-                    "Binding pattern target may not be called 'arguments' or 'eval' in strict mode",
-                );
+                self.syntax_error("Binding pattern target may not be called 'arguments' or 'eval' in strict mode");
             } else if is_strict_reserved_word(name) {
                 let name_str = String::from_utf16_lossy(name);
                 self.syntax_error(&format!(
@@ -841,7 +880,7 @@ impl<'a> Parser<'a> {
     /// Check for duplicate parameter names in arrow functions.
     /// Arrow functions always reject duplicates, regardless of strict mode.
     pub(crate) fn check_arrow_duplicate_parameters(&mut self, parameter_info: &[ParamInfo]) {
-        let mut seen_names: HashSet<&[u16]> = HashSet::new();
+        let mut seen_names: HashSet<&[u16]> = HashSet::default();
         for pi in parameter_info {
             let name = &pi.name;
             if name.is_empty() {
@@ -864,7 +903,7 @@ impl<'a> Parser<'a> {
         force_strict: bool,
         _kind: FunctionKind,
     ) {
-        let mut seen_names: HashSet<&[u16]> = HashSet::new();
+        let mut seen_names: HashSet<&[u16]> = HashSet::default();
         for pi in parameter_info {
             let name = &pi.name;
             if name.is_empty() {
@@ -873,17 +912,12 @@ impl<'a> Parser<'a> {
             self.check_identifier_name_for_assignment_validity(name, force_strict);
             if !seen_names.insert(&**name) {
                 let name_str = String::from_utf16_lossy(name);
-                self.syntax_error(&format!(
-                    "Duplicate parameter '{name_str}' not allowed in strict mode"
-                ));
+                self.syntax_error(&format!("Duplicate parameter '{name_str}' not allowed in strict mode"));
             }
         }
     }
 
     pub(crate) fn token_value<'b>(&'b self, token: &'b Token) -> &'b [u16] {
-        if let Some(ref value) = token.shared_identifier_value {
-            return value.as_slice();
-        }
         if let Some(ref value) = token.identifier_value {
             return value;
         }
@@ -984,10 +1018,10 @@ impl<'a> Parser<'a> {
 
         if self.program_type == ProgramType::Script {
             let (children, is_strict) = self.parse_script(starts_in_strict_mode);
-            let scope = ScopeData::shared_with_children(children);
+            let scope = self.make_scope(children);
             // Scope was opened in parse_script via open_program_scope.
             // Now close it after children are set.
-            self.scope_collector.set_scope_node(scope.clone());
+            self.scope_collector.set_scope_node(scope);
             self.scope_collector.close_scope();
             self.statement(
                 start,
@@ -1000,8 +1034,8 @@ impl<'a> Parser<'a> {
             )
         } else {
             let (children, has_top_level_await) = self.parse_module();
-            let scope = ScopeData::shared_with_children(children);
-            self.scope_collector.set_scope_node(scope.clone());
+            let scope = self.make_scope(children);
+            self.scope_collector.set_scope_node(scope);
             self.scope_collector.close_scope();
             self.statement(
                 start,
@@ -1090,9 +1124,9 @@ impl<'a> Parser<'a> {
         use crate::ast::*;
 
         // Collect all declared names at module level.
-        let mut declared_names: HashSet<Utf16String> = HashSet::new();
+        let mut declared_names: HashSet<Utf16String> = HashSet::default();
         for child in children {
-            collect_module_declared_names(child, &mut declared_names);
+            collect_module_declared_names(child, &mut declared_names, &self.arena);
         }
 
         // Check each export's local bindings.
@@ -1140,9 +1174,7 @@ impl<'a> Parser<'a> {
             if is_use_strict(raw_value) {
                 found_use_strict = true;
                 if self.flags.string_legacy_octal_escape_sequence_in_scope {
-                    self.syntax_error(
-                        "Octal escape sequence in string literal not allowed in strict mode",
-                    );
+                    self.syntax_error("Octal escape sequence in string literal not allowed in strict mode");
                 }
                 break;
             }
@@ -1151,10 +1183,7 @@ impl<'a> Parser<'a> {
         (found_use_strict, statements)
     }
 
-    pub(crate) fn parse_statement_list(
-        &mut self,
-        allow_labelled_functions: bool,
-    ) -> Vec<Statement> {
+    pub(crate) fn parse_statement_list(&mut self, allow_labelled_functions: bool) -> Vec<Statement> {
         let mut statements = Vec::new();
         while !self.done() {
             if self.match_export_or_import() {
@@ -1253,10 +1282,7 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn operator_precedence(tt: TokenType) -> i32 {
         match tt {
-            TokenType::Period
-            | TokenType::BracketOpen
-            | TokenType::ParenOpen
-            | TokenType::QuestionMarkPeriod => 20,
+            TokenType::Period | TokenType::BracketOpen | TokenType::ParenOpen | TokenType::QuestionMarkPeriod => 20,
             TokenType::New => 19,
             TokenType::PlusPlus | TokenType::MinusMinus => 18,
             TokenType::ExclamationMark
@@ -1358,13 +1384,14 @@ fn is_use_strict(raw: &[u16]) -> bool {
 fn collect_binding_names(
     target: &crate::ast::VariableDeclaratorTarget,
     names: &mut HashSet<Utf16String>,
+    arena: &crate::ast::AstArena,
 ) {
     match target {
         crate::ast::VariableDeclaratorTarget::Identifier(identifier) => {
-            names.insert(identifier.name.to_utf16_string());
+            names.insert(arena.name_of(*identifier).clone());
         }
         crate::ast::VariableDeclaratorTarget::BindingPattern(pattern) => {
-            collect_binding_pattern_names(pattern, names);
+            collect_binding_pattern_names(pattern, names, arena);
         }
     }
 }
@@ -1373,20 +1400,21 @@ fn collect_binding_names(
 fn collect_binding_pattern_names(
     pattern: &crate::ast::BindingPattern,
     names: &mut HashSet<Utf16String>,
+    arena: &crate::ast::AstArena,
 ) {
     for entry in &pattern.entries {
         if let Some(ref alias) = entry.alias {
             match alias {
                 crate::ast::BindingEntryAlias::Identifier(identifier) => {
-                    names.insert(identifier.name.to_utf16_string());
+                    names.insert(arena.name_of(*identifier).clone());
                 }
                 crate::ast::BindingEntryAlias::BindingPattern(nested) => {
-                    collect_binding_pattern_names(nested, names);
+                    collect_binding_pattern_names(nested, names, arena);
                 }
                 crate::ast::BindingEntryAlias::MemberExpression(_) => {}
             }
         } else if let Some(crate::ast::BindingEntryName::Identifier(identifier)) = &entry.name {
-            names.insert(identifier.name.to_utf16_string());
+            names.insert(arena.name_of(*identifier).clone());
         }
     }
 }
@@ -1398,23 +1426,24 @@ fn collect_binding_pattern_names(
 fn collect_module_declared_names(
     statement: &crate::ast::Statement,
     names: &mut HashSet<Utf16String>,
+    arena: &crate::ast::AstArena,
 ) {
     use crate::ast::*;
     match &statement.inner {
         StatementKind::VariableDeclaration(data) => {
             // All top-level declarations (var, let, const) are module-scoped.
             for decl in &data.declarations {
-                collect_binding_names(&decl.target, names);
+                collect_binding_names(&decl.target, names, arena);
             }
         }
         StatementKind::FunctionDeclaration(data) => {
-            if let Some(ref name) = data.name {
-                names.insert(name.name.to_utf16_string());
+            if let Some(name) = data.name {
+                names.insert(arena.name_of(name).clone());
             }
         }
         StatementKind::ClassDeclaration(data) => {
-            if let Some(ref name) = data.name {
-                names.insert(name.name.to_utf16_string());
+            if let Some(name) = data.name {
+                names.insert(arena.name_of(name).clone());
             }
         }
         StatementKind::Import(data) => {
@@ -1424,12 +1453,12 @@ fn collect_module_declared_names(
         }
         StatementKind::Export(data) => {
             if let Some(ref stmt) = data.statement {
-                collect_module_declared_names(stmt, names);
+                collect_module_declared_names(stmt, names, arena);
             }
         }
         // For any other statement, recurse to find hoisted var declarations.
         _ => {
-            collect_var_declared_names(statement, names);
+            collect_var_declared_names(statement, names, arena);
         }
     }
 }
@@ -1438,61 +1467,65 @@ fn collect_module_declared_names(
 /// `var` declarations are hoisted to the enclosing function/module scope,
 /// so we must walk into blocks, loops, if/else, switch, try/catch, etc.
 /// We do NOT walk into function bodies since `var` does not hoist out of functions.
-fn collect_var_declared_names(statement: &crate::ast::Statement, names: &mut HashSet<Utf16String>) {
+fn collect_var_declared_names(
+    statement: &crate::ast::Statement,
+    names: &mut HashSet<Utf16String>,
+    arena: &crate::ast::AstArena,
+) {
     use crate::ast::*;
     match &statement.inner {
         StatementKind::VariableDeclaration(data) if matches!(data.kind, DeclarationKind::Var) => {
             for decl in &data.declarations {
-                collect_binding_names(&decl.target, names);
+                collect_binding_names(&decl.target, names, arena);
             }
         }
         StatementKind::Block(scope) => {
-            for child in &scope.borrow().children {
-                collect_var_declared_names(child, names);
+            for child in &arena.scopes[*scope].children {
+                collect_var_declared_names(child, names, arena);
             }
         }
         StatementKind::If(data) => {
-            collect_var_declared_names(&data.consequent, names);
+            collect_var_declared_names(&data.consequent, names, arena);
             if let Some(ref alt) = data.alternate {
-                collect_var_declared_names(alt, names);
+                collect_var_declared_names(alt, names, arena);
             }
         }
         StatementKind::While(data) | StatementKind::DoWhile(data) => {
-            collect_var_declared_names(&data.body, names);
+            collect_var_declared_names(&data.body, names, arena);
         }
         StatementKind::With(data) => {
-            collect_var_declared_names(&data.body, names);
+            collect_var_declared_names(&data.body, names, arena);
         }
         StatementKind::For(data) => {
             if let Some(ForInit::Declaration(ref decl)) = data.init {
-                collect_var_declared_names(decl, names);
+                collect_var_declared_names(decl, names, arena);
             }
-            collect_var_declared_names(&data.body, names);
+            collect_var_declared_names(&data.body, names, arena);
         }
         StatementKind::ForInOf(data) => {
             if let ForInOfLhs::Declaration(ref decl) = data.lhs {
-                collect_var_declared_names(decl, names);
+                collect_var_declared_names(decl, names, arena);
             }
-            collect_var_declared_names(&data.body, names);
+            collect_var_declared_names(&data.body, names, arena);
         }
         StatementKind::Switch(data) => {
             for case in &data.cases {
-                for child in &case.scope.borrow().children {
-                    collect_var_declared_names(child, names);
+                for child in &arena.scopes[case.scope].children {
+                    collect_var_declared_names(child, names, arena);
                 }
             }
         }
         StatementKind::Try(data) => {
-            collect_var_declared_names(&data.block, names);
+            collect_var_declared_names(&data.block, names, arena);
             if let Some(ref handler) = data.handler {
-                collect_var_declared_names(&handler.body, names);
+                collect_var_declared_names(&handler.body, names, arena);
             }
             if let Some(ref finalizer) = data.finalizer {
-                collect_var_declared_names(finalizer, names);
+                collect_var_declared_names(finalizer, names, arena);
             }
         }
         StatementKind::Labelled(data) => {
-            collect_var_declared_names(&data.item, names);
+            collect_var_declared_names(&data.item, names, arena);
         }
         // Don't recurse into functions (var doesn't hoist out of functions).
         // Don't recurse into let/const (they are block-scoped, not hoisted).

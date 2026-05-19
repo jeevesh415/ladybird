@@ -9,7 +9,7 @@
 #include <AK/String.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/StoragePrototype.h>
+#include <LibWeb/Bindings/Storage.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Storage.h>
@@ -243,7 +243,7 @@ void Storage::broadcast(Optional<String> const& key, Optional<String> const& old
     //    remoteStorage.
     for (auto remote_storage : remote_storages) {
         queue_global_task(Task::Source::DOMManipulation, relevant_global, GC::create_function(heap(), [&realm, key, old_value, new_value, url, remote_storage] {
-            StorageEventInit init;
+            Bindings::StorageEventInit init;
             init.key = move(key);
             init.old_value = move(old_value);
             init.new_value = move(new_value);

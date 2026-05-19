@@ -5,6 +5,7 @@
  */
 
 #include <LibGfx/Color.h>
+#include <LibWeb/Bindings/Document.h>
 #include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
@@ -3785,7 +3786,7 @@ GC::Ref<DOM::Element> set_the_tag_name(GC::Ref<DOM::Element> element, FlyString 
         return element;
 
     // 3. Let replacement element be the result of calling createElement(new name) on the ownerDocument of element.
-    auto replacement_element = MUST(element->owner_document()->create_element(new_name.to_string(), DOM::ElementCreationOptions {}));
+    auto replacement_element = MUST(element->owner_document()->create_element(new_name.to_string(), Bindings::ElementCreationOptions {}));
 
     // 4. Insert replacement element into element's parent immediately before element.
     element->parent()->insert_before(replacement_element, element);
@@ -3899,11 +3900,10 @@ Optional<Utf16String> specified_command_value(GC::Ref<DOM::Element> element, Fly
     //     "xxx-large".)
     if (is<HTML::HTMLFontElement>(*element)) {
         auto const& font_element = static_cast<HTML::HTMLFontElement&>(*element);
-        auto cascaded_properties = font_element.document().heap().allocate<CSS::CascadedProperties>();
-        font_element.apply_presentational_hints(cascaded_properties);
-        auto property_value = cascaded_properties->property(property.value());
-        if (property_value)
-            return Utf16String::from_utf8_without_validation(property_value->to_string(CSS::SerializationMode::Normal));
+        Vector<CSS::StyleProperty> presentational_hint_properties;
+        font_element.apply_presentational_hints(presentational_hint_properties);
+        if (auto hint = presentational_hint_properties.first_matching([&](auto& it) { return it.property_id == property.value(); }); hint.has_value())
+            return Utf16String::from_utf8_without_validation(hint->value->to_string(CSS::SerializationMode::Normal));
     }
 
     // 12. If element is in the following list, and property is equal to the CSS property name listed for it, return the

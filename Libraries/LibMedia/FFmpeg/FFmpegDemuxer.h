@@ -30,10 +30,12 @@ public:
     virtual DecoderErrorOr<Vector<Track>> get_tracks_for_type(TrackType) override;
     virtual DecoderErrorOr<Optional<Track>> get_preferred_track_for_type(TrackType) override;
 
+    virtual AK::Duration select_fast_seek_target_for_track(Track const&, AK::Duration target, SeekMode) override;
     virtual DecoderErrorOr<DemuxerSeekResult> seek_to_most_recent_keyframe(Track const&, AK::Duration timestamp, DemuxerSeekOptions) override;
 
     virtual DecoderErrorOr<AK::Duration> duration_of_track(Track const&) override;
     virtual DecoderErrorOr<AK::Duration> total_duration() override;
+    virtual Optional<AK::UnixDateTime> start_time_realtime() const override;
 
     virtual TimeRanges buffered_time_ranges() const override;
 
@@ -81,6 +83,7 @@ private:
 
     NonnullRefPtr<MediaStream> m_stream;
     AK::Duration m_total_duration;
+    Optional<AK::UnixDateTime> m_start_time_realtime;
     Vector<StreamInfo> m_stream_info;
     Array<int, to_underlying(TrackType::Unknown)> m_preferred_track_for_type;
 

@@ -5,8 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLDetailsElementPrototype.h>
+#include <LibWeb/Bindings/HTMLDetailsElement.h>
 #include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
@@ -72,9 +73,7 @@ void HTMLDetailsElement::attribute_changed(FlyString const& local_name, Optional
 
     // 3. If localName is open, then:
     else if (local_name == HTML::AttributeNames::open) {
-        // The :open pseudo-class can affect sibling selectors (e.g., details:open + sibling),
-        // so we need full subtree + sibling invalidation, not just targeted invalidation.
-        invalidate_style(DOM::StyleInvalidationReason::HTMLDetailsOrDialogOpenAttributeChange);
+        CSS::Invalidation::invalidate_style_after_open_state_change(*this);
 
         // 1. If one of oldValue or value is null and the other is not null, run the following steps, which are known as
         //    the details notification task steps, for this details element:
@@ -126,7 +125,7 @@ void HTMLDetailsElement::queue_a_details_toggle_event_task(String old_state, Str
     auto task_id = queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, old_state, new_state = move(new_state)]() mutable {
         // 1. Fire an event named toggle at element, using ToggleEvent, with the oldState attribute initialized to
         //    oldState and the newState attribute initialized to newState.
-        ToggleEventInit event_init {};
+        Bindings::ToggleEventInit event_init {};
         event_init.old_state = move(old_state);
         event_init.new_state = move(new_state);
 

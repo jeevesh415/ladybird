@@ -7,12 +7,12 @@
 use super::instruction::Instruction;
 use super::operand::Label;
 
-/// A source map entry mapping a bytecode offset to a source range.
+/// A source map entry mapping a bytecode offset to a source position.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceMapEntry {
     pub bytecode_offset: u32,
-    pub source_start: u32,
-    pub source_end: u32,
+    pub line: u32,
+    pub column: u32,
 }
 
 /// A basic block in the bytecode generator.

@@ -287,7 +287,7 @@ String Token::to_debug_string() const
         has_type_specific_fields = true;
         break;
     case Type::Number:
-        builder.appendff("Number(value={}, number_type={}", m_number_value.value(), number_type_name(m_number_value.type()));
+        builder.appendff("Number(value={}, number_type={}", number_value(), number_type_name(m_number_value.type()));
         has_type_specific_fields = true;
         break;
     case Type::Percentage:
@@ -419,6 +419,12 @@ StringView Token::bracket_mirror_string() const
 }
 
 void Token::set_position_range(Badge<Tokenizer>, Position start, Position end)
+{
+    m_start_position = start;
+    m_end_position = end;
+}
+
+void Token::set_position_range(Badge<RustTokenizer>, Position start, Position end)
 {
     m_start_position = start;
     m_end_position = end;

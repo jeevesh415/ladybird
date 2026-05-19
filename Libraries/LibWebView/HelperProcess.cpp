@@ -87,12 +87,7 @@ static ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_proc
     auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
 
-    Vector<ByteString> arguments {
-        "--command-line"sv,
-        web_content_options.command_line.to_byte_string(),
-        "--executable-path"sv,
-        web_content_options.executable_path.to_byte_string(),
-    };
+    Vector<ByteString> arguments;
 
     if (browser_options.headless_mode.has_value())
         arguments.append("--headless"sv);
@@ -123,6 +118,8 @@ static ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_proc
         arguments.append("--collect-garbage-on-every-allocation"sv);
     if (web_content_options.paint_viewport_scrollbars == PaintViewportScrollbars::No)
         arguments.append("--disable-scrollbar-painting"sv);
+    if (web_content_options.enable_async_scrolling == EnableAsyncScrolling::No)
+        arguments.append("--disable-async-scrolling"sv);
     if (web_content_options.file_scheme_urls_have_tuple_origins == FileSchemeUrlsHaveTupleOrigins::Yes)
         arguments.append("--tuple-file-origins"sv);
 
@@ -134,6 +131,10 @@ static ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_proc
     if (web_content_options.default_time_zone.has_value()) {
         arguments.append("--default-time-zone");
         arguments.append(web_content_options.default_time_zone.value());
+    }
+    if (web_content_options.style_invalidation_counter_dump_interval.has_value()) {
+        arguments.append("--dump-style-invalidation-counters"sv);
+        arguments.append(ByteString::number(*web_content_options.style_invalidation_counter_dump_interval));
     }
 
     if (auto server = mach_server_name(); server.has_value()) {

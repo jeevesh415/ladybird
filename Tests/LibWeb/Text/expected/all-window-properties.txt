@@ -296,6 +296,8 @@ ManagedSourceBuffer
 Map
 MathMLElement
 MediaCapabilities
+MediaDeviceInfo
+MediaDevices
 MediaElementAudioSourceNode
 MediaError
 MediaKeySystemAccess
@@ -304,6 +306,9 @@ MediaQueryList
 MediaQueryListEvent
 MediaSource
 MediaSourceHandle
+MediaStream
+MediaStreamTrack
+MediaStreamTrackEvent
 MessageChannel
 MessageEvent
 MessagePort
@@ -348,6 +353,8 @@ PerformanceObserverEntryList
 PerformanceResourceTiming
 PerformanceTiming
 PeriodicWave
+PermissionStatus
+Permissions
 Plugin
 PluginArray
 PointerEvent
@@ -494,6 +501,7 @@ Symbol
 SyntaxError
 Text
 TextDecoder
+TextDecoderStream
 TextEncoder
 TextEncoderStream
 TextEvent

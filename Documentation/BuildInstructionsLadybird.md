@@ -7,7 +7,7 @@ Qt6 development packages, nasm, additional build tools, and a C++23 capable comp
 A Rust toolchain is also required. You can install it via [rustup](https://rustup.rs/).
 
 We currently use gcc-14 and clang-21 in our CI pipeline. If these versions are not available on your system, see
-[`Meta/find_compiler.py`](../Meta/find_compiler.py) for the minimum compatible version.
+[`find_compiler.py`](../Meta/Utils/find_compiler.py) for the minimum compatible version.
 
 CMake 3.30 or newer must be available in $PATH.
 
@@ -211,8 +211,11 @@ Or, download a version of Gradle >= 8.0.0, and run the ``gradlew`` program in ``
 ### FreeBSD
 
 ```
-pkg install autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip
+pkg install autoconf-archive automake autoconf bash cmake ccache curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base tar unzip zip
 ```
+> [!NOTE]
+> `zip`, `unzip`, and `tar` are required by the vcpkg bootstrap step. If any of these are missing,
+> the build will fail with a Python `CalledProcessError` traceback rather than a clear error message.
 
 ## Build steps
 
@@ -252,14 +255,37 @@ If you want to run other applications, such as the JS REPL or the WebAssembly RE
 Ladybird will be built with one of the following browser frontends, depending on the platform:
 * [AppKit](https://developer.apple.com/documentation/appkit?language=objc) - The native UI on macOS.
 * [Qt](https://doc.qt.io/qt-6/) - The UI used on all other platforms.
+* [GTK 4](https://docs.gtk.org/gtk4/) - An alternative UI on Linux (experimental).
 * [Android UI](https://developer.android.com/develop/ui) - The native UI on Android.
 
-The Qt UI is available on platforms where it is not the default as well (except on Android).
-You can pick the UI using the `LADYBIRD_GUI_FRAMEWORK` option, for example to enable the Qt UI:
+You can pick the UI using the `LADYBIRD_GUI_FRAMEWORK` option, or the `--gui` argument to ladybird.py.
+For example, to force building with the Qt UI:
 
 ```bash
 # From /path/to/ladybird
 cmake --preset Release -DLADYBIRD_GUI_FRAMEWORK=Qt
+# Or
+./Meta/ladybird.py run --gui=Qt
+```
+
+#### Additional prerequisites for the GTK UI
+
+Building with `LADYBIRD_GUI_FRAMEWORK=Gtk` requires additional system packages, as some vcpkg
+dependencies (e.g. gettext) need to be rebuilt from source:
+
+**Debian/Ubuntu:**
+```bash
+sudo apt install bison libxkbcommon-dev
+```
+
+**Arch Linux/Manjaro:**
+```bash
+sudo pacman -S bison
+```
+
+**Fedora:**
+```bash
+sudo dnf install bison
 ```
 
 ### Build error messages you may encounter
@@ -277,7 +303,7 @@ error: building skia:x64-linux failed with: BUILD_FAILED
 Elapsed time to handle skia:x64-linux: 1.6 s
 
 -- Running vcpkg install - failed
-CMake Error at Toolchain/Tarballs/vcpkg/scripts/buildsystems/vcpkg.cmake:899 (message):
+CMake Error at Build/vcpkg/scripts/buildsystems/vcpkg.cmake:899 (message):
   vcpkg install failed.  See logs for more information:
   Build/release/vcpkg-manifest-install.log
 Call Stack (most recent call first):
@@ -353,15 +379,6 @@ open -W --stdout $(tty) --stderr $(tty) ./Build/release/bin/Ladybird.app
 # Or to launch with arguments:
 open -W --stdout $(tty) --stderr $(tty) ./Build/release/bin/Ladybird.app --args https://ladybird.dev
 ```
-
-### Experimental GN build
-
-There is an experimental GN build for Ladybird. It is not officially supported, but it is kept up to date on a best-effort
-basis by interested contributors. See the [GN build instructions](../Meta/gn/README.md) for more information.
-
-In general, the GN build organizes ninja rules in a more compact way than the CMake build, and it may be faster on some systems.
-GN also allows building host and cross-targets in the same build directory, which is useful for managing dependencies on host tools when
-cross-compiling to other platforms.
 
 ### Debugging with CLion
 

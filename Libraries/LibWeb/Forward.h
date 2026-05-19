@@ -13,10 +13,12 @@
 #include <LibGfx/Forward.h>
 #include <LibIPC/Forward.h>
 #include <LibJS/Forward.h>
+#include <LibWeb/Bindings/Forward.h>
 #include <LibWeb/Export.h>
 
 namespace Web {
 
+struct AsyncScrollOperation;
 class AutoScrollHandler;
 class CSSPixels;
 class DisplayListRecordingContext;
@@ -42,17 +44,15 @@ AK_TYPEDEF_DISTINCT_NUMERIC_GENERAL(i64, UniqueNodeID, Comparison, Increment, Ca
 namespace Web::Painting {
 
 class BackingStore;
+class ChromeWidget;
 class DevicePixelConverter;
 class DisplayList;
 class DisplayListPlayerSkia;
 class DisplayListRecorder;
-class ExternalContentSource;
-class SVGGradientPaintStyle;
-class SVGPaintServerPaintStyle;
-class SVGPatternPaintStyle;
+class DisplayListResourceStorage;
+struct GradientPaintStyle;
+struct PatternPaintStyle;
 class ScrollStateSnapshot;
-using PaintStyle = RefPtr<SVGPaintServerPaintStyle>;
-using PaintStyleOrColor = Variant<PaintStyle, Gfx::Color>;
 
 }
 
@@ -95,6 +95,7 @@ enum class HdrMetadataType : u8;
 enum class ImageSmoothingQuality : u8;
 enum class MediaDecodingType : u8;
 enum class MediaEncodingType : u8;
+enum class MediaStreamTrackState : u8;
 enum class OffscreenRenderingContextId : u8;
 enum class ReadableStreamReaderMode : u8;
 enum class ReferrerPolicy : u8;
@@ -111,6 +112,13 @@ enum class ResponseType : u8;
 enum class TextTrackKind : u8;
 enum class TransferFunction : u8;
 enum class XMLHttpRequestResponseType : u8;
+
+}
+
+namespace Web::MediaCapture {
+
+class MediaStream;
+class MediaStreamTrack;
 
 }
 
@@ -137,7 +145,6 @@ class Policy;
 class PolicyList;
 class SecurityPolicyViolationEvent;
 class Violation;
-struct SecurityPolicyViolationEventInit;
 struct SerializedPolicy;
 
 }
@@ -186,18 +193,12 @@ class CredentialsContainer;
 class FederatedCredential;
 class PasswordCredential;
 
-struct CredentialData;
-struct CredentialRequestOptions;
-struct CredentialCreationOptions;
-struct FederatedCredentialRequestOptions;
-struct FederatedCredentialInit;
-struct PasswordCredentialData;
-
 }
 
 namespace Web::Crypto {
 
 class Crypto;
+class CryptoKey;
 class SubtleCrypto;
 
 }
@@ -214,7 +215,6 @@ struct Color;
 namespace Web::CSS {
 
 class AbstractImageStyleValue;
-class AddFunctionStyleValue;
 class AnchorStyleValue;
 class AnchorSizeStyleValue;
 class Angle;
@@ -310,9 +310,9 @@ class Display;
 class DisplayStyleValue;
 class EasingStyleValue;
 class EdgeStyleValue;
+class EmptyOptionalStyleValue;
 class ExplicitGridTrack;
 class FilterValueListStyleValue;
-class FitContentStyleValue;
 class Flex;
 class FlexStyleValue;
 class FontComputer;
@@ -320,10 +320,10 @@ class FontFace;
 class FontFaceSet;
 class FontSourceStyleValue;
 class FontStyleStyleValue;
-class FontVariantAlternatesFunctionStyleValue;
 class Frequency;
 class FrequencyPercentage;
 class FrequencyStyleValue;
+class FunctionStyleValue;
 class GridAutoFlowStyleValue;
 class GridLineNames;
 class GridMinMax;
@@ -335,8 +335,7 @@ class GridTrackPlacementStyleValue;
 class GridTrackSizeList;
 class GridTrackSizeListStyleValue;
 class GuaranteedInvalidStyleValue;
-class HSLColorStyleValue;
-class HWBColorStyleValue;
+class ImageSetStyleValue;
 class ImageStyleValue;
 class IntegerStyleValue;
 class InvalidationSet;
@@ -356,9 +355,9 @@ class MediaQueryListEvent;
 class Number;
 class NumberStyleValue;
 class NumericType;
-class OKLabColorStyleValue;
-class OKLCHColorStyleValue;
+class OpacityValueStyleValue;
 class OpenTypeTaggedStyleValue;
+class OverflowClipMarginStyleValue;
 class ParsedFontFace;
 class PendingSubstitutionStyleValue;
 class Percentage;
@@ -374,7 +373,6 @@ class RectStyleValue;
 class RepeatStyleStyleValue;
 class Resolution;
 class ResolutionStyleValue;
-class RGBColorStyleValue;
 class Screen;
 class ScreenOrientation;
 class ScrollbarGutterStyleValue;
@@ -383,7 +381,6 @@ class ShadowStyleValue;
 class ShorthandStyleValue;
 class Size;
 class ScrollbarColorStyleValue;
-class ScrollFunctionStyleValue;
 class StringStyleValue;
 class StyleComputer;
 class StylePropertyMap;
@@ -410,7 +407,6 @@ class UnicodeRangeStyleValue;
 class UnresolvedStyleValue;
 class URL;
 class URLStyleValue;
-class ViewFunctionStyleValue;
 class VisualViewport;
 
 enum class FontFeatureValueType : u8;
@@ -476,7 +472,6 @@ struct BackgroundLayerData;
 struct CalculationContext;
 struct CalculationResolutionContext;
 struct ComputationContext;
-struct CSSStyleSheetInit;
 struct FunctionParameterInternal;
 struct GridRepeatParams;
 struct LogicalAliasMappingContext;
@@ -496,11 +491,18 @@ using FilterValue = Variant<FilterOperation::Blur, FilterOperation::DropShadow, 
 
 }
 
+namespace Web::CSS::Invalidation {
+
+class StyleInvalidator;
+
+}
+
 namespace Web::CSS::Parser {
 
 class ComponentValue;
 class GuardedSubstitutionContexts;
 class Parser;
+class RustTokenizer;
 class SyntaxNode;
 class Token;
 class Tokenizer;
@@ -562,16 +564,12 @@ class ShadowRoot;
 class SlotRegistry;
 class StaticNodeList;
 class StaticRange;
-class StyleInvalidator;
 class Text;
 class TreeWalker;
 class XMLDocument;
 
 enum class QuirksMode;
 enum class SetNeedsLayoutReason;
-
-struct AddEventListenerOptions;
-struct EventListenerOptions;
 
 }
 
@@ -580,10 +578,6 @@ namespace Web::Encoding {
 class TextDecoder;
 class TextEncoder;
 class TextEncoderStream;
-
-struct TextDecodeOptions;
-struct TextDecoderOptions;
-struct TextEncoderEncodeIntoResult;
 
 }
 
@@ -677,10 +671,6 @@ class DOMRect;
 class DOMRectList;
 class DOMRectReadOnly;
 
-struct DOMMatrix2DInit;
-struct DOMMatrixInit;
-struct DOMPointInit;
-
 }
 
 namespace Web::HTML {
@@ -772,6 +762,7 @@ class HTMLParagraphElement;
 class HTMLParamElement;
 class HTMLParser;
 class HTMLParserEndState;
+class SpeculativeHTMLParser;
 class HTMLPictureElement;
 class HTMLPreElement;
 class HTMLProgressElement;
@@ -827,6 +818,8 @@ class Path2D;
 class Plugin;
 class PluginArray;
 class PopoverTargetAttributes;
+class PreloadEntry;
+struct PreloadKey;
 class PromiseRejectionEvent;
 class RadioNodeList;
 class SelectedFile;
@@ -882,13 +875,10 @@ struct OpenerPolicyEnforcementResult;
 struct PaintConfig;
 struct PolicyContainer;
 struct POSTResource;
-struct ScrollOptions;
-struct ScrollToOptions;
 struct SerializedFormData;
 struct SerializedPolicyContainer;
 struct SerializedTransferRecord;
 struct SourceSnapshotParams;
-struct StructuredSerializeOptions;
 struct ToggleTaskTracker;
 
 }
@@ -934,8 +924,6 @@ namespace Web::IntersectionObserver {
 
 class IntersectionObserver;
 class IntersectionObserverEntry;
-
-struct IntersectionObserverRegistration;
 
 }
 
@@ -989,17 +977,6 @@ namespace Web::MediaCapabilitiesAPI {
 
 class MediaCapabilities;
 
-struct AudioConfiguration;
-struct KeySystemTrackConfiguration;
-struct MediaCapabilitiesDecodingInfo;
-struct MediaCapabilitiesEncodingInfo;
-struct MediaCapabilitiesInfo;
-struct MediaCapabilitiesKeySystemConfiguration;
-struct MediaConfiguration;
-struct MediaDecodingConfiguration;
-struct MediaEncodingConfiguration;
-struct VideoConfiguration;
-
 }
 
 namespace Web::MediaSourceExtensions {
@@ -1029,9 +1006,6 @@ class PerformanceTiming;
 
 namespace Web::NotificationsAPI {
 
-struct NotificationAction;
-struct NotificationOptions;
-
 class Notification;
 
 }
@@ -1052,8 +1026,6 @@ class VideoPaintable;
 class ViewportPaintable;
 
 enum class PaintPhase;
-enum class ShouldAntiAlias : bool;
-
 struct BorderRadiiData;
 struct BorderRadiusData;
 struct LinearGradientData;
@@ -1066,13 +1038,18 @@ class PerformanceEntry;
 class PerformanceObserver;
 class PerformanceObserverEntryList;
 
-struct PerformanceObserverInit;
-
 }
 
 namespace Web::PermissionsPolicy {
 
 class AutoplayAllowlist;
+
+}
+
+namespace Web::PermissionsAPI {
+
+class Permissions;
+class PermissionStatus;
 
 }
 
@@ -1116,13 +1093,6 @@ namespace Web::Serial {
 
 class Serial;
 class SerialPort;
-
-struct SerialPortFilter;
-struct SerialPortRequestOptions;
-struct SerialOptions;
-struct SerialOutputSignals;
-struct SerialInputSignals;
-struct SerialPortInfo;
 
 }
 
@@ -1173,12 +1143,6 @@ class WritableStreamDefaultController;
 class WritableStreamDefaultWriter;
 
 struct PullIntoDescriptor;
-struct QueuingStrategy;
-struct QueuingStrategyInit;
-struct ReadableStreamGetReaderOptions;
-struct Transformer;
-struct UnderlyingSink;
-struct UnderlyingSource;
 
 }
 
@@ -1327,10 +1291,6 @@ class PeriodicWave;
 
 enum class AudioContextState;
 
-struct AudioContextOptions;
-struct DynamicsCompressorOptions;
-struct OscillatorOptions;
-
 }
 
 namespace Web::WebGL {
@@ -1355,11 +1315,6 @@ class WebGLTexture;
 class WebGLTransformFeedback;
 class WebGLUniformLocation;
 class WebGLVertexArrayObject;
-
-}
-
-namespace Web::WebGL::Extensions {
-
 class ANGLEInstancedArrays;
 class EXTBlendMinMax;
 class EXTColorBufferFloat;
@@ -1392,8 +1347,6 @@ using Promise = JS::PromiseCapability;
 }
 
 namespace Web::WebDriver {
-
-class HeapTimer;
 
 struct ActionObject;
 struct InputState;
@@ -1454,7 +1407,6 @@ class TrustedScript;
 class TrustedScriptURL;
 class TrustedTypePolicy;
 class TrustedTypePolicyFactory;
-struct TrustedTypePolicyOptions;
 
 }
 

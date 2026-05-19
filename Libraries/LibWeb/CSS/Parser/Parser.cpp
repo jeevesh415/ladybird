@@ -13,7 +13,7 @@
  */
 
 #include <AK/Debug.h>
-#include <LibGfx/ImmutableBitmap.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/CSS/CSSFontFeatureValuesRule.h>
 #include <LibWeb/CSS/CSSFunctionDeclarations.h>
@@ -1876,13 +1876,12 @@ RefPtr<StyleValue const> Parser::parse_source_size_value(TokenStream<ComponentVa
         return KeywordStyleValue::create(Keyword::Auto);
     }
 
-    if (auto parsed = parse_length_value(tokens)) {
-        // https://html.spec.whatwg.org/multipage/images.html#valid-source-size-list
-        // "A <source-size-value> that is a <length> must not be negative,
-        // and must not use CSS functions other than the math functions."
-        if (parsed->is_length() && parsed->as_length().length().raw_value() < 0)
-            return {};
-
+    // https://html.spec.whatwg.org/multipage/images.html#valid-source-size-list
+    // "A <source-size-value> that is a <length> must not be negative,
+    // and must not use CSS functions other than the math functions."
+    if (auto parsed = parse_length_value(tokens, non_negative_range)) {
+        // FIXME: It seems odd that we disallow infinite calculated values here rather than clamping as we do for all
+        //        other values - is this correct?
         if (parsed->is_calculated()) {
             // https://drafts.csswg.org/css-values-4/#calc-range
             // "the value resulting from a top-level calculation must be
@@ -2059,7 +2058,7 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
         // 3. If size is auto, and img is not null, and img is being rendered, and img allows auto-sizes,
         //    then set size to the concrete object size width of img, in CSS pixels.
         // FIXME: "img is being rendered" - we just see if it has a bitmap for now
-        if (size->has_auto() && img && img->immutable_bitmap() && img->allows_auto_sizes()) {
+        if (size->has_auto() && img && img->current_image_frame().has_value() && img->allows_auto_sizes()) {
             // FIXME: The spec doesn't seem to tell us how to determine the concrete size of an <img>, so use the default sizing algorithm.
             //        Should this use some of the methods from FormattingContext?
             auto concrete_size = run_default_sizing_algorithm(
@@ -2101,7 +2100,7 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
         // "If the result of any of the above productions is used in any
         // context that expects a two-valued boolean, 'unknown' must be
         // converted to 'false'."
-        if (m_document && !media_condition->evaluate_to_boolean(m_document))
+        if (m_document && !media_condition->evaluate_to_boolean({ .document = m_document }))
             continue;
 
         // 5. If size is not auto, then return size. Otherwise, continue.

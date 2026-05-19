@@ -8,8 +8,7 @@
 
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGElementPrototype.h>
-#include <LibWeb/CSS/CascadedProperties.h>
+#include <LibWeb/Bindings/SVGElement.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -133,9 +132,9 @@ bool SVGElement::is_presentational_hint(FlyString const& name) const
     return any_of(attribute_style_properties(), [&](auto& property) { return name.equals_ignoring_ascii_case(property.name); });
 }
 
-void SVGElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperties> cascaded_properties) const
+void SVGElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
-    Base::apply_presentational_hints(cascaded_properties);
+    Base::apply_presentational_hints(properties);
     CSS::Parser::ParsingParams parsing_context { document(), CSS::Parser::ParsingMode::SVGPresentationAttribute };
     for_each_attribute([&](auto& name, auto& value) {
         for (auto& property : attribute_style_properties()) {
@@ -145,10 +144,10 @@ void SVGElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperties> cas
                 continue;
             if (property.id == CSS::PropertyID::Mask) {
                 if (auto style_value = parse_css_value(parsing_context, value, CSS::PropertyID::Mask))
-                    cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Mask, style_value.release_nonnull());
+                    properties.append({ .property_id = CSS::PropertyID::Mask, .value = style_value.release_nonnull() });
             } else {
                 if (auto style_value = parse_css_value(parsing_context, value, property.id))
-                    cascaded_properties->set_property_from_presentational_hint(property.id, style_value.release_nonnull());
+                    properties.append({ .property_id = property.id, .value = style_value.release_nonnull() });
             }
             break;
         }
@@ -196,14 +195,14 @@ Optional<ARIA::Role> SVGElement::default_role() const
 void SVGElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    HTMLOrSVGElement::visit_edges(visitor);
+    HTMLOrSVGOrMathMLElement::visit_edges(visitor);
     visitor.visit(m_class_name_animated_string);
 }
 
 void SVGElement::attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(local_name, old_value, value, namespace_);
-    HTMLOrSVGElement::attribute_changed(local_name, old_value, value, namespace_);
+    HTMLOrSVGOrMathMLElement::attribute_changed(local_name, old_value, value, namespace_);
 
     update_use_elements_that_reference_this();
 }
@@ -211,14 +210,14 @@ void SVGElement::attribute_changed(FlyString const& local_name, Optional<String>
 WebIDL::ExceptionOr<void> SVGElement::cloned(DOM::Node& copy, bool clone_children) const
 {
     TRY(Base::cloned(copy, clone_children));
-    TRY(HTMLOrSVGElement::cloned(copy, clone_children));
+    TRY(HTMLOrSVGOrMathMLElement::cloned(copy, clone_children));
     return {};
 }
 
 void SVGElement::inserted()
 {
     Base::inserted();
-    HTMLOrSVGElement::inserted();
+    HTMLOrSVGOrMathMLElement::inserted();
 
     update_use_elements_that_reference_this();
 }
@@ -253,9 +252,9 @@ void SVGElement::update_use_elements_that_reference_this()
     });
 }
 
-void SVGElement::removed_from(Node* old_parent, Node& old_root)
+void SVGElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, Node& old_root)
 {
-    Base::removed_from(old_parent, old_root);
+    Base::removed_from(is_subtree_root, old_ancestor, old_root);
 
     auto is_use_element_shadow_root = [](Node& node) {
         auto* shadow_root = as_if<DOM::ShadowRoot>(node);

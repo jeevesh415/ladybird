@@ -133,7 +133,7 @@
           "type": "git",
           "url": "https://chromium.googlesource.com/angle/angle",
           "commit": "79ac1a8cd767a32cce6401203e20c4bd4ca4d539",
-          "branch": "chromium/7258_13",
+          "x-branch": "chromium/7258_13",
           "dest": "angle",
           "disable-submodules": true
         },
@@ -435,7 +435,7 @@
           {
             "type": "git",
             "url": "https://github.com/google/highway.git",
-            "tag": "1.3.0",
+            "tag": "1.4.0",
             "disable-submodules": true
           }
         ],
@@ -493,8 +493,8 @@
         {
           "type": "git",
           "url": "https://skia.googlesource.com/skia.git",
-          "commit": "e06a109cc972333266da5e531ebf08255231283b",
-          "branch": "chrome/m144"
+          "commit": "cd0c5f445516ea4e90e02b5f634cbc5ca23b5a44",
+          "x-branch": "chrome/m144"
         },
         {
           "type": "file",
@@ -674,6 +674,38 @@
         "-DMI_INSTALL_TOPLEVEL=ON",
         "-DMI_OVERRIDE=OFF",
         "-DMI_USE_CXX=ON"
+      ]
+    },
+    {
+      "name": "pdfjs",
+      "buildsystem": "simple",
+      "build-commands": [
+        "patch -p1 -i 0001-ladybird-embed.patch",
+        "install -d /app/share/pdfjs/build /app/share/pdfjs/web/images /app/share/pdfjs/web/locale/en-US",
+        "install -m644 build/*.mjs /app/share/pdfjs/build/",
+        "install -m644 web/viewer.html web/viewer.mjs web/viewer.css /app/share/pdfjs/web/",
+        "cp -r web/images/. /app/share/pdfjs/web/images/",
+        "install -m644 web/locale/locale.json /app/share/pdfjs/web/locale/",
+        "install -m644 web/locale/en-US/viewer.ftl /app/share/pdfjs/web/locale/en-US/"
+      ],
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://github.com/mozilla/pdf.js.git",
+          "tag": "v5.6.205",
+          "dest": "pdfjs-src"
+        },
+        {
+          "type": "archive",
+          "url": "https://github.com/mozilla/pdf.js/releases/download/v5.6.205/pdfjs-5.6.205-dist.zip",
+          "sha256": "0555ef47464e456125dcd0b9742cfa2aaed6d282e804e4dd1f1b99316b46ac00",
+          "dest": ".",
+          "strip-components": 0
+        },
+        {
+          "type": "file",
+          "path": "../vcpkg/overlay-ports/pdfjs/0001-ladybird-embed.patch"
+        }
       ]
     },
     {

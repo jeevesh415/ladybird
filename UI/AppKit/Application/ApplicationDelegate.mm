@@ -88,6 +88,9 @@
 
     if (url.has_value()) {
         [controller loadURL:*url];
+
+        if (*url != WebView::Application::settings().new_tab_page_url())
+            [controller focusWebView];
     }
 
     return controller;
@@ -103,6 +106,8 @@
     if (url.has_value()) {
         [controller loadURL:*url];
     }
+
+    [controller focusWebView];
 
     return controller;
 }
@@ -231,9 +236,7 @@
 
 - (void)clearHistory:(id)sender
 {
-    for (TabController* controller in self.managed_tabs) {
-        [controller clearHistory];
-    }
+    WebView::Application::the().clear_history();
 }
 
 - (NSMenuItem*)createApplicationMenu
@@ -296,10 +299,7 @@
                                          keyEquivalent:@"y"]];
     [submenu addItem:[NSMenuItem separatorItem]];
 
-    [submenu addItem:[[NSMenuItem alloc] initWithTitle:@"Cut"
-                                                action:@selector(cut:)
-                                         keyEquivalent:@"x"]];
-
+    [submenu addItem:Ladybird::create_application_menu_item(WebView::Application::the().cut_selection_action())];
     [submenu addItem:Ladybird::create_application_menu_item(WebView::Application::the().copy_selection_action())];
     [submenu addItem:Ladybird::create_application_menu_item(WebView::Application::the().paste_action())];
     [submenu addItem:[NSMenuItem separatorItem]];

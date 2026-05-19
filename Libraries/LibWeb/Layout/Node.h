@@ -7,10 +7,14 @@
 
 #pragma once
 
+#include <AK/DoublyLinkedList.h>
+#include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Vector.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/DisplayListRecordingContext.h>
@@ -62,16 +66,26 @@ public:
         m_pseudo_element_generator = &element;
     }
 
-    using PaintableList = IntrusiveList<&Painting::Paintable::m_list_node>;
+    using PaintableList = DoublyLinkedList<NonnullRefPtr<Painting::Paintable>>;
 
-    Painting::Paintable* first_paintable() { return m_paintable.first(); }
-    Painting::Paintable const* first_paintable() const { return m_paintable.first(); }
+    RefPtr<Painting::Paintable> first_paintable()
+    {
+        if (m_paintable.is_empty())
+            return nullptr;
+        return m_paintable.first();
+    }
+    RefPtr<Painting::Paintable const> first_paintable() const
+    {
+        if (m_paintable.is_empty())
+            return nullptr;
+        return m_paintable.first();
+    }
     PaintableList& paintables() { return m_paintable; }
     PaintableList const& paintables() const { return m_paintable; }
-    void add_paintable(GC::Ptr<Painting::Paintable>);
+    void add_paintable(RefPtr<Painting::Paintable>);
     void clear_paintables();
 
-    virtual GC::Ptr<Painting::Paintable> create_paintable() const;
+    virtual RefPtr<Painting::Paintable> create_paintable() const;
 
     DOM::Document& document();
     DOM::Document const& document() const;
@@ -265,6 +279,21 @@ class WEB_API NodeWithStyle : public Node {
 public:
     virtual ~NodeWithStyle() override = default;
 
+    static constexpr bool OVERRIDES_FINALIZE = true;
+
+    class ImageObserver final : public CSS::ImageStyleValue::Client {
+    public:
+        ImageObserver(NodeWithStyle&, NonnullRefPtr<CSS::ImageStyleValue const> image);
+        virtual ~ImageObserver() override;
+
+        virtual void image_style_value_did_update(CSS::ImageStyleValue&) override;
+        void visit_edges(JS::Cell::Visitor&) const;
+
+    private:
+        GC::Weak<NodeWithStyle> m_owner;
+        NonnullRefPtr<CSS::ImageStyleValue const> m_image;
+    };
+
     CSS::ImmutableComputedValues const& computed_values() const { return static_cast<CSS::ImmutableComputedValues const&>(*m_computed_values); }
     CSS::MutableComputedValues& mutable_computed_values() { return static_cast<CSS::MutableComputedValues&>(*m_computed_values); }
 
@@ -295,13 +324,17 @@ protected:
 
 private:
     virtual bool is_node_with_style() const final { return true; }
+    virtual void finalize() override;
 
     void reset_table_box_computed_values_used_by_wrapper_to_init_values();
     void propagate_non_inherit_values(NodeWithStyle& target_node) const;
     void propagate_style_to_anonymous_wrappers();
 
+    void rebuild_image_observers();
+
     NonnullOwnPtr<CSS::ComputedValues> m_computed_values;
     RefPtr<CSS::AbstractImageStyleValue const> m_list_style_image;
+    Vector<NonnullOwnPtr<ImageObserver>> m_image_observers;
     u32 m_layout_index { 0 };
 };
 

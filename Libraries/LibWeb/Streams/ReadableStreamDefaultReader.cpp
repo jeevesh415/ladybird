@@ -14,7 +14,7 @@
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/ReadableStreamDefaultReaderPrototype.h>
+#include <LibWeb/Bindings/ReadableStreamDefaultReader.h>
 #include <LibWeb/Fetch/Infrastructure/IncrementalReadLoopReadRequest.h>
 #include <LibWeb/Streams/ReadableStream.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
@@ -89,7 +89,7 @@ void ReadLoopReadRequest::on_chunk(JS::Value chunk)
     }
 
     auto const& array = static_cast<JS::Uint8Array const&>(chunk.as_object());
-    auto const& buffer = array.viewed_array_buffer()->buffer();
+    auto buffer = array.viewed_array_buffer()->bytes().slice(array.byte_offset(), array.byte_length().length());
 
     // 2. Append the bytes represented by chunk to bytes.
     m_bytes.append(buffer);

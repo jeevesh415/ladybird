@@ -29,6 +29,7 @@ enum class ActionID {
     Reload,
 
     CopySelection,
+    CutSelection,
     Paste,
     SelectAll,
 
@@ -57,6 +58,7 @@ enum class ActionID {
     ViewSource,
 
     OpenInNewTab,
+    OpenInNewWindow,
     CopyURL,
 
     OpenImage,

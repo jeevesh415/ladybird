@@ -7,6 +7,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/Layout/Node.h>
@@ -14,6 +16,7 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/BackgroundPainting.h>
 #include <LibWeb/Painting/Blending.h>
+#include <LibWeb/Painting/BorderRadiusCornerClipper.h>
 #include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
 
@@ -29,7 +32,7 @@ static void append_text_clip_paths(DisplayListRecordingContext& context, Paintab
             if (!layout_node.is_in_flow() && !layout_node.is_floating())
                 return TraversalDecision::SkipChildrenAndContinue;
         }
-        if (auto* paintable_lines = as_if<PaintableWithLines>(sub_paintable)) {
+        if (auto const* paintable_lines = as_if<PaintableWithLines>(sub_paintable)) {
             for (auto const& fragment : paintable_lines->fragments()) {
                 if (!is<Layout::TextNode>(fragment.layout_node()))
                     continue;
@@ -143,7 +146,7 @@ void paint_background(DisplayListRecordingContext& context, PaintableBox const& 
 
         CSSPixelRect const& css_clip_rect = clip_box.rect;
         auto clip_rect = context.rounded_device_rect(css_clip_rect);
-        ScopedCornerRadiusClip corner_clip { context, context.rounded_device_rect(css_clip_rect), clip_box.radii, CornerClip::Outside, !is_root_element };
+        ScopedCornerRadiusClip corner_clip { context, context.rounded_device_rect(css_clip_rect), clip_box.radii, Gfx::CornerClip::Outside, !is_root_element };
         if (!is_root_element) {
             display_list_recorder.add_clip_rect(clip_rect.to_type<int>());
 
@@ -158,9 +161,15 @@ void paint_background(DisplayListRecordingContext& context, PaintableBox const& 
         auto image_rect = layer.image_rect;
         auto background_positioning_area = layer.background_positioning_area;
 
+        auto original_context = display_list_recorder.accumulated_visual_context();
+        ScopeGuard restore_context = [&] {
+            display_list_recorder.set_accumulated_visual_context(original_context);
+        };
+
         switch (layer.attachment) {
         case CSS::BackgroundAttachment::Fixed:
-            background_positioning_area.set_location(paintable_box.layout_node().root().navigable()->viewport_scroll_offset());
+            if (auto fixed_context = paintable_box.fixed_background_visual_context(); fixed_context.has_value())
+                display_list_recorder.set_accumulated_visual_context(*fixed_context);
             break;
         case CSS::BackgroundAttachment::Local:
             if (!paintable_box.is_viewport_paintable()) {
@@ -304,9 +313,11 @@ void paint_background(DisplayListRecordingContext& context, PaintableBox const& 
             if (dest_rect.height() == 0)
                 dest_rect.set_height(1);
 
-            auto const* bitmap = static_cast<CSS::ImageStyleValue const&>(image).current_frame_bitmap(dest_rect);
-            auto scaling_mode = to_gfx_scaling_mode(image_rendering, bitmap->size(), dest_rect.size().to_type<int>());
-            context.display_list_recorder().draw_repeated_immutable_bitmap(dest_rect.to_type<int>(), clip_rect.to_type<int>(), *bitmap, scaling_mode, repeat_x, repeat_y);
+            auto frame = static_cast<CSS::ImageStyleValue const&>(image).current_frame(dest_rect);
+            if (!frame.has_value())
+                return;
+            auto scaling_mode = to_gfx_scaling_mode(image_rendering, frame->size(), dest_rect.size().to_type<int>());
+            context.display_list_recorder().draw_repeated_decoded_image_frame(dest_rect.to_type<int>(), clip_rect.to_type<int>(), *frame, scaling_mode, repeat_x, repeat_y);
         } else {
             for_each_image_device_rect([&](auto const& image_device_rect) {
                 image.paint(context, image_device_rect, image_rendering);
@@ -345,6 +356,18 @@ ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> co
             continue;
 
         auto background_positioning_area = get_box(layer.origin, border_box, paintable_box).rect;
+
+        // https://drafts.csswg.org/css-backgrounds-3/#background-origin
+        // If the background-attachment value for this layer is fixed, then this property has no effect: in this case
+        // the background positioning area is the initial containing block.
+        if (layer.attachment == CSS::BackgroundAttachment::Fixed
+            && paintable_box.fixed_background_visual_context().has_value()) {
+            if (auto navigable = paintable_box.navigable()) {
+                auto viewport_size = navigable->viewport_rect().size();
+                background_positioning_area = CSSPixelRect { { 0, 0 }, viewport_size };
+            }
+        }
+
         auto const& image = *layer.background_image;
 
         Optional<CSSPixels> specified_width {};

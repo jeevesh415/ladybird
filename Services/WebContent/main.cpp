@@ -21,6 +21,7 @@
 #include <LibRequests/RequestClient.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/Window.h>
@@ -28,7 +29,6 @@
 #include <LibWeb/Loader/ContentFilter.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/Painting/BackingStoreManager.h>
 #include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
@@ -131,8 +131,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
-    StringView command_line {};
-    StringView executable_path {};
     auto config_path = ByteString::formatted("{}/ladybird/default-config", WebView::s_ladybird_resource_root);
     StringView mach_server_name {};
     Vector<ByteString> certificates;
@@ -149,13 +147,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     bool collect_garbage_on_every_allocation = false;
     bool is_headless = false;
     bool disable_scrollbar_painting = false;
+    bool disable_async_scrolling = false;
     StringView echo_server_port_string_view {};
     StringView default_time_zone {};
+    StringView style_invalidation_counter_dump_interval {};
     bool file_origins_are_tuple_origins = false;
 
     Core::ArgsParser args_parser;
-    args_parser.add_option(command_line, "Browser process command line", "command-line", 0, "command_line");
-    args_parser.add_option(executable_path, "Browser process executable path", "executable-path", 0, "executable_path");
     args_parser.add_option(config_path, "Ladybird configuration path", "config-path", 0, "config_path");
     args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
@@ -171,9 +169,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation");
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical viewport scrollbars", "disable-scrollbar-painting");
+    args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
     args_parser.add_option(echo_server_port_string_view, "Echo server port used in test internals", "echo-server-port", 0, "echo_server_port");
     args_parser.add_option(is_headless, "Report that the browser is running in headless mode", "headless");
     args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
+    args_parser.add_option(style_invalidation_counter_dump_interval, "Dump style invalidation counters after every N style invalidations", "dump-style-invalidation-counters", 0, "N");
     args_parser.add_option(file_origins_are_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
 
     args_parser.parse(arguments);
@@ -187,6 +187,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             dbgln("Failed to set default time zone: {}", result.error());
     }
 
+    if (!style_invalidation_counter_dump_interval.is_empty()) {
+        auto interval = style_invalidation_counter_dump_interval.to_number<u64>();
+        if (!interval.has_value() || *interval == 0)
+            VERIFY_NOT_REACHED();
+        Web::DOM::Document::set_style_invalidation_counter_dump_interval(*interval);
+    }
+
     if (file_origins_are_tuple_origins)
         URL::set_file_scheme_urls_have_tuple_origins();
 
@@ -195,9 +202,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         font_provider.set_name_but_fixme_should_create_custom_system_font_provider("FontConfig"_string);
     }
     font_provider.load_all_fonts_from_uri("resource://fonts"sv);
-
-    Web::set_browser_process_command_line(command_line);
-    Web::set_browser_process_executable_path(executable_path);
 
     // Always use the CPU backend for tests, as the GPU backend is not deterministic
     if (force_cpu_painting) {
@@ -216,6 +220,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         Web::Fetch::Fetching::set_http_memory_cache_enabled(true);
 
     Web::Painting::set_paint_viewport_scrollbars(!disable_scrollbar_painting);
+    WebContent::PageClient::set_async_scrolling_enabled(!disable_async_scrolling);
 
     if (!echo_server_port_string_view.is_empty()) {
         if (auto maybe_echo_server_port = echo_server_port_string_view.to_number<u16>(); maybe_echo_server_port.has_value())

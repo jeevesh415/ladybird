@@ -31,7 +31,9 @@
 #include <LibWeb/CSS/StyleValues/CursorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShadowStyleValue.h>
+#include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
+#include <LibWeb/CSS/StyleValues/URLStyleValue.h>
 #include <LibWeb/CSS/URL.h>
 
 namespace Web::CSS {
@@ -144,6 +146,22 @@ private:
 
 using CursorData = Variant<NonnullRefPtr<CursorStyleValue const>, CursorPredefined>;
 
+struct OverflowClipMarginSide {
+    Optional<BackgroundBox> visual_box {};
+    Length offset { Length::make_px(0) };
+
+    bool operator==(OverflowClipMarginSide const&) const = default;
+};
+
+struct OverflowClipMarginData {
+    OverflowClipMarginSide left;
+    OverflowClipMarginSide top;
+    OverflowClipMarginSide right;
+    OverflowClipMarginSide bottom;
+
+    bool operator==(OverflowClipMarginData const&) const = default;
+};
+
 using ListStyleType = Variant<Empty, RefPtr<CounterStyle const>, String>;
 
 class InitialValues {
@@ -226,7 +244,7 @@ public:
     static LengthBox inset() { return {}; }
     static LengthBox margin() { return { Length::make_px(0), Length::make_px(0), Length::make_px(0), Length::make_px(0) }; }
     static LengthBox padding() { return { Length::make_px(0), Length::make_px(0), Length::make_px(0), Length::make_px(0) }; }
-    static LengthBox overflow_clip_margin() { return { Length::make_px(0), Length::make_px(0), Length::make_px(0), Length::make_px(0) }; }
+    static OverflowClipMarginData overflow_clip_margin() { return {}; }
     static Size width() { return Size::make_auto(); }
     static Size min_width() { return Size::make_auto(); }
     static Size max_width() { return Size::make_none(); }
@@ -267,6 +285,7 @@ public:
     static UserSelect user_select() { return UserSelect::Auto; }
     static Isolation isolation() { return Isolation::Auto; }
     static Containment contain() { return {}; }
+    static Vector<FlyString> container_name() { return {}; }
     static ContainerType container_type() { return {}; }
     static MixBlendMode mix_blend_mode() { return MixBlendMode::Normal; }
     static Optional<int> z_index() { return OptionalNone(); }
@@ -308,6 +327,25 @@ enum class BackgroundSize {
 // https://svgwg.org/svg2-draft/painting.html#SpecifyingPaint
 class SVGPaint {
 public:
+    static SVGPaint from_style_value(NonnullRefPtr<StyleValue const> const& style_value, ColorResolutionContext const& color_resolution_context)
+    {
+        if (style_value->has_color())
+            return style_value->to_color(color_resolution_context).value();
+
+        if (style_value->is_value_list()) {
+            auto const& values = style_value->as_value_list().values();
+
+            VERIFY(values.size() == 2);
+
+            if (values[1]->is_empty_optional())
+                return values[0]->as_url().url();
+
+            return { values[0]->as_url().url(), values[1]->to_color(color_resolution_context) };
+        }
+
+        VERIFY_NOT_REACHED();
+    }
+
     SVGPaint(Color color)
         : m_value(color)
     {
@@ -637,6 +675,7 @@ public:
     UserSelect user_select() const { return m_noninherited.user_select; }
     Isolation isolation() const { return m_noninherited.isolation; }
     Containment const& contain() const { return m_noninherited.contain; }
+    Vector<FlyString> const& container_name() const { return m_noninherited.container_name; }
     ContainerType const& container_type() const { return m_noninherited.container_type; }
     MixBlendMode mix_blend_mode() const { return m_noninherited.mix_blend_mode; }
     Optional<FlyString> view_transition_name() const { return m_noninherited.view_transition_name; }
@@ -646,7 +685,7 @@ public:
     LengthBox const& inset() const { return m_noninherited.inset; }
     LengthBox const& margin() const { return m_noninherited.margin; }
     LengthBox const& padding() const { return m_noninherited.padding; }
-    LengthBox const& overflow_clip_margin() const { return m_noninherited.overflow_clip_margin; }
+    OverflowClipMarginData const& overflow_clip_margin() const { return m_noninherited.overflow_clip_margin; }
 
     BorderData const& border_left() const { return m_noninherited.border_left; }
     BorderData const& border_top() const { return m_noninherited.border_top; }
@@ -842,7 +881,7 @@ protected:
         LengthBox inset { InitialValues::inset() };
         LengthBox margin { InitialValues::margin() };
         LengthBox padding { InitialValues::padding() };
-        LengthBox overflow_clip_margin { InitialValues::overflow_clip_margin() };
+        OverflowClipMarginData overflow_clip_margin { InitialValues::overflow_clip_margin() };
         Filter backdrop_filter { InitialValues::backdrop_filter() };
         Filter filter { InitialValues::filter() };
         BorderData border_left;
@@ -908,6 +947,7 @@ protected:
         UserSelect user_select { InitialValues::user_select() };
         Isolation isolation { InitialValues::isolation() };
         Containment contain { InitialValues::contain() };
+        Vector<FlyString> container_name { InitialValues::container_name() };
         ContainerType container_type { InitialValues::container_type() };
         MixBlendMode mix_blend_mode { InitialValues::mix_blend_mode() };
         WhiteSpaceTrimData white_space_trim;
@@ -1029,7 +1069,7 @@ public:
     void set_inset(LengthBox const& inset) { m_noninherited.inset = inset; }
     void set_margin(LengthBox const& margin) { m_noninherited.margin = margin; }
     void set_padding(LengthBox const& padding) { m_noninherited.padding = padding; }
-    void set_overflow_clip_margin(LengthBox const& overflow_clip_margin) { m_noninherited.overflow_clip_margin = overflow_clip_margin; }
+    void set_overflow_clip_margin(OverflowClipMarginData const& overflow_clip_margin) { m_noninherited.overflow_clip_margin = overflow_clip_margin; }
     void set_overflow_x(Overflow value) { m_noninherited.overflow_x = value; }
     void set_overflow_y(Overflow value) { m_noninherited.overflow_y = value; }
     void set_list_style_type(ListStyleType value) { m_inherited.list_style_type = move(value); }
@@ -1128,13 +1168,14 @@ public:
     void set_user_select(UserSelect value) { m_noninherited.user_select = value; }
     void set_isolation(Isolation value) { m_noninherited.isolation = value; }
     void set_contain(Containment value) { m_noninherited.contain = move(value); }
+    void set_container_name(Vector<FlyString> value) { m_noninherited.container_name = move(value); }
     void set_container_type(ContainerType value) { m_noninherited.container_type = move(value); }
     void set_mix_blend_mode(MixBlendMode value) { m_noninherited.mix_blend_mode = value; }
     void set_view_transition_name(Optional<FlyString> value) { m_noninherited.view_transition_name = move(value); }
     void set_touch_action(TouchActionData value) { m_noninherited.touch_action = value; }
 
-    void set_fill(SVGPaint value) { m_inherited.fill = move(value); }
-    void set_stroke(SVGPaint value) { m_inherited.stroke = move(value); }
+    void set_fill(Optional<SVGPaint> value) { m_inherited.fill = move(value); }
+    void set_stroke(Optional<SVGPaint> value) { m_inherited.stroke = move(value); }
     void set_fill_rule(FillRule value) { m_inherited.fill_rule = value; }
     void set_fill_opacity(float value) { m_inherited.fill_opacity = value; }
     void set_stroke_dasharray(Vector<Variant<LengthPercentage, float>> value) { m_inherited.stroke_dasharray = move(value); }

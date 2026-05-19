@@ -7,7 +7,7 @@
 
 #include <AK/Random.h>
 #include <LibJS/Runtime/TypedArray.h>
-#include <LibWeb/Bindings/CryptoPrototype.h>
+#include <LibWeb/Bindings/Crypto.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/Crypto/SubtleCrypto.h>
@@ -70,7 +70,7 @@ WebIDL::ExceptionOr<GC::Root<WebIDL::ArrayBufferView>> Crypto::get_random_values
         return WebIDL::QuotaExceededError::create(realm(), "array's byteLength may not be greater than 65536"_utf16);
 
     // 3. Overwrite all elements of array with cryptographically strong random values of the appropriate type.
-    fill_with_random(array->viewed_array_buffer()->buffer().bytes().slice(array->byte_offset(), array->byte_length()));
+    fill_with_random(array->viewed_array_buffer()->bytes().slice(array->byte_offset(), array->byte_length()));
 
     // 4. Return array.
     return array;

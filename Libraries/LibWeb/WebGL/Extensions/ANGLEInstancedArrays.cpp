@@ -5,7 +5,7 @@
  */
 
 #include <LibJS/Runtime/Realm.h>
-#include <LibWeb/Bindings/ANGLEInstancedArraysPrototype.h>
+#include <LibWeb/Bindings/ANGLEInstancedArrays.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/WebGL/Extensions/ANGLEInstancedArrays.h>
 #include <LibWeb/WebGL/OpenGLContext.h>
@@ -15,7 +15,7 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
 GC_DEFINE_ALLOCATOR(ANGLEInstancedArrays);
 

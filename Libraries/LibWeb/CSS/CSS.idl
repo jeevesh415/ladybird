@@ -1,5 +1,5 @@
-#import <CSS/CSSUnitValue.idl>
-#import <CSS/GeneratedCSSNumericFactoryMethods.idl>
+// https://drafts.csswg.org/cssom-1/#cssomstring
+typedef DOMString CSSOMString;
 
 dictionary PropertyDefinition {
     required CSSOMString name;

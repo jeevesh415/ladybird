@@ -19,7 +19,8 @@
 #include <LibJS/Runtime/GlobalObject.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/Origin.h>
-#include <LibWeb/Bindings/XMLHttpRequestPrototype.h>
+#include <LibWeb/Bindings/ProgressEvent.h>
+#include <LibWeb/Bindings/XMLHttpRequest.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoading.h>
 #include <LibWeb/DOM/Event.h>
@@ -105,7 +106,7 @@ static void fire_progress_event(XMLHttpRequestEventTarget& target, FlyString con
     // To fire a progress event named e at target, given transmitted and length, means to fire an event named e at target, using ProgressEvent,
     // with the loaded attribute initialized to transmitted, and if length is not 0, with the lengthComputable attribute initialized to true
     // and the total attribute initialized to length.
-    ProgressEventInit event_init {};
+    Bindings::ProgressEventInit event_init {};
     event_init.length_computable = length;
     event_init.loaded = transmitted;
     event_init.total = length;
@@ -892,15 +893,15 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(NullableDocumentOrXMLHttpRequestB
         IGNORE_USE_IN_ESCAPING_LAMBDA bool processed_response = false;
 
         // 2. Let processResponseConsumeBody, given a response and nullOrFailureOrBytes, be these steps:
-        auto process_response_consume_body = [this, &processed_response](GC::Ref<Fetch::Infrastructure::Response> response, Variant<Empty, Fetch::Infrastructure::FetchAlgorithms::ConsumeBodyFailureTag, ByteBuffer> null_or_failure_or_bytes) {
+        auto process_response_consume_body = [this, &processed_response](GC::Ref<Fetch::Infrastructure::Response> response, Fetch::Infrastructure::FetchAlgorithms::BodyBytes null_or_failure_or_bytes) {
             // 1. If nullOrFailureOrBytes is not failure, then set this’s response to response.
             if (!null_or_failure_or_bytes.has<Fetch::Infrastructure::FetchAlgorithms::ConsumeBodyFailureTag>())
                 m_response = response;
 
             // 2. If nullOrFailureOrBytes is a byte sequence, then append nullOrFailureOrBytes to this’s received bytes.
-            if (null_or_failure_or_bytes.has<ByteBuffer>()) {
+            if (null_or_failure_or_bytes.has<Core::ImmutableBytes>()) {
                 // NOTE: We are not in a context where we can throw if this fails due to OOM.
-                m_received_bytes.append(null_or_failure_or_bytes.get<ByteBuffer>());
+                m_received_bytes.append(null_or_failure_or_bytes.get<Core::ImmutableBytes>().bytes());
             }
 
             // 3. Set processedResponse to true.

@@ -5,16 +5,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/CSSStylePropertiesPrototype.h>
+#include <LibJS/Runtime/ExternalMemory.h>
+#include <LibWeb/Bindings/CSSStyleProperties.h>
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
 #include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/CSS/CSSRule.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/CSS/StyleValues/FitContentStyleValue.h>
+#include <LibWeb/CSS/StyleSheetInvalidation.h>
+#include <LibWeb/CSS/StyleValues/ColorFunctionStyleValue.h>
+#include <LibWeb/CSS/StyleValues/FunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -124,6 +128,14 @@ void CSSStyleProperties::visit_edges(Visitor& visitor)
     }
 }
 
+size_t CSSStyleProperties::external_memory_size() const
+{
+    auto size = Base::external_memory_size();
+    size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_properties));
+    size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_custom_properties));
+    return size;
+}
+
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-length
 size_t CSSStyleProperties::length() const
 {
@@ -173,7 +185,7 @@ Optional<StyleProperty const&> CSSStyleProperties::custom_property(FlyString con
         auto& element = owner_node()->element();
         auto pseudo_element = owner_node()->pseudo_element();
 
-        element.document().update_style();
+        element.document().update_style_for_element(*owner_node());
 
         auto data = element.custom_property_data(pseudo_element);
         if (!data)
@@ -316,8 +328,8 @@ static NonnullRefPtr<StyleValue const> style_value_for_size(Size const& size)
         return KeywordStyleValue::create(Keyword::MaxContent);
     if (size.is_fit_content()) {
         if (auto available_space = size.fit_content_available_space(); available_space.has_value())
-            return FitContentStyleValue::create(style_value_for_length_percentage(available_space.release_value()));
-        return FitContentStyleValue::create();
+            return FunctionStyleValue::create("fit-content"_fly_string, style_value_for_length_percentage(available_space.release_value()));
+        return KeywordStyleValue::create(Keyword::FitContent);
     }
     TODO();
 }
@@ -572,10 +584,11 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
             // always need update_layout() to ensure both style and layout tree are up to date.
             abstract_element.document().update_layout(DOM::UpdateLayoutReason::ResolvedCSSStyleDeclarationProperty);
             layout_node = abstract_element.layout_node();
-        } else if (abstract_element.document().element_needs_style_update(abstract_element)) {
-            // Just ensure styles are up to date.
-            abstract_element.document().update_style();
         }
+        // Ensure styles are up to date. update_layout()/update_style() skip display:none subtrees,
+        // so the leaf and its inheritance ancestors may still be stale at this point.
+        if (abstract_element.document().element_needs_style_update(abstract_element))
+            abstract_element.document().update_style_for_element(abstract_element);
 
         // FIXME: Somehow get custom properties if there's no layout node.
         if (property_name_and_id.is_custom_property()) {
@@ -584,6 +597,20 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
                     .property_id = property_id,
                     .value = maybe_value.release_nonnull(),
                 };
+            }
+            // Pseudo-elements may have no own custom-property data if the matching rule targeted the originating
+            // element rather than the pseudo-element itself (for example `::slotted(...)`).
+            // In that case, getComputedStyle(..., "::before") still needs to expose inherited custom properties from
+            // the originating element.
+            if (abstract_element.pseudo_element().has_value()) {
+                if (auto inherit_from = abstract_element.element_to_inherit_style_from(); inherit_from.has_value()) {
+                    if (auto maybe_value = inherit_from->get_custom_property(property_name_and_id.name())) {
+                        return StyleProperty {
+                            .property_id = property_id,
+                            .value = maybe_value.release_nonnull(),
+                        };
+                    }
+                }
             }
             // FIXME: Currently, to get the initial value for a registered custom property we have to look at the document.
             //        These should be cascaded like other properties.
@@ -629,11 +656,12 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
 
 static RefPtr<StyleValue const> resolve_color_style_value(StyleValue const& style_value, Color computed_color)
 {
-    if (style_value.is_color_function())
+    if (style_value.is_color_function() && as<ColorFunctionStyleValue>(style_value).serializes_as_color_function())
         return style_value;
     if (style_value.is_color()) {
         auto& color_style_value = static_cast<ColorStyleValue const&>(style_value);
-        if (first_is_one_of(color_style_value.color_type(), ColorStyleValue::ColorType::Lab, ColorStyleValue::ColorType::OKLab, ColorStyleValue::ColorType::LCH, ColorStyleValue::ColorType::OKLCH))
+        if (auto color_type = color_style_value.color_type();
+            color_type.has_value() && first_is_one_of(*color_type, ColorStyleValue::ColorType::Lab, ColorStyleValue::ColorType::OKLab, ColorStyleValue::ColorType::LCH, ColorStyleValue::ColorType::OKLCH))
             return style_value;
     }
 
@@ -649,10 +677,12 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
 
     auto used_value_for_property = [&layout_node, property_id](Function<CSSPixels(Painting::PaintableBox const&)>&& used_value_getter) -> Optional<CSSPixels> {
         auto const& display = layout_node.computed_values().display();
-        if (!display.is_none() && !display.is_contents() && layout_node.first_paintable()) {
-            if (auto const* paintable_box = as_if<Painting::PaintableBox>(layout_node.first_paintable()))
+        if (!display.is_none() && !display.is_contents()) {
+            auto first_paintable = layout_node.first_paintable();
+            if (auto const* paintable_box = as_if<Painting::PaintableBox>(first_paintable.ptr()))
                 return used_value_getter(*paintable_box);
-            dbgln("FIXME: Support getting used value for property `{}` on {}", string_from_property_id(property_id), layout_node.debug_description());
+            if (first_paintable)
+                dbgln("FIXME: Support getting used value for property `{}` on {}", string_from_property_id(property_id), layout_node.debug_description());
         }
         return {};
     };
@@ -876,8 +906,9 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
         auto transform = FloatMatrix4x4::identity();
 
         // 2. Post-multiply all <transform-function>s in <transform-list> to transform.
-        VERIFY(layout_node.first_paintable());
-        auto const& paintable_box = as<Painting::PaintableBox const>(*layout_node.first_paintable());
+        auto first_paintable = layout_node.first_paintable();
+        VERIFY(first_paintable);
+        auto const& paintable_box = as<Painting::PaintableBox const>(*first_paintable);
         for (auto const& transformation : transformations) {
             transform = transform * transformation->to_matrix(paintable_box).release_value();
         }
@@ -1010,16 +1041,14 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
         // For grid-template-columns and grid-template-rows the resolved value is the used value.
         // https://www.w3.org/TR/css-grid-2/#resolved-track-list-standalone
         if (property_id == PropertyID::GridTemplateColumns) {
-            if (layout_node.first_paintable() && layout_node.first_paintable()->is_paintable_box()) {
-                auto const& paintable_box = as<Painting::PaintableBox const>(*layout_node.first_paintable());
-                if (auto used_values_for_grid_template_columns = paintable_box.used_values_for_grid_template_columns()) {
+            if (auto first_paintable = layout_node.first_paintable(); auto const* paintable_box = as_if<Painting::PaintableBox>(first_paintable.ptr())) {
+                if (auto used_values_for_grid_template_columns = paintable_box->used_values_for_grid_template_columns()) {
                     return used_values_for_grid_template_columns;
                 }
             }
         } else if (property_id == PropertyID::GridTemplateRows) {
-            if (layout_node.first_paintable() && layout_node.first_paintable()->is_paintable_box()) {
-                auto const& paintable_box = as<Painting::PaintableBox const>(*layout_node.first_paintable());
-                if (auto used_values_for_grid_template_rows = paintable_box.used_values_for_grid_template_rows()) {
+            if (auto first_paintable = layout_node.first_paintable(); auto const* paintable_box = as_if<Painting::PaintableBox>(first_paintable.ptr())) {
+                if (auto used_values_for_grid_template_rows = paintable_box->used_values_for_grid_template_rows()) {
                     return used_values_for_grid_template_rows;
                 }
             }
@@ -1400,6 +1429,11 @@ void CSSStyleProperties::invalidate_owners(DOM::StyleInvalidationReason reason)
 {
     if (auto rule = parent_rule()) {
         if (auto sheet = rule->parent_style_sheet()) {
+            if (rule->type() == CSSRule::Type::Style || rule->type() == CSSRule::Type::NestedDeclarations) {
+                invalidate_style_for_style_sheet_owners(*sheet, reason, ShouldInvalidateRuleCache::No);
+                return;
+            }
+
             sheet->invalidate_owners(reason);
         }
     }

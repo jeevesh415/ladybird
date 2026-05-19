@@ -9,7 +9,10 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <LibGC/Weak.h>
+#include <LibGfx/DecodedImageFrame.h>
+#include <LibGfx/Forward.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/URL.h>
@@ -26,14 +29,14 @@ class ImageStyleValue final
 public:
     class Client {
     public:
-        Client(ImageStyleValue&);
+        Client(ImageStyleValue const&);
         virtual ~Client();
         virtual void image_style_value_did_update(ImageStyleValue&) = 0;
 
     protected:
         void image_style_value_finalize();
 
-        ImageStyleValue& m_image_style_value;
+        ImageStyleValue const& m_image_style_value;
     };
 
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(URL const&);
@@ -57,7 +60,7 @@ public:
     void paint(DisplayListRecordingContext& context, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering) const override;
 
     virtual Optional<Gfx::Color> color_if_single_pixel_bitmap() const override;
-    Gfx::ImmutableBitmap const* current_frame_bitmap(DevicePixelRect const& dest_rect) const;
+    Optional<Gfx::DecodedImageFrame> current_frame(DevicePixelRect const& dest_rect) const;
 
     mutable Function<void()> on_animate;
 
@@ -68,14 +71,14 @@ private:
 
     ImageStyleValue(URL const&);
 
-    void register_client(Client&);
-    void unregister_client(Client&);
+    void register_client(Client&) const;
+    void unregister_client(Client&) const;
 
     virtual void set_style_sheet(GC::Ptr<CSSStyleSheet>) override;
 
     virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
     void animate();
-    Gfx::ImmutableBitmap const* bitmap(size_t frame_index, Gfx::IntSize = {}) const;
+    Optional<Gfx::DecodedImageFrame> frame(size_t frame_index, Gfx::IntSize = {}) const;
 
     GC::Ptr<HTML::SharedResourceRequest> m_resource_request;
     GC::Ptr<CSSStyleSheet> m_style_sheet;
@@ -87,7 +90,7 @@ private:
     size_t m_loops_completed { 0 };
     GC::Ptr<Platform::Timer> m_timer;
 
-    HashTable<Client*> m_clients;
+    mutable HashTable<Client*> m_clients;
 };
 
 }

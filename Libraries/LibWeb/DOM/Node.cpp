@@ -14,12 +14,15 @@
 #include <LibGC/DeferGC.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibJS/Runtime/FunctionObject.h>
 #include <LibWeb/Animations/Animation.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/Bindings/NodePrototype.h>
+#include <LibWeb/Bindings/Node.h>
 #include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/Invalidation/NodeInvalidator.h>
+#include <LibWeb/CSS/Invalidation/StructuralMutationInvalidator.h>
+#include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/AccessibilityTreeNode.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/CDATASection.h>
@@ -39,7 +42,6 @@
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/StaticNodeList.h>
-#include <LibWeb/DOM/StyleInvalidator.h>
 #include <LibWeb/DOM/XMLDocument.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
@@ -63,6 +65,7 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/XMLSerializer.h>
 #include <LibWeb/Infra/CharacterTypes.h>
+#include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/MathML/MathMLElement.h>
@@ -104,6 +107,9 @@ Node::Node(JS::Realm& realm, Document& document, NodeType type)
     , m_type(type)
     , m_unique_id(allocate_unique_id(this))
 {
+    // A Document is its own shadow-including root, so it is always connected.
+    if (type == NodeType::DOCUMENT_NODE)
+        m_is_connected = true;
 }
 
 Node::Node(Document& document, NodeType type)
@@ -127,11 +133,17 @@ void Node::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_child_nodes);
 
     visitor.visit(m_layout_node);
-    visitor.visit(m_paintable);
-
     if (m_registered_observer_list) {
         visitor.visit(*m_registered_observer_list);
     }
+}
+
+size_t Node::external_memory_size() const
+{
+    auto size = Base::external_memory_size();
+    if (m_registered_observer_list)
+        size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(*m_registered_observer_list));
+    return size;
 }
 
 // https://dom.spec.whatwg.org/#dom-node-baseuri
@@ -403,162 +415,50 @@ GC::Ptr<HTML::Navigable> Node::navigable() const
     return document().navigable();
 }
 
-[[maybe_unused]] static StringView to_string(StyleInvalidationReason reason)
+CSS::StyleScope& Node::style_scope()
 {
-#define __ENUMERATE_STYLE_INVALIDATION_REASON(reason) \
-    case StyleInvalidationReason::reason:             \
-        return #reason##sv;
-    switch (reason) {
-        ENUMERATE_STYLE_INVALIDATION_REASONS(__ENUMERATE_STYLE_INVALIDATION_REASON)
-    default:
-        VERIFY_NOT_REACHED();
+    auto& root = this->root();
+    if (auto* shadow_root = as_if<ShadowRoot>(root)) {
+        if (shadow_root->uses_document_style_sheets())
+            return document().style_scope();
+        return shadow_root->style_scope();
     }
+    return document().style_scope();
 }
 
-static bool reason_may_affect_has_selectors(StyleInvalidationReason reason)
+void Node::for_each_style_scope_which_may_observe_the_node(Function<void(CSS::StyleScope&)> const& callback)
 {
-    // :has() selectors match based on DOM state only (structure, attributes, pseudo-classes). Reasons that don't change
-    // any DOM state can't affect :has() matching, so we can skip scheduling :has() ancestor invalidation.
-    return !first_is_one_of(reason,
-        StyleInvalidationReason::BaseURLChanged,
-        StyleInvalidationReason::CSSFontLoaded,
-        StyleInvalidationReason::HTMLIFrameElementGeometryChange,
-        StyleInvalidationReason::HTMLObjectElementUpdateLayoutAndChildObjects,
-        StyleInvalidationReason::NavigableSetViewportSize,
-        StyleInvalidationReason::SettingsChange);
+    HashTable<CSS::StyleScope*> visited_scopes;
+    auto visit = [&](CSS::StyleScope& scope) {
+        if (visited_scopes.set(&scope) != AK::HashSetResult::InsertedNewEntry)
+            return;
+        callback(scope);
+    };
+
+    visit(style_scope());
+
+    if (auto* element = as_if<Element>(*this)) {
+        if (auto shadow_root = element->shadow_root())
+            visit(shadow_root->style_scope());
+    }
+
+    for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+        visit(ancestor->style_scope());
+        if (auto* element = as_if<Element>(*ancestor)) {
+            if (auto shadow_root = element->shadow_root())
+                visit(shadow_root->style_scope());
+        }
+    }
 }
 
 void Node::invalidate_style(StyleInvalidationReason reason)
 {
-    if (is_character_data())
-        return;
-
-    auto& style_scope = root().is_shadow_root() ? static_cast<ShadowRoot&>(root()).style_scope() : document().style_scope();
-
-    if (style_scope.may_have_has_selectors()) {
-        if (reason == StyleInvalidationReason::NodeRemove) {
-            if (auto* parent = parent_or_shadow_host(); parent) {
-                style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*parent);
-                parent->for_each_child_of_type<Element>([&](auto& element) {
-                    if (element.affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator())
-                        element.invalidate_style_if_affected_by_has();
-                    return IterationDecision::Continue;
-                });
-            }
-        } else if (reason_may_affect_has_selectors(reason)) {
-            style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
-        }
-    }
-
-    if (!needs_style_update() && !document().needs_full_style_update()) {
-        dbgln_if(STYLE_INVALIDATION_DEBUG, "Invalidate style ({}): {}", to_string(reason), debug_description());
-    }
-
-    if (is_document()) {
-        auto& document = static_cast<DOM::Document&>(*this);
-        document.set_needs_full_style_update(true);
-        return;
-    }
-
-    // If the document is already marked for a full style update, there's no need to do anything here.
-    if (document().needs_full_style_update()) {
-        return;
-    }
-
-    // If any ancestor is already marked for an entire subtree update, there's no need to do anything here.
-    for (auto* ancestor = this->parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
-        if (ancestor->entire_subtree_needs_style_update())
-            return;
-    }
-
-    // When invalidating style for a node, we actually invalidate:
-    // - the node itself
-    // - all of its descendants
-    // - preceding siblings that depend on following-sibling counts (only on DOM insert/remove)
-    // - subsequent siblings that depend on previous siblings or sibling combinators
-    // FIXME: This is a lot of invalidation and we should implement more sophisticated invalidation to do less work!
-
-    auto mark_entire_subtree_for_style_update = [](Node& node_to_mark) {
-        node_to_mark.set_entire_subtree_needs_style_update(true);
-    };
-
-    mark_entire_subtree_for_style_update(*this);
-
-    auto previous_sibling_needs_structural_invalidation = [](Element const& element) {
-        return element.affected_by_backward_structural_changes();
-    };
-
-    auto next_sibling_needs_structural_invalidation = [](Element const& element, size_t current_sibling_distance) {
-        if (element.affected_by_indirect_sibling_combinator() || element.affected_by_first_child_pseudo_class() || element.affected_by_forward_positional_pseudo_class())
-            return true;
-        return element.affected_by_direct_sibling_combinator() && current_sibling_distance <= element.sibling_invalidation_distance();
-    };
-
-    if (reason == StyleInvalidationReason::NodeInsertBefore || reason == StyleInvalidationReason::NodeRemove) {
-        for (auto* sibling = previous_sibling(); sibling; sibling = sibling->previous_sibling()) {
-            if (auto* element = as_if<Element>(sibling); element && previous_sibling_needs_structural_invalidation(*element))
-                mark_entire_subtree_for_style_update(*element);
-        }
-    }
-
-    size_t current_sibling_distance = 1;
-    for (auto* sibling = next_sibling(); sibling; sibling = sibling->next_sibling()) {
-        if (auto* element = as_if<Element>(sibling)) {
-            bool needs_to_invalidate = false;
-            if (reason == StyleInvalidationReason::NodeInsertBefore || reason == StyleInvalidationReason::NodeRemove) {
-                needs_to_invalidate = next_sibling_needs_structural_invalidation(*element, current_sibling_distance);
-            } else if (element->affected_by_indirect_sibling_combinator() || element->affected_by_forward_positional_pseudo_class()) {
-                needs_to_invalidate = true;
-            } else if (element->affected_by_direct_sibling_combinator() && current_sibling_distance <= element->sibling_invalidation_distance()) {
-                needs_to_invalidate = true;
-            }
-            if (needs_to_invalidate)
-                mark_entire_subtree_for_style_update(*element);
-            current_sibling_distance++;
-        }
-    }
-
-    for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host())
-        ancestor->m_child_needs_style_update = true;
+    CSS::Invalidation::invalidate_node_style(*this, reason);
 }
 
 void Node::invalidate_style(StyleInvalidationReason reason, Vector<CSS::InvalidationSet::Property> const& properties, StyleInvalidationOptions options)
 {
-    if (is_character_data())
-        return;
-
-    auto& root = this->root();
-    auto& style_scope = root.is_shadow_root() ? static_cast<ShadowRoot&>(root).style_scope() : document().style_scope();
-    CSS::StyleScope* shadow_style_scope = nullptr;
-    if (auto* element = as_if<Element>(this); element && element->is_shadow_host()) {
-        if (auto element_shadow_root = element->shadow_root())
-            shadow_style_scope = &element_shadow_root->style_scope();
-    }
-
-    bool properties_used_in_has_selectors = false;
-    for (auto const& property : properties) {
-        properties_used_in_has_selectors |= document().style_computer().invalidation_property_used_in_has_selector(property, style_scope);
-        if (shadow_style_scope)
-            properties_used_in_has_selectors |= document().style_computer().invalidation_property_used_in_has_selector(property, *shadow_style_scope);
-    }
-    if (properties_used_in_has_selectors) {
-        style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
-        if (shadow_style_scope)
-            shadow_style_scope->schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
-    }
-
-    if (options.invalidate_self)
-        set_needs_style_update(true);
-
-    auto invalidate_for_style_scope = [this, reason, &properties](CSS::StyleScope& style_scope) {
-        auto plan = document().style_computer().invalidation_plan_for_properties(properties, style_scope);
-        return document().style_invalidator().enqueue_invalidation_plan(*this, reason, *plan);
-    };
-
-    if (invalidate_for_style_scope(style_scope))
-        return;
-    if (shadow_style_scope)
-        (void)invalidate_for_style_scope(*shadow_style_scope);
+    CSS::Invalidation::invalidate_node_style_for_properties(*this, reason, properties, options);
 }
 
 Utf16String Node::child_text_content() const
@@ -612,13 +512,6 @@ bool Node::is_closed_shadow_hidden_from(Node const& b) const
         return true;
 
     return false;
-}
-
-// https://dom.spec.whatwg.org/#connected
-bool Node::is_connected() const
-{
-    // An element is connected if its shadow-including root is a document.
-    return shadow_including_root().is_document();
 }
 
 // https://html.spec.whatwg.org/multipage/infrastructure.html#browsing-context-connected
@@ -1036,8 +929,8 @@ void Node::remove(bool suppress_observers)
         assign_slottables_for_a_tree(*this);
     }
 
-    // 11. Run the removing steps with node and parent.
-    removed_from(parent, parent_root);
+    // 11. Run the removing steps with node, true, and parent.
+    removed_from(IsSubtreeRoot::Yes, parent, parent_root);
 
     // 12. Let isParentConnected be parent’s connected.
     bool is_parent_connected = parent->is_connected();
@@ -1055,8 +948,8 @@ void Node::remove(bool suppress_observers)
 
     // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
     for_each_shadow_including_descendant([&](Node& descendant) {
-        // 1. Run the removing steps with descendant and null.
-        descendant.removed_from(nullptr, parent_root);
+        // 1. Run the removing steps with descendant, false, and parent.
+        descendant.removed_from(IsSubtreeRoot::No, parent, parent_root);
 
         // 2. If descendant is custom and isParentConnected is true, then enqueue a custom element callback reaction
         //    with descendant, callback name "disconnectedCallback", and « ».
@@ -1301,6 +1194,7 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 
     // 8. Assert: oldParent is non-null.
     VERIFY(old_parent);
+    bool const is_same_parent_move = old_parent == &new_parent;
 
     // 9. Run the live range pre-remove steps, given node.
     live_range_pre_remove();
@@ -1320,7 +1214,10 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     if (old_parent->is_connected()) {
         // Since the tree structure is about to change, we need to invalidate both style and layout.
         // In the future, we should find a way to only invalidate the parts that actually need it.
-        invalidate_style(StyleInvalidationReason::NodeRemove);
+        if (is_same_parent_move)
+            CSS::Invalidation::invalidate_style_after_same_parent_move(*this, StyleInvalidationReason::NodeRemove);
+        else
+            invalidate_style(StyleInvalidationReason::NodeRemove);
 
         // NOTE: If we didn’t have a layout node before, rebuilding the layout tree isn’t gonna give us one
         //       after we’ve been removed from the DOM.
@@ -1393,7 +1290,10 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
         new_parent.insert_before_impl(*this, child);
     }
 
-    invalidate_style(StyleInvalidationReason::NodeInsertBefore);
+    if (is_same_parent_move)
+        CSS::Invalidation::invalidate_style_after_same_parent_move(*this, StyleInvalidationReason::NodeInsertBefore);
+    else
+        invalidate_style(StyleInvalidationReason::NodeInsertBefore);
     if (is_connected()) {
         new_parent.set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
     }
@@ -1430,18 +1330,17 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 
     // 24. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
     for_each_shadow_including_inclusive_descendant([this, &new_parent, old_parent](Node& inclusive_descendant) {
-        // 1. If inclusiveDescendant is node, then run the moving steps with inclusiveDescendant and oldParent. Otherwise, run the moving
-        //    steps with inclusiveDescendant and null.
-        if (&inclusive_descendant == this)
-            inclusive_descendant.moved_from(*old_parent);
-        else
-            inclusive_descendant.moved_from(nullptr);
+        // 1. Let isSubtreeRoot be true if inclusiveDescendant is node; otherwise false.
+        auto is_subtree_root = (&inclusive_descendant == this) ? IsSubtreeRoot::Yes : IsSubtreeRoot::No;
 
-        // NOTE: Because the move algorithm is a separate primitive from insert and remove, it does not invoke the traditional insertion steps or
-        //       removing steps for inclusiveDescendant.
+        // 2. Run the moving steps with inclusiveDescendant, isSubtreeRoot, and oldParent.
+        inclusive_descendant.moved_from(is_subtree_root, old_parent);
 
-        // 2. If inclusiveDescendant is custom and newParent is connected, then enqueue a custom element callback reaction with inclusiveDescendant,
-        //    callback name "connectedMoveCallback", and « ».
+        // NOTE: Because the move algorithm is a separate primitive from insert and remove, it does not invoke the
+        //       insertion steps or removing steps for inclusiveDescendant.
+
+        // 3. If inclusiveDescendant is custom and newParent is connected, then enqueue a custom element callback
+        //    reaction with inclusiveDescendant, callback name "connectedMoveCallback", and « ».
         if (auto* element = as_if<DOM::Element>(inclusive_descendant)) {
             if (element->is_custom() && new_parent.is_connected()) {
                 GC::RootVector<JS::Value> empty_arguments { vm().heap() };
@@ -1639,14 +1538,26 @@ void Node::set_document(Document& document)
     if (m_document.ptr() == &document)
         return;
 
+    bool const node_needs_style_update = needs_style_update();
+    bool const subtree_needs_style_update = entire_subtree_needs_style_update();
+    bool const descendants_need_style_update = child_needs_style_update();
     m_document = &document;
-
-    if (needs_style_update() || child_needs_style_update()) {
+    if (node_needs_style_update) {
         // NOTE: We unset and reset the "needs style update" flag here.
         //       This ensures that there's a pending style update in the new document
         //       that will eventually assign some style to this node if needed.
         set_needs_style_update(false);
         set_needs_style_update(true);
+    }
+
+    if (subtree_needs_style_update || descendants_need_style_update) {
+        // These broader dirty flags stay set across adoption, but the new ancestor chain has never seen them
+        // propagate. Re-mark ancestors so style update still descends into this adopted subtree.
+        for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+            if (ancestor->m_child_needs_style_update)
+                break;
+            ancestor->m_child_needs_style_update = true;
+        }
     }
 }
 
@@ -1809,6 +1720,8 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
     }
 
     if (m_needs_layout_tree_update) {
+        document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
+
         for (auto* ancestor = flat_tree_parent(); ancestor; ancestor = ancestor->flat_tree_parent()) {
             if (ancestor->m_child_needs_layout_tree_update)
                 break;
@@ -1848,6 +1761,9 @@ void Node::set_needs_style_update(bool value)
     m_needs_style_update = value;
 
     if (m_needs_style_update) {
+        document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
+
+        document().record_style_invalidation();
         for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
             if (ancestor->m_child_needs_style_update)
                 break;
@@ -1862,19 +1778,28 @@ void Node::post_connection()
 
 void Node::inserted()
 {
+    // NB: The DOM insertion steps visit shadow-including inclusive descendants in tree order,
+    //     so by the time we get here, our parent (or host, for shadow roots) has already had
+    //     its connected flag updated, and we can just inherit from it.
+    if (auto* shadow_root = as_if<ShadowRoot>(*this))
+        m_is_connected = shadow_root->host() && shadow_root->host()->is_connected();
+    else if (parent())
+        m_is_connected = parent()->is_connected();
+
     recompute_editable_subtree_flag();
     set_needs_style_update(true);
 }
 
-void Node::removed_from(Node*, Node&)
+void Node::removed_from(IsSubtreeRoot, Node*, Node&)
 {
+    m_is_connected = false;
     m_in_editable_subtree = false;
     m_layout_node = nullptr;
     m_paintable = nullptr;
 }
 
 // https://dom.spec.whatwg.org/#concept-node-move-ext
-void Node::moved_from(GC::Ptr<Node>)
+void Node::moved_from(IsSubtreeRoot, GC::Ptr<Node>)
 {
     recompute_editable_subtree_flag();
 }
@@ -2676,7 +2601,7 @@ bool Node::in_a_document_tree() const
 }
 
 // https://dom.spec.whatwg.org/#dom-node-getrootnode
-GC::Ref<Node> Node::get_root_node(GetRootNodeOptions const& options)
+GC::Ref<Node> Node::get_root_node(Bindings::GetRootNodeOptions const& options)
 {
     // The getRootNode(options) method steps are to return this’s shadow-including root if options["composed"] is true;
     if (options.composed)
@@ -2729,7 +2654,7 @@ Layout::Node* Node::layout_node()
     return m_layout_node;
 }
 
-void Node::set_paintable(GC::Ptr<Painting::Paintable> paintable)
+void Node::set_paintable(WeakPtr<Painting::Paintable> paintable)
 {
     m_paintable = paintable;
 }
@@ -2743,55 +2668,67 @@ void Node::set_needs_repaint(InvalidateDisplayList should_invalidate_display_lis
 {
     if (auto* layout_node = unsafe_layout_node()) {
         for (auto& paintable : layout_node->paintables())
-            paintable.set_needs_repaint(should_invalidate_display_list);
+            paintable->set_needs_repaint(should_invalidate_display_list);
     }
 }
 
 void Node::set_needs_layout_update(SetNeedsLayoutReason reason)
 {
-    if (auto* node = unsafe_layout_node())
+    if (auto* node = unsafe_layout_node()) {
         node->set_needs_layout_update(reason);
+        document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
+    }
 }
 
-Painting::Paintable const* Node::paintable() const
+RefPtr<Painting::Paintable const> Node::paintable() const
 {
     if (m_paintable)
         VERIFY(document().layout_is_up_to_date());
-    return m_paintable;
+    return m_paintable.strong_ref();
 }
 
-Painting::Paintable* Node::paintable()
+RefPtr<Painting::Paintable> Node::paintable()
 {
     if (m_paintable)
         VERIFY(document().layout_is_up_to_date());
-    return m_paintable;
+    return m_paintable.strong_ref();
 }
 
-Painting::PaintableBox const* Node::paintable_box() const
+RefPtr<Painting::Paintable const> Node::unsafe_paintable() const
 {
-    if (auto* p = paintable(); p && p->is_paintable_box())
-        return static_cast<Painting::PaintableBox const*>(p);
+    return m_paintable.strong_ref();
+}
+
+RefPtr<Painting::Paintable> Node::unsafe_paintable()
+{
+    return m_paintable.strong_ref();
+}
+
+RefPtr<Painting::PaintableBox const> Node::paintable_box() const
+{
+    if (auto p = paintable(); p && p->is_paintable_box())
+        return static_cast<Painting::PaintableBox const&>(*p);
     return nullptr;
 }
 
-Painting::PaintableBox* Node::paintable_box()
+RefPtr<Painting::PaintableBox> Node::paintable_box()
 {
-    if (auto* p = paintable(); p && p->is_paintable_box())
-        return static_cast<Painting::PaintableBox*>(p);
+    if (auto p = paintable(); p && p->is_paintable_box())
+        return static_cast<Painting::PaintableBox&>(*p);
     return nullptr;
 }
 
-Painting::PaintableBox const* Node::unsafe_paintable_box() const
+RefPtr<Painting::PaintableBox const> Node::unsafe_paintable_box() const
 {
-    if (m_paintable && m_paintable->is_paintable_box())
-        return static_cast<Painting::PaintableBox const*>(m_paintable.ptr());
+    if (auto paintable = m_paintable.strong_ref(); paintable && paintable->is_paintable_box())
+        return static_cast<Painting::PaintableBox const&>(*paintable);
     return nullptr;
 }
 
-Painting::PaintableBox* Node::unsafe_paintable_box()
+RefPtr<Painting::PaintableBox> Node::unsafe_paintable_box()
 {
-    if (m_paintable && m_paintable->is_paintable_box())
-        return static_cast<Painting::PaintableBox*>(m_paintable.ptr());
+    if (auto paintable = m_paintable.strong_ref(); paintable && paintable->is_paintable_box())
+        return static_cast<Painting::PaintableBox&>(*paintable);
     return nullptr;
 }
 
@@ -3448,13 +3385,13 @@ void Node::add_registered_observer(RegisteredObserver& registered_observer)
     m_registered_observer_list->append(registered_observer);
 }
 
-bool Node::has_inclusive_ancestor_with_display_none()
+bool Node::has_inclusive_ancestor_with_display_none_ignoring_animations() const
 {
-    for (auto* ancestor = this; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+    for (auto const* ancestor = this; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
         if (!ancestor->is_element())
             continue;
-        auto const& ancestor_element = static_cast<Element&>(*ancestor);
-        if (ancestor_element.computed_properties() && ancestor_element.computed_properties()->display().is_none()) {
+        auto const& ancestor_element = static_cast<Element const&>(*ancestor);
+        if (ancestor_element.computed_properties() && ancestor_element.computed_properties()->property(CSS::PropertyID::Display, CSS::ComputedProperties::WithAnimationsApplied::No).as_display().display().is_none()) {
             return true;
         }
     }

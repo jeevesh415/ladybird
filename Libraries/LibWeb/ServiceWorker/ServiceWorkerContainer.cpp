@@ -7,7 +7,7 @@
 
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/ServiceWorkerContainerPrototype.h>
+#include <LibWeb/Bindings/ServiceWorkerContainer.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
@@ -54,7 +54,7 @@ GC::Ref<ServiceWorkerContainer> ServiceWorkerContainer::create(JS::Realm& realm)
 }
 
 // https://w3c.github.io/ServiceWorker/#navigator-service-worker-register
-GC::Ref<WebIDL::Promise> ServiceWorkerContainer::register_(TrustedTypes::TrustedScriptURLOrString script_url, RegistrationOptions const& options)
+GC::Ref<WebIDL::Promise> ServiceWorkerContainer::register_(TrustedTypes::TrustedScriptURLOrString script_url, Bindings::RegistrationOptions const& options)
 {
     auto& realm = this->realm();
     // Note: The register(scriptURL, options) method creates or updates a service worker registration for the given scope url.

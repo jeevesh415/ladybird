@@ -23,6 +23,8 @@ JS_API extern bool g_dump_ast_use_color;
 namespace FFI {
 
 struct ParsedProgram;
+struct CompiledProgram;
+struct DecodedBytecodeCacheBlob;
 
 }
 
@@ -54,6 +56,8 @@ public:
     virtual ~Script() override;
     static Result<GC::Ref<Script>, Vector<ParserError>> parse(StringView source_text, Realm&, StringView filename = {}, HostDefined* = nullptr, size_t line_number_offset = 1);
     static Result<GC::Ref<Script>, Vector<ParserError>> create_from_parsed(FFI::ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm&, HostDefined* = nullptr);
+    static Result<GC::Ref<Script>, Vector<ParserError>> create_from_compiled(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm&, HostDefined* = nullptr);
+    static Result<GC::Ref<Script>, Vector<ParserError>> create_from_bytecode_cache(FFI::DecodedBytecodeCacheBlob*, NonnullRefPtr<SourceCode const> source_code, Realm&, HostDefined* = nullptr);
 
     Realm& realm() { return *m_realm; }
     Vector<LoadedModuleRequest>& loaded_modules() { return m_loaded_modules; }
@@ -82,6 +86,7 @@ private:
     Script(Realm&, StringView filename, RustIntegration::ScriptResult&&, HostDefined*);
 
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual size_t external_memory_size() const override;
 
     GC::Ptr<Realm> m_realm;                       // [[Realm]]
     Vector<LoadedModuleRequest> m_loaded_modules; // [[LoadedModules]]

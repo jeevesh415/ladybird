@@ -287,15 +287,6 @@ void ResourceLoader::handle_about_load_request(LoadRequest const& request, Callb
     Requests::RequestTimingInfo timing_info {};
 
     auto serialized_path = URL::percent_decode(url.serialize_path());
-
-    // About version page
-    if (serialized_path == "version") {
-        auto version_page = MUST(load_about_version_page());
-        callback(version_page.bytes(), timing_info, response_headers);
-        return;
-    }
-
-    // Other about static HTML pages
     auto target_file = ByteString::formatted("{}.html", serialized_path);
 
     auto about_directory = MUST(Core::Resource::load_from_uri("resource://ladybird/about-pages"_string));
@@ -360,7 +351,7 @@ void ResourceLoader::handle_resource_load_request(LoadRequest const& request, Re
     on_resource(load_result);
 }
 
-RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<OnHeadersReceived> on_headers_received, GC::Root<OnDataReceived> on_data_received, GC::Root<OnComplete> on_complete)
+RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<OnHeadersReceived> on_headers_received, GC::Root<OnDataReceived> on_data_received, GC::Root<OnCachedBodyAvailable> on_cached_body_available, GC::Root<OnComplete> on_complete)
 {
     auto const& url = request.url().value();
 
@@ -377,8 +368,8 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
             request,
             [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete = move(on_complete), request](ReadonlyBytes data, Requests::RequestTimingInfo const& timing_info, HTTP::HeaderList const& response_headers) {
                 log_success(request);
-                on_headers_received->function()(response_headers, {}, {});
-                on_data_received->function()(data);
+                on_headers_received->function()(response_headers, {}, {}, {}, {});
+                on_data_received->function()(Requests::ResponseData::from_bytes(data));
                 on_complete->function()(true, timing_info, {});
             });
         return nullptr;
@@ -388,8 +379,8 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         handle_resource_load_request(
             request,
             [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](FileLoadResult const& load_result) {
-                on_headers_received->function()(load_result.response_headers, {}, {});
-                on_data_received->function()(load_result.data);
+                on_headers_received->function()(load_result.response_headers, {}, {}, {}, {});
+                on_data_received->function()(Requests::ResponseData::from_bytes(load_result.data));
                 on_complete->function()(true, load_result.timing_info, {});
             },
             [on_complete](ByteString const& message) {
@@ -404,8 +395,8 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
             request,
             [request, on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](FileLoadResult const& load_result) {
                 log_success(request);
-                on_headers_received->function()(load_result.response_headers, {}, {});
-                on_data_received->function()(load_result.data);
+                on_headers_received->function()(load_result.response_headers, {}, {}, {}, {});
+                on_data_received->function()(Requests::ResponseData::from_bytes(load_result.data));
                 on_complete->function()(true, load_result.timing_info, {});
             },
             [on_complete, request](ByteString const& message) {
@@ -429,19 +420,19 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         return nullptr;
     }
 
-    auto protocol_headers_received = [this, on_headers_received = move(on_headers_received), request, request_id = protocol_request->id()](auto const& response_headers, auto status_code, auto const& reason_phrase) {
+    auto protocol_headers_received = [this, on_headers_received = move(on_headers_received), request, request_id = protocol_request->id()](auto const& response_headers, auto status_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key) {
         handle_network_response_headers(request, response_headers);
 
         if (auto page = request.page())
             page->client().page_did_receive_network_response_headers(request_id, status_code.value_or(0), reason_phrase, response_headers->headers());
 
-        on_headers_received->function()(response_headers, move(status_code), reason_phrase);
+        on_headers_received->function()(response_headers, move(status_code), reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key);
     };
 
     auto protocol_data_received = [on_data_received = move(on_data_received), request, request_id = protocol_request->id()](auto data) {
         if (auto page = request.page())
-            page->client().page_did_receive_network_response_body(request_id, data);
-        on_data_received->function()(data);
+            page->client().page_did_receive_network_response_body(request_id, data.bytes());
+        on_data_received->function()(move(data));
     };
 
     auto protocol_complete = [this, on_complete = move(on_complete), request, &protocol_request = *protocol_request](u64 total_size, Requests::RequestTimingInfo const& timing_info, Optional<Requests::NetworkError> const& network_error) {
@@ -462,7 +453,11 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         }
     };
 
-    protocol_request->set_unbuffered_request_callbacks(move(protocol_headers_received), move(protocol_data_received), move(protocol_complete));
+    auto protocol_cached_body_available = [on_cached_body_available = move(on_cached_body_available)](auto data) {
+        on_cached_body_available->function()(move(data));
+    };
+
+    protocol_request->set_unbuffered_request_callbacks(move(protocol_headers_received), move(protocol_data_received), move(protocol_cached_body_available), move(protocol_complete));
     return protocol_request;
 }
 

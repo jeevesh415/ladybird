@@ -25,25 +25,25 @@
 #include <LibJS/Runtime/StringObject.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibWeb/Bindings/DOMExceptionPrototype.h>
-#include <LibWeb/Bindings/DOMMatrixPrototype.h>
-#include <LibWeb/Bindings/DOMMatrixReadOnlyPrototype.h>
-#include <LibWeb/Bindings/DOMPointPrototype.h>
-#include <LibWeb/Bindings/DOMPointReadOnlyPrototype.h>
-#include <LibWeb/Bindings/DOMQuadPrototype.h>
-#include <LibWeb/Bindings/DOMRectPrototype.h>
-#include <LibWeb/Bindings/DOMRectReadOnlyPrototype.h>
-#include <LibWeb/Bindings/FileListPrototype.h>
-#include <LibWeb/Bindings/FilePrototype.h>
-#include <LibWeb/Bindings/ImageBitmapPrototype.h>
+#include <LibWeb/Bindings/DOMException.h>
+#include <LibWeb/Bindings/DOMMatrix.h>
+#include <LibWeb/Bindings/DOMMatrixReadOnly.h>
+#include <LibWeb/Bindings/DOMPoint.h>
+#include <LibWeb/Bindings/DOMPointReadOnly.h>
+#include <LibWeb/Bindings/DOMQuad.h>
+#include <LibWeb/Bindings/DOMRect.h>
+#include <LibWeb/Bindings/DOMRectReadOnly.h>
+#include <LibWeb/Bindings/File.h>
+#include <LibWeb/Bindings/FileList.h>
+#include <LibWeb/Bindings/ImageBitmap.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/MessagePortPrototype.h>
-#include <LibWeb/Bindings/QuotaExceededErrorPrototype.h>
-#include <LibWeb/Bindings/ReadableStreamPrototype.h>
+#include <LibWeb/Bindings/MessagePort.h>
+#include <LibWeb/Bindings/QuotaExceededError.h>
+#include <LibWeb/Bindings/ReadableStream.h>
 #include <LibWeb/Bindings/Serializable.h>
 #include <LibWeb/Bindings/Transferable.h>
-#include <LibWeb/Bindings/TransformStreamPrototype.h>
-#include <LibWeb/Bindings/WritableStreamPrototype.h>
+#include <LibWeb/Bindings/TransformStream.h>
+#include <LibWeb/Bindings/WritableStream.h>
 #include <LibWeb/Crypto/CryptoKey.h>
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/FileAPI/File.h>
@@ -167,7 +167,10 @@ static WebIDL::ExceptionOr<void> serialize_array_buffer(JS::VM& vm, TransferData
         auto data_copy = TRY(JS::create_byte_data_block(vm, size));
 
         // 4. Perform CopyDataBlockBytes(dataCopy, 0, value.[[ArrayBufferData]], 0, size).
-        JS::copy_data_block_bytes(data_copy.buffer(), 0, array_buffer.buffer(), 0, size);
+        if (array_buffer.is_external())
+            data_copy.overwrite(0, array_buffer.data(), size);
+        else
+            JS::copy_data_block_bytes(data_copy.buffer(), 0, array_buffer.buffer(), 0, size);
 
         // 5. If value has an [[ArrayBufferMaxByteLength]] internal slot, then set serialized to { [[Type]]: "ResizableArrayBuffer",
         //    [[ArrayBufferData]]: dataCopy, [[ArrayBufferByteLength]]: size, [[ArrayBufferMaxByteLength]]: value.[[ArrayBufferMaxByteLength]] }.
@@ -1040,13 +1043,17 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
         // 4. If transferable has an [[ArrayBufferData]] internal slot, then:
         if (array_buffer) {
             // 1. If transferable has an [[ArrayBufferMaxByteLength]] internal slot, then:
+            auto buffer_data = array_buffer->is_external()
+                ? MUST(ByteBuffer::copy(array_buffer->bytes()))
+                : ByteBuffer(array_buffer->buffer());
+
             if (!array_buffer->is_fixed_length()) {
                 // 1. Set dataHolder.[[Type]] to "ResizableArrayBuffer".
                 data_holder.encode(TransferType::ResizableArrayBuffer);
 
                 // 2. Set dataHolder.[[ArrayBufferData]] to transferable.[[ArrayBufferData]].
                 // 3. Set dataHolder.[[ArrayBufferByteLength]] to transferable.[[ArrayBufferByteLength]].
-                data_holder.encode(array_buffer->buffer());
+                data_holder.encode(buffer_data);
 
                 // 4. Set dataHolder.[[ArrayBufferMaxByteLength]] to transferable.[[ArrayBufferMaxByteLength]].
                 data_holder.encode(array_buffer->max_byte_length());
@@ -1058,7 +1065,7 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
 
                 // 2. Set dataHolder.[[ArrayBufferData]] to transferable.[[ArrayBufferData]].
                 // 3. Set dataHolder.[[ArrayBufferByteLength]] to transferable.[[ArrayBufferByteLength]].
-                data_holder.encode(array_buffer->buffer());
+                data_holder.encode(buffer_data);
             }
 
             // 3. Perform ? DetachArrayBuffer(transferable).

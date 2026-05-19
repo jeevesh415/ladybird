@@ -5,9 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLIFrameElementPrototype.h>
-#include <LibWeb/CSS/CascadedProperties.h>
+#include <LibWeb/Bindings/HTMLIFrameElement.h>
 #include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/Invalidation/EmbeddedContentInvalidator.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/DOM/DOMTokenList.h>
@@ -87,10 +87,8 @@ void HTMLIFrameElement::attribute_changed(FlyString const& name, Optional<String
         }
     }
 
-    if (name == HTML::AttributeNames::width || name == HTML::AttributeNames::height) {
-        // FIXME: This should only invalidate the layout, not the style.
-        invalidate_style(DOM::StyleInvalidationReason::HTMLIFrameElementGeometryChange);
-    }
+    if (name == HTML::AttributeNames::width || name == HTML::AttributeNames::height)
+        CSS::Invalidation::invalidate_style_after_embedded_content_geometry_change(*this);
 
     if (name == HTML::AttributeNames::marginwidth || name == HTML::AttributeNames::marginheight) {
         if (auto* document = this->content_document_without_origin_check()) {
@@ -206,9 +204,9 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:the-iframe-element-7
-void HTMLIFrameElement::removed_from(DOM::Node* old_parent, DOM::Node& old_root)
+void HTMLIFrameElement::removed_from(IsSubtreeRoot is_subtree_root, DOM::Node* old_ancestor, DOM::Node& old_root)
 {
-    HTMLElement::removed_from(old_parent, old_root);
+    HTMLElement::removed_from(is_subtree_root, old_ancestor, old_root);
 
     // When an iframe element is removed from a document, the user agent must destroy the nested navigable of the element.
     destroy_the_child_navigable();
@@ -252,9 +250,9 @@ bool HTMLIFrameElement::is_presentational_hint(FlyString const& name) const
     return name == HTML::AttributeNames::frameborder;
 }
 
-void HTMLIFrameElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperties> cascaded_properties) const
+void HTMLIFrameElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
-    Base::apply_presentational_hints(cascaded_properties);
+    Base::apply_presentational_hints(properties);
 
     // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images:attr-iframe-frameborder
     // When an iframe element has a frameborder attribute whose value, when parsed using the rules for parsing integers,
@@ -264,10 +262,10 @@ void HTMLIFrameElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperti
         auto frameborder = parse_integer(*frameborder_attribute);
         if (!frameborder.has_value() || frameborder == 0) {
             auto zero = CSS::LengthStyleValue::create(CSS::Length::make_px(0));
-            cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderTopWidth, zero);
-            cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderRightWidth, zero);
-            cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderBottomWidth, zero);
-            cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderLeftWidth, zero);
+            properties.append({ .property_id = CSS::PropertyID::BorderTopWidth, .value = zero });
+            properties.append({ .property_id = CSS::PropertyID::BorderRightWidth, .value = zero });
+            properties.append({ .property_id = CSS::PropertyID::BorderBottomWidth, .value = zero });
+            properties.append({ .property_id = CSS::PropertyID::BorderLeftWidth, .value = zero });
         }
     }
 }

@@ -15,7 +15,7 @@
 #include <LibGfx/Filter.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibGfx/PaintStyle.h>
-#include <LibWeb/Bindings/CanvasRenderingContext2DPrototype.h>
+#include <LibWeb/Bindings/CanvasRenderingContext2D.h>
 #include <LibWeb/CSS/Length.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/HTML/CanvasGradient.h>
@@ -74,10 +74,7 @@ public:
 
         void visit_edges(GC::Cell::Visitor& visitor)
         {
-            m_fill_or_stroke_style.visit([&](Gfx::Color) {},
-                [&](auto& handle) {
-                    visitor.visit(handle);
-                });
+            visitor.visit(m_fill_or_stroke_style);
         }
 
     private:

@@ -6,13 +6,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/Promise.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMedia/PlaybackManager.h>
 #include <LibMedia/Sinks/DisplayingVideoSink.h>
 #include <LibMedia/Track.h>
+#include <LibMedia/VideoFrame.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/Bindings/HTMLMediaElementPrototype.h>
+#include <LibWeb/Bindings/HTMLMediaElement.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
@@ -89,7 +91,7 @@ void HTMLMediaElement::initialize(JS::Realm& realm)
     Base::initialize(realm);
 
     m_audio_tracks = realm.create<AudioTrackList>(realm);
-    m_video_tracks = realm.create<VideoTrackList>(realm);
+    m_video_tracks = realm.create<VideoTrackList>(realm, this);
     m_text_tracks = realm.create<TextTrackList>(realm);
     m_document_observer = realm.create<DOM::DocumentObserver>(realm, document());
 
@@ -122,6 +124,14 @@ void HTMLMediaElement::initialize(JS::Realm& realm)
 void HTMLMediaElement::finalize()
 {
     Base::finalize();
+
+    // Tear down the controls eagerly so the Core::Timer they own (and the
+    // closures it captures) cannot fire during the window between this GC
+    // and our sweep, when our GC::Weak references to shadow tree nodes are
+    // already cleared.
+    m_controls.clear();
+
+    clear_compositor_video_frame();
 
     document().page().unregister_media_element({}, unique_id());
 }
@@ -241,9 +251,9 @@ void HTMLMediaElement::set_assigned_media_provider_object(MediaProviderObject co
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#playing-the-media-resource:media-element-83
-void HTMLMediaElement::removed_from(DOM::Node* old_parent, DOM::Node& old_root)
+void HTMLMediaElement::removed_from(IsSubtreeRoot is_subtree_root, DOM::Node* old_ancestor, DOM::Node& old_root)
 {
-    Base::removed_from(old_parent, old_root);
+    Base::removed_from(is_subtree_root, old_ancestor, old_root);
 
     // When a media element is removed from a Document, the user agent must run the following steps:
 
@@ -459,6 +469,7 @@ void HTMLMediaElement::set_current_playback_position(double playback_position)
         reached_end_of_media_playback();
 
     upon_has_ended_playback_possibly_changed();
+    update_natural_dimensions();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#dom-media-duration
@@ -470,6 +481,16 @@ double HTMLMediaElement::duration() const
 
     // FIXME: Handle unbounded media resources.
     return m_duration;
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#dom-media-getstartdate
+JS::Object* HTMLMediaElement::get_start_date()
+{
+    // The getStartDate() method must return a new Date object representing the current timeline offset.
+    auto date_value = m_timeline_offset.has_value()
+        ? static_cast<double>(m_timeline_offset->milliseconds_since_epoch())
+        : NAN;
+    return JS::Date::create(realm(), date_value).ptr();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#dom-media-ended
@@ -665,8 +686,8 @@ GC::Ref<TextTrack> HTMLMediaElement::add_text_track(Bindings::TextTrackKind kind
     //    textTracks attribute's TextTrackList object, using TrackEvent, with the track attribute initialized to the new
     //    text track's TextTrack object.
     queue_a_media_element_task([this, text_track] {
-        TrackEventInit event_init {};
-        event_init.track = GC::make_root(text_track);
+        Bindings::TrackEventInit event_init {};
+        event_init.track = GC::Root { text_track };
 
         auto event = TrackEvent::create(this->realm(), HTML::EventNames::addtrack, move(event_init));
         m_text_tracks->dispatch_event(event);
@@ -751,7 +772,8 @@ WebIDL::ExceptionOr<void> HTMLMediaElement::load_element()
             });
         }
 
-        // FIXME: 9. Set the timeline offset to Not-a-Number (NaN).
+        // 9. Set the timeline offset to Not-a-Number (NaN).
+        m_timeline_offset = {};
 
         // 10. Update the duration attribute to Not-a-Number (NaN).
         set_duration(NAN);
@@ -1279,6 +1301,7 @@ void HTMLMediaElement::load_remote_resource(ByteRange const& byte_range)
             // NOTE: We do this step before creating the updateMedia task so that we can invoke the failure callback.
             auto maybe_verify_response_failure = self->verify_response_or_get_failure_reason(response, byte_range);
             if (maybe_verify_response_failure.has_value()) {
+                fetch_data->stream->close();
                 fetch_data->failure_callback(maybe_verify_response_failure.value());
                 return;
             }
@@ -1328,6 +1351,8 @@ void HTMLMediaElement::load_remote_resource(ByteRange const& byte_range)
                     return;
                 if (fetch_generation != weak_self->m_current_fetch_generation)
                     return;
+
+                weak_self->m_remote_fetch_data->stream->close();
                 weak_self->queue_a_media_element_task([self = weak_self.as_nonnull()] {
                     self->process_media_data(FetchingStatus::Interrupted);
                 });
@@ -1526,11 +1551,37 @@ void HTMLMediaElement::set_audio_track_enabled(Badge<AudioTrack>, GC::Ptr<HTML::
         m_playback_manager->disable_an_audio_track(audio_track->track_in_playback_manager());
 }
 
-Painting::ExternalContentSource& HTMLMediaElement::ensure_external_content_source()
+Painting::VideoFrameResourceId HTMLMediaElement::ensure_video_frame_resource_id()
 {
-    if (!m_external_content_source)
-        m_external_content_source = Painting::ExternalContentSource::create();
-    return *m_external_content_source;
+    if (!m_video_frame_resource_id.has_value())
+        m_video_frame_resource_id = Painting::allocate_video_frame_resource_id();
+    return *m_video_frame_resource_id;
+}
+
+void HTMLMediaElement::update_compositor_video_frame(NonnullRefPtr<Media::VideoFrame const> frame)
+{
+    auto frame_id = ensure_video_frame_resource_id();
+    if (auto navigable = document().navigable(); navigable && navigable->has_compositor_context())
+        navigable->compositor_context().update_video_frame(frame_id, move(frame));
+}
+
+void HTMLMediaElement::clear_compositor_video_frame()
+{
+    if (!m_video_frame_resource_id.has_value())
+        return;
+    if (auto navigable = document().navigable(); navigable && navigable->has_compositor_context())
+        navigable->compositor_context().clear_video_frame(*m_video_frame_resource_id);
+}
+
+void HTMLMediaElement::update_current_video_frame()
+{
+    if (auto current_frame = m_selected_video_track_sink->current_frame())
+        update_compositor_video_frame(NonnullRefPtr<Media::VideoFrame const> { *current_frame });
+    else
+        clear_compositor_video_frame();
+
+    auto intrinsic_dimensions_changed = update_intrinsic_video_dimensions();
+    set_needs_repaint(intrinsic_dimensions_changed ? InvalidateDisplayList::Yes : InvalidateDisplayList::No);
 }
 
 void HTMLMediaElement::set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML::VideoTrack> video_track)
@@ -1540,16 +1591,23 @@ void HTMLMediaElement::set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML:
     if (video_track && !m_playback_manager->video_tracks().contains_slow(video_track->track_in_playback_manager()))
         return;
 
-    if (m_external_content_source)
-        m_external_content_source->clear();
+    clear_compositor_video_frame();
 
     auto previous_track = m_selected_video_track;
 
     m_selected_video_track = video_track;
-    if (video_track)
+    if (video_track) {
         m_selected_video_track_sink = m_playback_manager->get_or_create_the_displaying_video_sink_for_track(video_track->track_in_playback_manager());
-    else
+        auto sink_update_result = m_selected_video_track_sink->update();
+        if (sink_update_result == Media::DisplayingVideoSinkUpdateResult::NewFrameAvailable) {
+            update_current_video_frame();
+        } else if (auto* video_element = as_if<HTMLVideoElement>(this)) {
+            auto const& video_data = video_track->track_in_playback_manager().video_data();
+            video_element->set_intrinsic_video_dimensions(Gfx::Size<u32>(video_data.pixel_width, video_data.pixel_height));
+        }
+    } else {
         m_selected_video_track_sink = nullptr;
+    }
 
     if (previous_track)
         m_playback_manager->remove_the_displaying_video_sink_for_track(previous_track->track_in_playback_manager());
@@ -1562,10 +1620,8 @@ void HTMLMediaElement::update_video_frame_and_timeline()
 
     if (m_selected_video_track_sink) {
         auto sink_update_result = m_selected_video_track_sink->update();
-        if (sink_update_result == Media::DisplayingVideoSinkUpdateResult::NewFrameAvailable) {
-            ensure_external_content_source().update(m_selected_video_track_sink->current_frame());
-            set_needs_repaint();
-        }
+        if (sink_update_result == Media::DisplayingVideoSinkUpdateResult::NewFrameAvailable)
+            update_current_video_frame();
     }
 
     // Wait for the seek to complete before updating the timestamp, otherwise we'll display the timestamp from
@@ -1613,7 +1669,7 @@ void HTMLMediaElement::on_audio_track_added(Media::Track const& track)
         audio_track->set_enabled(true);
 
     // 7. Fire an event named addtrack at this AudioTrackList object, using TrackEvent, with the track attribute initialized to the new AudioTrack object.
-    TrackEventInit event_init {};
+    Bindings::TrackEventInit event_init {};
     event_init.track = GC::make_root(audio_track);
 
     auto event = TrackEvent::create(realm, EventNames::addtrack, move(event_init));
@@ -1656,7 +1712,7 @@ void HTMLMediaElement::on_video_track_added(Media::Track const& track)
         video_track->set_selected(true);
 
     // 7. Fire an event named addtrack at this VideoTrackList object, using TrackEvent, with the track attribute initialized to the new VideoTrack object.
-    TrackEventInit event_init {};
+    Bindings::TrackEventInit event_init {};
     event_init.track = GC::make_root(video_track);
 
     auto event = TrackEvent::create(realm, HTML::EventNames::addtrack, move(event_init));
@@ -1674,8 +1730,9 @@ void HTMLMediaElement::on_metadata_parsed()
     m_source_element_selector = nullptr;
 
     // FIXME: 1. Establish the media timeline for the purposes of the current playback position and the earliest possible position, based on the media data.
-    // FIXME: 2. Update the timeline offset to the date and time that corresponds to the zero time in the media timeline established in the previous step,
-    //           if any. If no explicit time and date is given by the media resource, the timeline offset must be set to Not-a-Number (NaN).
+    // 2. Update the timeline offset to the date and time that corresponds to the zero time in the media timeline established in the previous step,
+    //    if any. If no explicit time and date is given by the media resource, the timeline offset must be set to Not-a-Number (NaN).
+    m_timeline_offset = m_playback_manager->start_time_realtime();
 
     // 3. Set the current playback position and the official playback position to the earliest possible position.
     m_current_playback_position = 0;
@@ -1696,12 +1753,8 @@ void HTMLMediaElement::on_metadata_parsed()
     //    named resize at the media element.
     auto* video_element = as_if<HTMLVideoElement>(*this);
     if (m_selected_video_track && video_element) {
-        video_element->set_video_height(m_selected_video_track->track_in_playback_manager().video_data().pixel_height);
-        video_element->set_video_width(m_selected_video_track->track_in_playback_manager().video_data().pixel_width);
-
-        queue_a_media_element_task([this] {
-            dispatch_event(DOM::Event::create(this->realm(), HTML::EventNames::resize));
-        });
+        auto const& video_data = m_selected_video_track->track_in_playback_manager().video_data();
+        video_element->set_intrinsic_video_dimensions(Gfx::Size<u32>(video_data.pixel_width, video_data.pixel_height));
     }
 
     // 6. Set the readyState attribute to HAVE_METADATA.
@@ -1739,7 +1792,9 @@ void HTMLMediaElement::on_metadata_parsed()
         });
     }
 
-    // AD-HOC: If we've already got buffered data, we need to upgrade the readyState further than HAVE_METADATA.
+    // AD-HOC: Now that we've enabled one of each available track type, the playback manager can be started. If this
+    //         causes the playback manager to exit the initial state, the ready state should change.
+    m_playback_manager->start();
     update_ready_state();
 }
 
@@ -1969,6 +2024,10 @@ void HTMLMediaElement::forget_media_resource_specific_tracks()
     m_audio_tracks->remove_all_tracks();
     m_video_tracks->remove_all_tracks();
     m_playback_manager.clear();
+    clear_compositor_video_frame();
+
+    // NB: At this point, we no longer have any selected tracks to derive the video dimensions from.
+    update_intrinsic_video_dimensions();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#ready-states:media-element-3
@@ -1982,6 +2041,7 @@ void HTMLMediaElement::set_ready_state(ReadyState ready_state)
 
     ScopeGuard guard { [&] {
         upon_has_ended_playback_possibly_changed();
+        update_natural_dimensions();
         set_needs_style_update(true);
     } };
 
@@ -2121,9 +2181,10 @@ void HTMLMediaElement::update_ready_state()
     auto current_time = m_playback_manager->current_time();
     auto ranges = m_playback_manager->buffered_time_ranges();
     auto current_range = ranges.range_at_or_after(current_time);
-    auto has_future_data = m_playback_manager->has_future_data();
+    auto available_data = m_playback_manager->available_data();
 
-    if (!has_future_data && !current_range.has_value()) {
+    if (available_data == Media::AvailableData::None
+        || (available_data == Media::AvailableData::Current && !current_range.has_value())) {
         // 1. Set the HTMLMediaElement's readyState attribute to HAVE_METADATA.
         set_ready_state(ReadyState::HaveMetadata);
         // 2. Abort these steps.
@@ -2142,7 +2203,7 @@ void HTMLMediaElement::update_ready_state()
 
     // -> If HTMLMediaElement's buffered contains a TimeRanges that includes the current playback position and
     //    enough data to ensure uninterrupted playback:
-    if (has_future_data && (playable_duration >= have_enough_data_duration || current_range_end >= duration)) {
+    if (available_data == Media::AvailableData::Future && (playable_duration >= have_enough_data_duration || current_range_end >= duration)) {
         // 1. Set the HTMLMediaElement's readyState attribute to HAVE_ENOUGH_DATA.
         set_ready_state(ReadyState::HaveEnoughData);
 
@@ -2155,7 +2216,7 @@ void HTMLMediaElement::update_ready_state()
 
     // -> If HTMLMediaElement's buffered contains a TimeRanges that includes the current playback position and
     //    some time beyond the current playback position:
-    if (has_future_data && playable_duration > AK::Duration::zero()) {
+    if (available_data == Media::AvailableData::Future && playable_duration > AK::Duration::zero()) {
         // 1. Set the HTMLMediaElement's readyState attribute to HAVE_FUTURE_DATA.
         set_ready_state(ReadyState::HaveFutureData);
 
@@ -2474,6 +2535,7 @@ void HTMLMediaElement::set_show_poster(bool show_poster)
 
     m_show_poster = show_poster;
 
+    update_natural_dimensions();
     set_needs_repaint();
 }
 
@@ -2492,6 +2554,7 @@ void HTMLMediaElement::set_paused(bool paused)
             document().page().client().page_did_change_audio_play_state(AudioPlayState::Paused);
     }
 
+    update_natural_dimensions();
     set_needs_repaint();
     set_needs_style_update(true);
 }

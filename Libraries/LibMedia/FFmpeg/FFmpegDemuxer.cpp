@@ -12,6 +12,7 @@
 #include <LibMedia/FFmpeg/FFmpegDemuxer.h>
 #include <LibMedia/FFmpeg/FFmpegHelpers.h>
 #include <LibMedia/MediaStream.h>
+#include <LibMedia/SeekMode.h>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -128,6 +129,8 @@ DecoderErrorOr<NonnullRefPtr<FFmpegDemuxer>> FFmpegDemuxer::from_stream(NonnullR
 
     auto demuxer = DECODER_TRY_ALLOC(adopt_nonnull_ref_or_enomem(new (nothrow) FFmpegDemuxer(stream)));
     demuxer->m_total_duration = AK::Duration::from_time_units(format_context->duration, 1, AV_TIME_BASE);
+    if (format_context->start_time_realtime != AV_NOPTS_VALUE)
+        demuxer->m_start_time_realtime = AK::UnixDateTime::from_microseconds_since_epoch(format_context->start_time_realtime);
 
     auto format_name = StringView(format_context->iformat->name, strlen(format_context->iformat->name));
     auto seen_types = HashTable<TrackType>();
@@ -219,6 +222,11 @@ DecoderErrorOr<AK::Duration> FFmpegDemuxer::total_duration()
     return m_total_duration;
 }
 
+Optional<AK::UnixDateTime> FFmpegDemuxer::start_time_realtime() const
+{
+    return m_start_time_realtime;
+}
+
 TimeRanges FFmpegDemuxer::buffered_time_ranges() const
 {
     // FIXME: Use the format context's index to determine the buffered ranges from the underlying stream.
@@ -251,6 +259,21 @@ DecoderErrorOr<Optional<Track>> FFmpegDemuxer::get_preferred_track_for_type(Trac
         return OptionalNone();
 
     return m_stream_info[preferred_index].track;
+}
+
+AK::Duration FFmpegDemuxer::select_fast_seek_target_for_track(Track const&, AK::Duration target, SeekMode)
+{
+    // FIXME: We can do this using the index getter functions, but unfortunately FFmpeg's seek table is in
+    //        DTS -> byte position, so for files with reordered frames (H.264), seeking to a keyframe will often
+    //        result in the first frame back being at a later PTS than the seek target, so we would display a blank
+    //        frame. To avoid this being especially common, just always accurately seek.
+    //
+    //        Note that we can end up showing a blank frame anyway by accurately seeking very close to a keyframe,
+    //        it's just much less likely to happen under normal usage.
+    //
+    //        This FIXME can be dropped when MP4/MOV is demuxed separately from FFmpeg, and then inclusion of an
+    //        index scan here can be re-evaluated.
+    return target;
 }
 
 DecoderErrorOr<DemuxerSeekResult> FFmpegDemuxer::seek_to_most_recent_keyframe(Track const& track, AK::Duration timestamp, DemuxerSeekOptions)

@@ -7,7 +7,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGfx/ImmutableBitmap.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Fetch.h>
@@ -80,7 +80,11 @@ void ImageStyleValue::load_any_resources(DOM::Document& document)
                 if (image_data->is_animated() && image_data->frame_count() > 1) {
                     self.m_timer = Platform::Timer::create(self.m_document->heap());
                     self.m_timer->set_interval(image_data->frame_duration(0));
-                    self.m_timer->on_timeout = GC::create_function(self.m_document->heap(), [ptr = &self] { ptr->animate(); });
+                    auto weak_self = self.template make_weak_ptr<ImageStyleValue>();
+                    self.m_timer->on_timeout = GC::create_function(self.m_document->heap(), [weak_self] {
+                        if (weak_self)
+                            weak_self->animate();
+                    });
                     self.m_timer->start();
                 }
             }),
@@ -118,11 +122,11 @@ bool ImageStyleValue::is_paintable() const
     return image_data();
 }
 
-Gfx::ImmutableBitmap const* ImageStyleValue::bitmap(size_t frame_index, Gfx::IntSize size) const
+Optional<Gfx::DecodedImageFrame> ImageStyleValue::frame(size_t frame_index, Gfx::IntSize size) const
 {
     if (auto image_data = this->image_data())
-        return image_data->bitmap(frame_index, size);
-    return nullptr;
+        return image_data->frame(frame_index, size);
+    return {};
 }
 
 void ImageStyleValue::serialize(StringBuilder& builder, SerializationMode) const
@@ -170,9 +174,9 @@ void ImageStyleValue::paint(DisplayListRecordingContext& context, DevicePixelRec
     image_data->paint(context, m_current_frame_index, dest_int_rect, dest_int_rect, scaling_mode);
 }
 
-Gfx::ImmutableBitmap const* ImageStyleValue::current_frame_bitmap(DevicePixelRect const& dest_rect) const
+Optional<Gfx::DecodedImageFrame> ImageStyleValue::current_frame(DevicePixelRect const& dest_rect) const
 {
-    return bitmap(m_current_frame_index, dest_rect.size().to_type<int>());
+    return frame(m_current_frame_index, dest_rect.size().to_type<int>());
 }
 
 GC::Ptr<HTML::DecodedImageData> ImageStyleValue::image_data() const
@@ -184,9 +188,10 @@ GC::Ptr<HTML::DecodedImageData> ImageStyleValue::image_data() const
 
 Optional<Gfx::Color> ImageStyleValue::color_if_single_pixel_bitmap() const
 {
-    if (auto const* b = bitmap(m_current_frame_index)) {
-        if (b->width() == 1 && b->height() == 1)
-            return b->get_pixel(0, 0);
+    if (auto decoded_frame = frame(m_current_frame_index); decoded_frame.has_value()) {
+        auto const& bitmap = decoded_frame->bitmap();
+        if (bitmap.width() == 1 && bitmap.height() == 1)
+            return bitmap.get_pixel(0, 0);
     }
     return {};
 }
@@ -229,19 +234,19 @@ ValueComparingNonnullRefPtr<StyleValue const> ImageStyleValue::absolutized(Compu
     return *this;
 }
 
-void ImageStyleValue::register_client(Client& client)
+void ImageStyleValue::register_client(Client& client) const
 {
     auto result = m_clients.set(&client);
     VERIFY(result == AK::HashSetResult::InsertedNewEntry);
 }
 
-void ImageStyleValue::unregister_client(Client& client)
+void ImageStyleValue::unregister_client(Client& client) const
 {
     auto did_remove = m_clients.remove(&client);
     VERIFY(did_remove);
 }
 
-ImageStyleValue::Client::Client(ImageStyleValue& image_style_value)
+ImageStyleValue::Client::Client(ImageStyleValue const& image_style_value)
     : m_image_style_value(image_style_value)
 {
     m_image_style_value.register_client(*this);

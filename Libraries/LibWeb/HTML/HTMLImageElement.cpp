@@ -8,10 +8,9 @@
 #include <LibCore/Timer.h>
 #include <LibGC/Weak.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/ImmutableBitmap.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/ARIA/Roles.h>
-#include <LibWeb/Bindings/HTMLImageElementPrototype.h>
-#include <LibWeb/CSS/CascadedProperties.h>
+#include <LibWeb/Bindings/HTMLImageElement.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -38,6 +37,7 @@
 #include <LibWeb/HTML/PotentialCORSRequest.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
+#include <LibWeb/HTML/SupportedImageTypes.h>
 #include <LibWeb/Layout/ImageBox.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Painting/PaintableBox.h>
@@ -47,6 +47,45 @@
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 
 namespace Web::HTML {
+
+// We batch handling of successfully fetched images to avoid interleaving 1 image, 1 layout, 1 image, 1 layout, etc.
+// The processing timer is 1ms instead of 0ms, since layout is driven by a 0ms timer, and if we use 0ms here,
+// the event loop will process them in insertion order. This is a bit of a hack, but it works.
+struct BatchingDispatcher {
+public:
+    BatchingDispatcher()
+        : m_timer(Core::Timer::create_single_shot(1, [this] { process(); }))
+    {
+    }
+
+    void enqueue(GC::Root<GC::Function<void()>> callback)
+    {
+        // NOTE: We don't want to flush the queue on every image load, since that would be slow.
+        //       However, we don't want to keep growing the batch forever either.
+        static constexpr size_t max_loads_to_batch_before_flushing = 16;
+
+        m_queue.append(move(callback));
+        if (m_queue.size() < max_loads_to_batch_before_flushing)
+            m_timer->restart();
+    }
+
+private:
+    void process()
+    {
+        auto queue = move(m_queue);
+        for (auto& callback : queue)
+            callback->function()();
+    }
+
+    NonnullRefPtr<Core::Timer> m_timer;
+    Vector<GC::Root<GC::Function<void()>>> m_queue;
+};
+
+static BatchingDispatcher& batching_dispatcher()
+{
+    static BatchingDispatcher dispatcher;
+    return dispatcher;
+}
 
 GC_DEFINE_ALLOCATOR(HTMLImageElement);
 
@@ -136,33 +175,33 @@ bool HTMLImageElement::is_presentational_hint(FlyString const& name) const
         HTML::AttributeNames::border);
 }
 
-void HTMLImageElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperties> cascaded_properties) const
+void HTMLImageElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
-    Base::apply_presentational_hints(cascaded_properties);
+    Base::apply_presentational_hints(properties);
     for_each_attribute([&](auto& name, auto& value) {
         if (name == HTML::AttributeNames::hspace) {
             if (auto parsed_value = parse_dimension_value(value)) {
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginLeft, *parsed_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginRight, *parsed_value);
+                properties.append({ .property_id = CSS::PropertyID::MarginLeft, .value = *parsed_value });
+                properties.append({ .property_id = CSS::PropertyID::MarginRight, .value = *parsed_value });
             }
         } else if (name == HTML::AttributeNames::vspace) {
             if (auto parsed_value = parse_dimension_value(value)) {
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginTop, *parsed_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginBottom, *parsed_value);
+                properties.append({ .property_id = CSS::PropertyID::MarginTop, .value = *parsed_value });
+                properties.append({ .property_id = CSS::PropertyID::MarginBottom, .value = *parsed_value });
             }
         } else if (name == HTML::AttributeNames::border) {
             if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
                 auto width_value = CSS::LengthStyleValue::create(CSS::Length::make_px(*parsed_value));
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderTopWidth, width_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderRightWidth, width_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderBottomWidth, width_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderLeftWidth, width_value);
+                properties.append({ .property_id = CSS::PropertyID::BorderTopWidth, .value = width_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderRightWidth, .value = width_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderBottomWidth, .value = width_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderLeftWidth, .value = width_value });
 
                 auto solid_value = CSS::KeywordStyleValue::create(CSS::Keyword::Solid);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderTopStyle, solid_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderRightStyle, solid_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderBottomStyle, solid_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderLeftStyle, solid_value);
+                properties.append({ .property_id = CSS::PropertyID::BorderTopStyle, .value = solid_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderRightStyle, .value = solid_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderBottomStyle, .value = solid_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderLeftStyle, .value = solid_value });
             }
         }
     });
@@ -202,16 +241,11 @@ void HTMLImageElement::adjust_computed_style(CSS::ComputedProperties& style)
         style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
 }
 
-RefPtr<Gfx::ImmutableBitmap> HTMLImageElement::immutable_bitmap() const
-{
-    return current_image_bitmap();
-}
-
-RefPtr<Gfx::ImmutableBitmap> HTMLImageElement::default_image_bitmap_sized(Gfx::IntSize size) const
+Optional<Gfx::DecodedImageFrame> HTMLImageElement::default_image_frame_sized(Gfx::IntSize size) const
 {
     if (auto data = m_current_request->image_data())
-        return data->bitmap(0, size);
-    return nullptr;
+        return data->frame(0, size);
+    return {};
 }
 
 bool HTMLImageElement::is_image_available() const
@@ -240,11 +274,11 @@ Optional<CSSPixelFraction> HTMLImageElement::intrinsic_aspect_ratio() const
     return {};
 }
 
-RefPtr<Gfx::ImmutableBitmap> HTMLImageElement::current_image_bitmap_sized(Gfx::IntSize size) const
+Optional<Gfx::DecodedImageFrame> HTMLImageElement::current_image_frame_sized(Gfx::IntSize size) const
 {
     if (auto data = m_current_request->image_data())
-        return data->bitmap(m_current_frame_index, size);
-    return nullptr;
+        return data->frame(m_current_frame_index, size);
+    return {};
 }
 
 void HTMLImageElement::set_visible_in_viewport(bool)
@@ -258,7 +292,7 @@ WebIDL::UnsignedLong HTMLImageElement::width() const
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementWidth);
 
     // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto* paintable_box = this->paintable_box())
+    if (auto paintable_box = this->paintable_box())
         return paintable_box->content_width().to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -269,7 +303,7 @@ WebIDL::UnsignedLong HTMLImageElement::width() const
 
     // ...or else the density-corrected intrinsic width and height of the image, in CSS pixels,
     // if the image has intrinsic dimensions and is available but not being rendered.
-    if (auto bitmap = current_image_bitmap())
+    if (auto bitmap = current_image_frame(); bitmap.has_value())
         return bitmap->width();
 
     // ...or else 0, if the image is not available or does not have intrinsic dimensions.
@@ -289,7 +323,7 @@ WebIDL::UnsignedLong HTMLImageElement::height() const
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementHeight);
 
     // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto* paintable_box = this->paintable_box())
+    if (auto paintable_box = this->paintable_box())
         return paintable_box->content_height().to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -300,7 +334,7 @@ WebIDL::UnsignedLong HTMLImageElement::height() const
 
     // ...or else the density-corrected intrinsic height and height of the image, in CSS pixels,
     // if the image has intrinsic dimensions and is available but not being rendered.
-    if (auto bitmap = current_image_bitmap())
+    if (auto bitmap = current_image_frame(); bitmap.has_value())
         return bitmap->height();
 
     // ...or else 0, if the image is not available or does not have intrinsic dimensions.
@@ -319,7 +353,7 @@ unsigned HTMLImageElement::natural_width() const
 {
     // Return the density-corrected intrinsic width of the image, in CSS pixels,
     // if the image has intrinsic dimensions and is available.
-    if (auto bitmap = current_image_bitmap())
+    if (auto bitmap = current_image_frame(); bitmap.has_value())
         return bitmap->width();
 
     // ...or else 0.
@@ -331,7 +365,7 @@ unsigned HTMLImageElement::natural_height() const
 {
     // Return the density-corrected intrinsic height of the image, in CSS pixels,
     // if the image has intrinsic dimensions and is available.
-    if (auto bitmap = current_image_bitmap())
+    if (auto bitmap = current_image_frame(); bitmap.has_value())
         return bitmap->height();
 
     // ...or else 0.
@@ -346,7 +380,7 @@ int HTMLImageElement::x() const
     // to the element and its ancestors, or zero if there is no box.
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementX);
 
-    auto const* paintable_box = this->paintable_box();
+    auto paintable_box = this->paintable_box();
     if (!paintable_box)
         return 0;
 
@@ -365,7 +399,7 @@ int HTMLImageElement::y() const
     // to the element and its ancestors, or zero if there is no box.
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementY);
 
-    auto const* paintable_box = this->paintable_box();
+    auto paintable_box = this->paintable_box();
     if (!paintable_box)
         return 0;
 
@@ -465,26 +499,32 @@ WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> HTMLImageElement::decode() const
         }
 
         current_request.add_callbacks(
-            [weak_this, expected_request, queue_resolve_task, queue_reject_task] {
-                if (!weak_this) {
-                    queue_reject_task("Image element no longer available"_utf16);
-                    return;
-                }
-                auto& image = *weak_this;
+            // AD-HOC: Enqueue on the batching dispatcher to preserve ordering relative to update_the_image_data's step
+            //         16, which also goes through the batching dispatcher. Otherwise decode() can resolve before the
+            //         current request transitions to CompletelyAvailable, leaving the image dimensions at zero when
+            //         callers inspect them.
+            [weak_this, expected_request, queue_resolve_task, queue_reject_task, &realm] {
+                batching_dispatcher().enqueue(GC::create_function(realm.heap(), [weak_this, expected_request, queue_resolve_task, queue_reject_task] {
+                    if (!weak_this) {
+                        queue_reject_task("Image element no longer available"_utf16);
+                        return;
+                    }
+                    auto& image = *weak_this;
 
-                if (!image.document().is_fully_active()) {
-                    queue_reject_task("Node document not fully active"_utf16);
-                    return;
-                }
-                if (image.m_current_request != expected_request) {
-                    queue_reject_task("Current request changed or was mutated"_utf16);
-                    return;
-                }
-                if (image.current_request().state() == ImageRequest::State::Broken) {
-                    queue_reject_task("Current request state is broken"_utf16);
-                    return;
-                }
-                queue_resolve_task();
+                    if (!image.document().is_fully_active()) {
+                        queue_reject_task("Node document not fully active"_utf16);
+                        return;
+                    }
+                    if (image.m_current_request != expected_request) {
+                        queue_reject_task("Current request changed or was mutated"_utf16);
+                        return;
+                    }
+                    if (image.current_request().state() == ImageRequest::State::Broken) {
+                        queue_reject_task("Current request state is broken"_utf16);
+                        return;
+                    }
+                    queue_resolve_task();
+                }));
             },
             [weak_this, expected_request, queue_reject_task] {
                 if (!weak_this) {
@@ -531,45 +571,6 @@ bool HTMLImageElement::uses_srcset_or_picture() const
     // An img element is said to use srcset or picture if it has a srcset attribute specified
     // or if it has a parent that is a picture element.
     return has_attribute(HTML::AttributeNames::srcset) || (parent() && is<HTMLPictureElement>(*parent()));
-}
-
-// We batch handling of successfully fetched images to avoid interleaving 1 image, 1 layout, 1 image, 1 layout, etc.
-// The processing timer is 1ms instead of 0ms, since layout is driven by a 0ms timer, and if we use 0ms here,
-// the event loop will process them in insertion order. This is a bit of a hack, but it works.
-struct BatchingDispatcher {
-public:
-    BatchingDispatcher()
-        : m_timer(Core::Timer::create_single_shot(1, [this] { process(); }))
-    {
-    }
-
-    void enqueue(GC::Root<GC::Function<void()>> callback)
-    {
-        // NOTE: We don't want to flush the queue on every image load, since that would be slow.
-        //       However, we don't want to keep growing the batch forever either.
-        static constexpr size_t max_loads_to_batch_before_flushing = 16;
-
-        m_queue.append(move(callback));
-        if (m_queue.size() < max_loads_to_batch_before_flushing)
-            m_timer->restart();
-    }
-
-private:
-    void process()
-    {
-        auto queue = move(m_queue);
-        for (auto& callback : queue)
-            callback->function()();
-    }
-
-    NonnullRefPtr<Core::Timer> m_timer;
-    Vector<GC::Root<GC::Function<void()>>> m_queue;
-};
-
-static BatchingDispatcher& batching_dispatcher()
-{
-    static BatchingDispatcher dispatcher;
-    return dispatcher;
 }
 
 // https://html.spec.whatwg.org/multipage/images.html#update-the-image-data
@@ -690,6 +691,9 @@ void HTMLImageElement::update_the_image_data_impl(bool restart_animations, bool 
 
                 // 2. Set the current request's current URL to urlString.
                 m_current_request->set_current_url(realm(), *url_string);
+
+                set_needs_style_update(true);
+                set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
 
                 // 3. If maybe omit events is not set or previousURL is not equal to urlString, then fire an event named load at the img element.
                 if (!maybe_omit_events || previous_url != url_string)
@@ -926,6 +930,7 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
 
                 // 3. Add the image to the list of available images using the key key, with the ignore higher-layer caching flag set.
                 document().list_of_available_images().add(key, *image_data, true);
+                document().prune_image_resource_caches();
 
                 set_needs_style_update(true);
                 set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
@@ -1076,6 +1081,7 @@ void HTMLImageElement::react_to_changes_in_the_environment()
 
             // 4. Add the image to the list of available images using the key key, with the ignore higher-layer caching flag set.
             document().list_of_available_images().add(key, image_data, true);
+            document().prune_image_resource_caches();
 
             // 5. Upgrade the pending request to the current request.
             upgrade_pending_request_to_current_request();
@@ -1182,33 +1188,6 @@ void HTMLImageElement::restart_the_animation()
     } else {
         m_animation_timer->stop();
     }
-}
-
-static bool is_supported_image_type(String const& type)
-{
-    if (type.is_empty())
-        return true;
-    if (!type.starts_with_bytes("image/"sv, CaseSensitivity::CaseInsensitive))
-        return false;
-    // FIXME: These should be derived from ImageDecoder
-    if (type.equals_ignoring_ascii_case("image/bmp"sv)
-        || type.equals_ignoring_ascii_case("image/gif"sv)
-        || type.equals_ignoring_ascii_case("image/vnd.microsoft.icon"sv)
-        || type.equals_ignoring_ascii_case("image/x-icon"sv)
-        || type.equals_ignoring_ascii_case("image/jpeg"sv)
-        || type.equals_ignoring_ascii_case("image/jpg"sv)
-        || type.equals_ignoring_ascii_case("image/pjpeg"sv)
-        || type.equals_ignoring_ascii_case("image/jxl"sv)
-        || type.equals_ignoring_ascii_case("image/png"sv)
-        || type.equals_ignoring_ascii_case("image/apng"sv)
-        || type.equals_ignoring_ascii_case("image/x-png"sv)
-        || type.equals_ignoring_ascii_case("image/tiff"sv)
-        || type.equals_ignoring_ascii_case("image/tinyvg"sv)
-        || type.equals_ignoring_ascii_case("image/webp"sv)
-        || type.equals_ignoring_ascii_case("image/svg+xml"sv))
-        return true;
-
-    return false;
 }
 
 // https://html.spec.whatwg.org/multipage/images.html#update-the-source-set

@@ -92,9 +92,9 @@ static ::Crypto::UnsignedBigInteger big_integer_from_api_big_integer(GC::Ptr<JS:
     // (that is, at most 7 leading zero bits, except the value 0 which shall have length 8 bits).
     // The API SHALL accept values with any number of leading zero bits, including the empty array, which represents zero.
 
-    auto const& buffer = big_integer->viewed_array_buffer()->buffer();
+    auto buffer = big_integer->viewed_array_buffer()->bytes();
 
-    if (buffer.size() > 0)
+    if (!buffer.is_empty())
         return ::Crypto::UnsignedBigInteger::import_data(buffer);
     return ::Crypto::UnsignedBigInteger(0);
 }
@@ -189,7 +189,7 @@ static WebIDL::ExceptionOr<::Crypto::Certificate::PrivateKey> parse_a_private_ke
     return parse_an_ASN1_structure<::Crypto::Certificate::PrivateKey>(realm, bytes, true);
 }
 
-static WebIDL::ExceptionOr<::Crypto::PK::RSAPrivateKey> parse_jwk_rsa_private_key(JS::Realm& realm, Bindings::JsonWebKey const& jwk)
+static WebIDL::ExceptionOr<::Crypto::PK::RSAPrivateKey> parse_jwk_rsa_private_key(JS::Realm& realm, JsonWebKey const& jwk)
 {
     auto n = TRY(base64_url_uint_decode(realm, *jwk.n));
     auto d = TRY(base64_url_uint_decode(realm, *jwk.d));
@@ -208,7 +208,7 @@ static WebIDL::ExceptionOr<::Crypto::PK::RSAPrivateKey> parse_jwk_rsa_private_ke
     return ::Crypto::PK::RSAPrivateKey(move(n), move(d), move(e), move(p), move(q), move(dp), move(dq), move(qi));
 }
 
-static WebIDL::ExceptionOr<::Crypto::PK::RSAPublicKey> parse_jwk_rsa_public_key(JS::Realm& realm, Bindings::JsonWebKey const& jwk)
+static WebIDL::ExceptionOr<::Crypto::PK::RSAPublicKey> parse_jwk_rsa_public_key(JS::Realm& realm, JsonWebKey const& jwk)
 {
     auto e = TRY(base64_url_uint_decode(realm, *jwk.e));
     auto n = TRY(base64_url_uint_decode(realm, *jwk.n));
@@ -216,7 +216,7 @@ static WebIDL::ExceptionOr<::Crypto::PK::RSAPublicKey> parse_jwk_rsa_public_key(
     return ::Crypto::PK::RSAPublicKey(move(n), move(e));
 }
 
-static WebIDL::ExceptionOr<ByteBuffer> parse_jwk_symmetric_key(JS::Realm& realm, Bindings::JsonWebKey const& jwk)
+static WebIDL::ExceptionOr<ByteBuffer> parse_jwk_symmetric_key(JS::Realm& realm, JsonWebKey const& jwk)
 {
     if (!jwk.k.has_value()) {
         return WebIDL::DataError::create(realm, "JWK has no 'k' field"_utf16);
@@ -225,7 +225,7 @@ static WebIDL::ExceptionOr<ByteBuffer> parse_jwk_symmetric_key(JS::Realm& realm,
 }
 
 // https://www.rfc-editor.org/rfc/rfc7517#section-4.3
-static WebIDL::ExceptionOr<void> validate_jwk_key_ops(JS::Realm& realm, Bindings::JsonWebKey const& jwk, Vector<Bindings::KeyUsage> const& usages)
+static WebIDL::ExceptionOr<void> validate_jwk_key_ops(JS::Realm& realm, JsonWebKey const& jwk, Vector<Bindings::KeyUsage> const& usages)
 {
     // Use of the "key_ops" member is OPTIONAL, unless the application requires its presence.
     if (!jwk.key_ops.has_value())
@@ -1030,9 +1030,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSAOAEP::import_key(Web::Crypto::Algorit
         //         Let jwk equal keyData.
         //    -> Otherwise:
         //         Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field of jwk is present and usages contains an entry which is not "decrypt" or "unwrapKey", then throw a SyntaxError.
         if (jwk.d.has_value()) {
@@ -1270,7 +1270,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> RSAOAEP::export_key(Bindings::KeyFormat
     // If format is "jwk"
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "RSA".
         jwk.kty = "RSA"_string;
@@ -1613,9 +1613,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSAPSS::import_key(AlgorithmParams const
         //         Let jwk equal keyData.
         //    -> Otherwise:
         //         Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field of jwk is present and usages contains an entry which is not "sign", or,
         //    if the d field of jwk is not present and usages contains an entry which is not "verify"
@@ -1852,7 +1852,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> RSAPSS::export_key(Bindings::KeyFormat 
     // If format is "jwk"
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "RSA".
         jwk.kty = "RSA"_string;
@@ -2190,9 +2190,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSASSAPKCS1::import_key(AlgorithmParams 
         //         Let jwk equal keyData.
         //    -> Otherwise:
         //         Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field of jwk is present and usages contains an entry which is not "sign", or,
         //    if the d field of jwk is not present and usages contains an entry which is not "verify"
@@ -2429,7 +2429,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> RSASSAPKCS1::export_key(Bindings::KeyFo
     // If format is "jwk"
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "RSA".
         jwk.kty = "RSA"_string;
@@ -2593,9 +2593,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> AesCbc::import_key(AlgorithmParams const
         //                Let jwk equal keyData.
         //       ->   Otherwise:
         //                Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         //    2. If the kty field of jwk is not "oct", then throw a DataError.
         if (jwk.kty != "oct"_string)
@@ -2738,7 +2738,9 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesCbc::export_key(Bindings::KeyFormat 
     GC::Ptr<JS::Object> result = nullptr;
 
     // 2. -> If format is "raw":
-    if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing symmetric algorithms in WebCrypto, "raw-secret" acts as an alias of "raw".
+    if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawSecret) {
         // 1. Let data be the raw octets of the key represented by [[handle]] internal slot of key.
         auto data = handle.get<ByteBuffer>();
 
@@ -2748,7 +2750,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesCbc::export_key(Bindings::KeyFormat 
     //    -> If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "oct".
         jwk.kty = "oct"_string;
@@ -2841,10 +2843,10 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> AesCtr::import_key(AlgorithmParams const
         //         Let jwk equal keyData.
         //    -> Otherwise:
         //         Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
 
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the kty field of jwk is not "oct", then throw a DataError.
         if (jwk.kty != "oct"_string)
@@ -2939,7 +2941,9 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesCtr::export_key(Bindings::KeyFormat 
     GC::Ptr<JS::Object> result = nullptr;
 
     // 2. If format is "raw":
-    if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing symmetric algorithms in WebCrypto, "raw-secret" acts as an alias of "raw".
+    if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawSecret) {
         // 1. Let data be the raw octets of the key represented by [[handle]] internal slot of key.
         auto data = key->handle().get<ByteBuffer>();
 
@@ -2950,7 +2954,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesCtr::export_key(Bindings::KeyFormat 
     // 2. If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "oct".
         jwk.kty = "oct"_string;
@@ -3161,10 +3165,10 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> AesGcm::import_key(AlgorithmParams const
         //         Let jwk equal keyData.
         //    -> Otherwise:
         //         Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
 
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the kty field of jwk is not "oct", then throw a DataError.
         if (jwk.kty != "oct"_string)
@@ -3259,7 +3263,9 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesGcm::export_key(Bindings::KeyFormat 
     GC::Ptr<JS::Object> result = nullptr;
 
     // 2. If format is "raw":
-    if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing symmetric algorithms in WebCrypto, "raw-secret" acts as an alias of "raw".
+    if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawSecret) {
         // 1. Let data be the raw octets of the key represented by [[handle]] internal slot of key.
         auto data = key->handle().get<ByteBuffer>();
 
@@ -3270,7 +3276,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesGcm::export_key(Bindings::KeyFormat 
     // 2. If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "oct".
         jwk.kty = "oct"_string;
@@ -3511,10 +3517,10 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> AesKw::import_key(AlgorithmParams const&
         //         Let jwk equal keyData.
         //    -> Otherwise:
         //         Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
 
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the kty field of jwk is not "oct", then throw a DataError.
         if (jwk.kty != "oct"_string)
@@ -3607,7 +3613,9 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesKw::export_key(Bindings::KeyFormat f
     GC::Ptr<JS::Object> result = nullptr;
 
     // 2. If format is "raw":
-    if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing symmetric algorithms in WebCrypto, "raw-secret" acts as an alias of "raw".
+    if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawSecret) {
         // 1. Let data be the raw octets of the key represented by [[handle]] internal slot of key.
         auto data = key->handle().get<ByteBuffer>();
 
@@ -3618,7 +3626,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesKw::export_key(Bindings::KeyFormat f
     // 2. If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "oct".
         jwk.kty = "oct"_string;
@@ -3775,7 +3783,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> HKDF::import_key(AlgorithmParams const&,
     //        (… see below …)
     //    Otherwise:
     //        throw a NotSupportedError.
-    if (format != Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing symmetric algorithms in WebCrypto, "raw-secret" acts as an alias of "raw".
+    if (format != Bindings::KeyFormat::Raw && format != Bindings::KeyFormat::RawSecret) {
         return WebIDL::NotSupportedError::create(m_realm, "Only raw format is supported"_utf16);
     }
 
@@ -4364,9 +4374,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ECDSA::import_key(AlgorithmParams const&
     else if (key_format == Bindings::KeyFormat::Jwk) {
         // 1. If keyData is a JsonWebKey dictionary: Let jwk equal keyData.
         //    Otherwise: Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field is present and usages contains a value which is not "sign", or,
         //    if the d field is not present and usages contains a value which is not "verify" then throw a SyntaxError.
@@ -4556,7 +4566,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ECDSA::import_key(AlgorithmParams const&
     }
 
     // 2. If format is "raw":
-    else if (key_format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing asymmetric algorithms in WebCrypto, "raw-public" acts as an alias of "raw".
+    else if (key_format == Bindings::KeyFormat::Raw || key_format == Bindings::KeyFormat::RawPublic) {
         // 1. If the namedCurve member of normalizedAlgorithm is not a named curve, then throw a DataError.
         if (!normalized_algorithm.named_curve.is_one_of("P-256"sv, "P-384"sv, "P-521"sv))
             return WebIDL::DataError::create(m_realm, "Invalid algorithm"_utf16);
@@ -4757,7 +4769,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> ECDSA::export_key(Bindings::KeyFormat f
     // 3. If format is "jwt":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to "EC".
         jwk.kty = "EC"_string;
@@ -4866,7 +4878,9 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> ECDSA::export_key(Bindings::KeyFormat f
     }
 
     // 3. If format is "raw":
-    else if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing asymmetric algorithms in WebCrypto, "raw-public" acts as an alias of "raw".
+    else if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawPublic) {
         // 1. If the [[type]] internal slot of key is not "public", then throw an InvalidAccessError.
         if (key->type() != Bindings::KeyType::Public)
             return WebIDL::InvalidAccessError::create(m_realm, "Key is not a public key"_utf16);
@@ -5350,9 +5364,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ECDH::import_key(AlgorithmParams const& 
     else if (key_format == Bindings::KeyFormat::Jwk) {
         // 1. If keyData is a JsonWebKey dictionary: Let jwk equal keyData.
         //    Otherwise: Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field is present and if usages contains an entry which is not "deriveKey" or "deriveBits" then throw a SyntaxError.
         if (jwk.d.has_value() && !usages.is_empty()) {
@@ -5511,7 +5525,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ECDH::import_key(AlgorithmParams const& 
     }
 
     // 2. If format is "raw":
-    else if (key_format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing asymmetric algorithms in WebCrypto, "raw-public" acts as an alias of "raw".
+    else if (key_format == Bindings::KeyFormat::Raw || key_format == Bindings::KeyFormat::RawPublic) {
         // 1. If the namedCurve member of normalizedAlgorithm is not a named curve, then throw a DataError.
         if (!normalized_algorithm.named_curve.is_one_of("P-256"sv, "P-384"sv, "P-521"sv))
             return WebIDL::DataError::create(m_realm, "Invalid algorithm"_utf16);
@@ -5703,7 +5719,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> ECDH::export_key(Bindings::KeyFormat fo
     // 3. If format is "jwt":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to "EC".
         jwk.kty = "EC"_string;
@@ -5812,7 +5828,9 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> ECDH::export_key(Bindings::KeyFormat fo
     }
 
     // 3. If format is "raw":
-    else if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing asymmetric algorithms in WebCrypto, "raw-public" acts as an alias of "raw".
+    else if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawPublic) {
         // 1. If the [[type]] internal slot of key is not "public", then throw an InvalidAccessError.
         if (key->type() != Bindings::KeyType::Public)
             return WebIDL::InvalidAccessError::create(m_realm, "Key is not a public key"_utf16);
@@ -6022,9 +6040,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED25519::import_key(
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. If keyData is a JsonWebKey dictionary: Let jwk equal keyData.
         //    Otherwise: Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field is present and usages contains a value which is not "sign",
         //    or, if the d field is not present and usages contains a value which is not "verify" then throw a SyntaxError.
@@ -6082,19 +6100,24 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED25519::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (!jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
+            auto private_key = TRY(base64_url_bytes_decode(m_realm, jwk.d.value()));
+            if (private_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
+
+            ::Crypto::Curves::Ed25519 curve;
+            auto derived_public_key = TRY_OR_THROW_OOM(m_realm->vm(), curve.generate_public_key(private_key));
+            if (derived_public_key != public_key)
+                return WebIDL::DataError::create(m_realm, "Invalid key pair"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the Ed25519 private key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto private_key_base_64 = jwk.d.value();
-            auto private_key_or_error = decode_base64url(private_key_base_64);
-            if (private_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto private_key = private_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { private_key });
 
             // 3. Set the [[type]] internal slot of Key to "private".
@@ -6115,6 +6138,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED25519::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
@@ -6122,12 +6148,6 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED25519::import_key(
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the Ed25519 public key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto public_key_base_64 = jwk.x.value();
-            auto public_key_or_error = decode_base64url(public_key_base_64);
-            if (public_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto public_key = public_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { public_key });
 
             // 3. Set the [[type]] internal slot of Key to "public".
@@ -6145,7 +6165,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED25519::import_key(
     }
 
     // 2. If format is "raw":
-    else if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing asymmetric algorithms in WebCrypto, "raw-public" acts as an alias of "raw".
+    else if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawPublic) {
         // 1. If usages contains a value which is not "verify" then throw a SyntaxError.
         for (auto const& usage : usages) {
             if (usage != Bindings::KeyUsage::Verify) {
@@ -6239,7 +6261,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> ED25519::export_key(Bindings::KeyFormat
     // 2. If format is "jwk":
     if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk;
+        JsonWebKey jwk;
 
         // 2. Set the kty attribute of jwk to "OKP".
         jwk.kty = "OKP"_string;
@@ -6283,7 +6305,9 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> ED25519::export_key(Bindings::KeyFormat
     }
 
     // 2. If format is "raw":
-    if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing asymmetric algorithms in WebCrypto, "raw-public" acts as an alias of "raw".
+    if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawPublic) {
         // 1. If the [[type]] internal slot of key is not "public", then throw an InvalidAccessError.
         if (key->type() != Bindings::KeyType::Public)
             return WebIDL::InvalidAccessError::create(m_realm, "Key is not a public key"_utf16);
@@ -6530,9 +6554,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. If keyData is a JsonWebKey dictionary: Let jwk equal keyData.
         //    Otherwise: Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field is present and usages contains a value which is not "sign",
         //    or, if the d field is not present and usages contains a value which is not "verify" then throw a SyntaxError.
@@ -6590,19 +6614,24 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 57)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (!jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
+            auto private_key = TRY(base64_url_bytes_decode(m_realm, jwk.d.value()));
+            if (private_key.size() != 57)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
+
+            ::Crypto::Curves::Ed448 curve;
+            auto derived_public_key = TRY_OR_THROW_OOM(m_realm->vm(), curve.generate_public_key(private_key));
+            if (derived_public_key != public_key)
+                return WebIDL::DataError::create(m_realm, "Invalid key pair"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the Ed448 private key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto private_key_base_64 = jwk.d.value();
-            auto private_key_or_error = decode_base64url(private_key_base_64);
-            if (private_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto private_key = private_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { private_key });
 
             // 3. Set the [[type]] internal slot of Key to "private".
@@ -6623,6 +6652,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 57)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
@@ -6630,12 +6662,6 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the Ed448 public key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto public_key_base_64 = jwk.x.value();
-            auto public_key_or_error = decode_base64url(public_key_base_64);
-            if (public_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto public_key = public_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { public_key });
 
             // 3. Set the [[type]] internal slot of Key to "public".
@@ -6665,7 +6691,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
         auto data = move(key_data.get<ByteBuffer>());
 
         // 3. If the length in bits of data is not 448 then throw a DataError.
-        if (data.size() * 8 != 448)
+        // AD-HOC: The spec has a typo with the size of the key length
+        //         See spec comment: https://github.com/w3c/webcrypto/pull/425#discussion_r3070135408
+        if (data.size() * 8 != 456)
             return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
         // 4. Let algorithm be a new KeyAlgorithm object.
@@ -6745,7 +6773,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> ED448::export_key(Bindings::KeyFormat f
     // 2. If format is "jwk":
     if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk;
+        JsonWebKey jwk;
 
         // 2. Set the kty attribute of jwk to "OKP".
         jwk.kty = "OKP"_string;
@@ -6997,7 +7025,9 @@ WebIDL::ExceptionOr<JS::Value> PBKDF2::get_key_length(AlgorithmParams const&)
 WebIDL::ExceptionOr<GC::Ref<CryptoKey>> PBKDF2::import_key(AlgorithmParams const&, Bindings::KeyFormat format, CryptoKey::InternalKeyData key_data, bool extractable, Vector<Bindings::KeyUsage> const& key_usages)
 {
     // 1. If format is not "raw", throw a NotSupportedError
-    if (format != Bindings::KeyFormat::Raw)
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing symmetric algorithms in WebCrypto, "raw-secret" acts as an alias of "raw".
+    if (format != Bindings::KeyFormat::Raw && format != Bindings::KeyFormat::RawSecret)
         return WebIDL::NotSupportedError::create(m_realm, "Only raw format is supported"_utf16);
 
     // 2. If usages contains a value that is not "deriveKey" or "deriveBits", then throw a SyntaxError.
@@ -7267,9 +7297,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X25519::import_key([[maybe_unused]] Web:
     else if (key_format == Bindings::KeyFormat::Jwk) {
         // 1. If keyData is a JsonWebKey dictionary: Let jwk equal keyData.
         //    Otherwise: Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "keyData is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field is present and if usages contains an entry which is not "deriveKey" or "deriveBits" then throw a SyntaxError.
         if (jwk.d.has_value() && !usages.is_empty()) {
@@ -7319,19 +7349,24 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X25519::import_key([[maybe_unused]] Web:
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (!jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing d field"_utf16);
+            auto private_key = TRY(base64_url_bytes_decode(m_realm, jwk.d.value()));
+            if (private_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
+
+            ::Crypto::Curves::X25519 curve;
+            auto derived_public_key = TRY_OR_THROW_OOM(m_realm->vm(), curve.generate_public_key(private_key));
+            if (derived_public_key != public_key)
+                return WebIDL::DataError::create(m_realm, "Invalid key pair"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the X25519 private key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto private_key_base_64 = jwk.d.value();
-            auto private_key_or_error = decode_base64url(private_key_base_64);
-            if (private_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto private_key = private_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { private_key });
 
             // 3. Set the [[type]] internal slot of Key to "private".
@@ -7352,19 +7387,15 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X25519::import_key([[maybe_unused]] Web:
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
 
-            // 2. Let key be a new CryptoKey object that represents the X25519 public key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto public_key_base_64 = jwk.x.value();
-            auto public_key_or_error = decode_base64url(public_key_base_64);
-            if (public_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto public_key = public_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { public_key });
 
             // 3. Set the [[type]] internal slot of Key to "public".
@@ -7382,7 +7413,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X25519::import_key([[maybe_unused]] Web:
     }
 
     // 2. If format is "raw":
-    else if (key_format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing asymmetric algorithms in WebCrypto, "raw-public" acts as an alias of "raw".
+    else if (key_format == Bindings::KeyFormat::Raw || key_format == Bindings::KeyFormat::RawPublic) {
         // 1. If usages is not empty then throw a SyntaxError.
         if (!usages.is_empty())
             return WebIDL::SyntaxError::create(m_realm, "Usages must be empty"_utf16);
@@ -7475,7 +7508,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> X25519::export_key(Bindings::KeyFormat 
     // 3. If format is "jwt":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionar1y.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to "OKP".
         jwk.kty = "OKP"_string;
@@ -7518,7 +7551,9 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> X25519::export_key(Bindings::KeyFormat 
     }
 
     // 3. If format is "raw":
-    else if (format == Bindings::KeyFormat::Raw) {
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing asymmetric algorithms in WebCrypto, "raw-public" acts as an alias of "raw".
+    else if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawPublic) {
         // 1. If the [[type]] internal slot of key is not "public", then throw an InvalidAccessError.
         if (key->type() != Bindings::KeyType::Public)
             return WebIDL::InvalidAccessError::create(m_realm, "Key is not a public key"_utf16);
@@ -7726,7 +7761,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> X448::export_key(Bindings::KeyFormat fo
     // 3. If format is "jwk":
     if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to "OKP".
         jwk.kty = "OKP"_string;
@@ -7881,9 +7916,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X448::import_key(
         //    Let jwk equal keyData.
         //    Otherwise:
         //    Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "Data is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the d field is present and if usages contains an entry which is not "deriveKey" or "deriveBits" then throw a SyntaxError.
         if (jwk.d.has_value()) {
@@ -7936,19 +7971,24 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X448::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 56)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (!jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing d field"_utf16);
+            auto private_key = TRY(base64_url_bytes_decode(m_realm, jwk.d.value()));
+            if (private_key.size() != 56)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
-            // 2. Let key be a new CryptoKey object that represents the X25519 private key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto private_key_base_64 = jwk.d.value();
-            auto private_key_or_error = decode_base64url(private_key_base_64);
-            if (private_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto private_key = private_key_or_error.release_value();
+            ::Crypto::Curves::X448 curve;
+            auto derived_public_key = TRY_OR_THROW_OOM(m_realm->vm(), curve.generate_public_key(private_key));
+            if (derived_public_key != public_key)
+                return WebIDL::DataError::create(m_realm, "Invalid key pair"_utf16);
+
+            // 2. Let key be a new CryptoKey object that represents the X448 private key identified by interpreting jwk according to Section 2 of [RFC8037].
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { private_key });
 
             // 3. Set the [[type]] internal slot of Key to "private".
@@ -7969,19 +8009,16 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X448::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 56)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
 
-            // 2. Let key be a new CryptoKey object that represents the Ed25519 public key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto public_key_base_64 = jwk.x.value();
-            auto public_key_or_error = decode_base64url(public_key_base_64);
-            if (public_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto public_key = public_key_or_error.release_value();
+            // 2. Let key be a new CryptoKey object that represents the X448 public key identified by interpreting jwk according to Section 2 of [RFC8037].
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { public_key });
 
             // 3. Set the [[type]] internal slot of Key to "public".
@@ -8207,9 +8244,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> HMAC::import_key(Web::Crypto::AlgorithmP
         //    Let jwk equal keyData.
         //    Otherwise:
         //    Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "Data is not a JsonWebKey dictionary"_utf16);
-        auto& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the kty field of jwk is not "oct", then throw a DataError.
         if (jwk.kty != "oct"sv)
@@ -8348,8 +8385,10 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> HMAC::export_key(Bindings::KeyFormat fo
     auto data = key->handle().get<ByteBuffer>();
 
     // 4. If format is "raw":
+    // https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyformat
+    // For all existing symmetric algorithms in WebCrypto, "raw-secret" acts as an alias of "raw".
     GC::Ptr<JS::Object> result;
-    if (format == Bindings::KeyFormat::Raw) {
+    if (format == Bindings::KeyFormat::Raw || format == Bindings::KeyFormat::RawSecret) {
         // Let result be the result of creating an ArrayBuffer containing data.
         result = JS::ArrayBuffer::create(m_realm, data);
     }
@@ -8357,7 +8396,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> HMAC::export_key(Bindings::KeyFormat fo
     // If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk {};
+        JsonWebKey jwk {};
 
         // Set the kty attribute of jwk to the string "oct".
         jwk.kty = "oct"_string;
@@ -8818,7 +8857,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> MLDSA::import_key(AlgorithmParams const&
         //        Let jwk equal keyData.
         //     => Otherwise:
         //        Throw a DataError.
-        auto* const jwk = key_data.get_pointer<Bindings::JsonWebKey>();
+        auto* const jwk = key_data.get_pointer<JsonWebKey>();
 
         if (!jwk)
             return WebIDL::DataError::create(m_realm, "Data is not a JsonWebKey dictionary"_utf16);
@@ -9046,7 +9085,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> MLDSA::export_key(Bindings::KeyFormat f
     //   -> If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        auto jwk = Bindings::JsonWebKey {};
+        auto jwk = JsonWebKey {};
 
         // 2. Set the kty attribute of jwk to "AKP".
         jwk.kty = "AKP"_string;
@@ -9959,10 +9998,10 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ChaCha20Poly1305::import_key(AlgorithmPa
         //        Let jwk equal keyData.
         //    Otherwise:
         //        Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "Invalid JWK key data"_utf16);
 
-        auto const& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto const& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the kty field of jwk is not "oct", then throw a DataError.
         if (jwk.kty != "oct"_string)
@@ -10036,7 +10075,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> ChaCha20Poly1305::export_key(Bindings::
     // 2. If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "oct".
         jwk.kty = "oct"_string;
@@ -10265,10 +10304,10 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> AesOcb::import_key(AlgorithmParams const
         //        Let jwk equal keyData.
         //    Otherwise:
         //        Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "Invalid JWK key data"_utf16);
 
-        auto const& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto const& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the kty field of jwk is not "oct", then throw a DataError.
         if (jwk.kty != "oct"_string)
@@ -10367,7 +10406,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> AesOcb::export_key(Bindings::KeyFormat 
     // 2. If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "oct".
         jwk.kty = "oct"_string;
@@ -10602,10 +10641,10 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> KMAC::import_key(AlgorithmParams const& 
         //        Let jwk equal keyData.
         //    Otherwise:
         //        Throw a DataError.
-        if (!key_data.has<Bindings::JsonWebKey>())
+        if (!key_data.has<JsonWebKey>())
             return WebIDL::DataError::create(m_realm, "Data is not a JsonWebKey dictionary"_utf16);
 
-        auto const& jwk = key_data.get<Bindings::JsonWebKey>();
+        auto const& jwk = key_data.get<JsonWebKey>();
 
         // 2. If the kty field of jwk is not "oct", then throw a DataError.
         if (jwk.kty != "oct"sv)
@@ -10711,7 +10750,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> KMAC::export_key(Bindings::KeyFormat fo
     // 2. If format is "jwk":
     else if (format == Bindings::KeyFormat::Jwk) {
         // 1. Let jwk be a new JsonWebKey dictionary.
-        Bindings::JsonWebKey jwk = {};
+        JsonWebKey jwk = {};
 
         // 2. Set the kty attribute of jwk to the string "oct".
         jwk.kty = "oct"_string;

@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <LibGfx/BitmapExportResult.h>
+#include <LibGfx/BitmapExport.h>
 #include <LibJS/Runtime/DataView.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibWeb/Bindings/PlatformObject.h>
@@ -93,11 +93,11 @@ protected:
         auto raw_object = src_data->raw_object();
 
         if (auto* array_buffer = as_if<JS::ArrayBuffer>(*raw_object)) {
-            return TRY(get_offset_span(array_buffer->buffer().span(), src_offset, src_length_override)).reinterpret<T>();
+            return TRY(get_offset_span(array_buffer->span(), src_offset, src_length_override)).reinterpret<T>();
         }
 
         if (auto* data_view = as_if<JS::DataView>(*raw_object)) {
-            return TRY(get_offset_span(data_view->viewed_array_buffer()->buffer().span(), src_offset, src_length_override)).reinterpret<T>();
+            return TRY(get_offset_span(data_view->viewed_array_buffer()->span(), src_offset, src_length_override)).reinterpret<T>();
         }
 
         // NOTE: This has to be done because src_offset is the number of elements to offset by, not the number of bytes.

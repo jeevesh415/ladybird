@@ -106,10 +106,15 @@ public:
     [[nodiscard]] GC::Ref<ComputedProperties> compute_style_with_seeded_ancestors(DOM::AbstractElement);
     [[nodiscard]] GC::Ptr<ComputedProperties> compute_pseudo_element_style_if_needed(DOM::AbstractElement, Optional<bool&> did_change_custom_properties) const;
 
-    [[nodiscard]] Vector<MatchingRule const*> collect_matching_rules(DOM::AbstractElement, CascadeOrigin, PseudoClassBitmap& attempted_pseudo_class_matches, Optional<FlyString const> qualified_layer_name = {}) const;
+    struct ScopedMatchingRule {
+        MatchingRule const* rule { nullptr };
+        GC::Ptr<DOM::ShadowRoot const> shadow_root;
+    };
+
+    [[nodiscard]] Vector<ScopedMatchingRule> collect_matching_rules(DOM::AbstractElement, CascadeOrigin, PseudoClassBitmap& attempted_pseudo_class_matches, Optional<FlyString const> qualified_layer_name = {}) const;
 
     NonnullRefPtr<InvalidationPlan> invalidation_plan_for_properties(Vector<InvalidationSet::Property> const&, StyleScope const&) const;
-    bool invalidation_property_used_in_has_selector(InvalidationSet::Property const&, StyleScope const&) const;
+    Vector<HasInvalidationMetadata> const* has_invalidation_metadata_for_property(InvalidationSet::Property const&, StyleScope const&) const;
 
     static CSSPixels default_user_font_size();
     static CSSPixels absolute_size_mapping(AbsoluteSize, CSSPixels default_font_size);
@@ -123,7 +128,7 @@ public:
     [[nodiscard]] GC::Ref<ComputedProperties> compute_properties(DOM::AbstractElement, CascadedProperties&) const;
 
     void compute_property_values(ComputedProperties&, Optional<DOM::AbstractElement>) const;
-    void process_animation_definitions(ComputedProperties const& computed_properties, DOM::AbstractElement& abstract_element) const;
+    void process_animation_definitions(ComputedProperties const& computed_properties, CascadedProperties const&, DOM::AbstractElement& abstract_element) const;
 
     [[nodiscard]] inline bool should_reject_with_ancestor_filter(Selector const&) const;
 
@@ -140,7 +145,6 @@ public:
     static NonnullRefPtr<StyleValue const> compute_font_weight(NonnullRefPtr<StyleValue const> const& absolutized_value, Optional<DOM::AbstractElement> const& inheritance_parent);
     static NonnullRefPtr<StyleValue const> compute_font_width(NonnullRefPtr<StyleValue const> const& absolutized_value);
     static NonnullRefPtr<StyleValue const> compute_line_height(NonnullRefPtr<StyleValue const> const& absolutized_value, CSSPixels computed_font_size);
-    static NonnullRefPtr<StyleValue const> compute_opacity(NonnullRefPtr<StyleValue const> const& absolutized_value);
     static NonnullRefPtr<StyleValue const> compute_position_area(NonnullRefPtr<StyleValue const> const& absolutized_value);
 
 private:
@@ -153,12 +157,12 @@ private:
 
     struct LayerMatchingRules {
         FlyString qualified_layer_name;
-        Vector<MatchingRule const*> rules;
+        Vector<ScopedMatchingRule> rules;
     };
 
     struct MatchingRuleSet {
-        Vector<MatchingRule const*> user_agent_rules;
-        Vector<MatchingRule const*> user_rules;
+        Vector<ScopedMatchingRule> user_agent_rules;
+        Vector<ScopedMatchingRule> user_rules;
         Vector<LayerMatchingRules> author_rules;
     };
 
@@ -178,10 +182,20 @@ private:
     void cascade_declarations(
         CascadedProperties&,
         DOM::AbstractElement,
-        Vector<MatchingRule const*> const&,
+        Vector<ScopedMatchingRule> const&,
         CascadeOrigin,
         Important,
         Optional<FlyString> layer_name) const;
+
+    void apply_property_list_to_cascade(
+        CascadedProperties&,
+        DOM::AbstractElement,
+        ReadonlySpan<StyleProperty>,
+        CascadeOrigin,
+        Important,
+        Optional<FlyString> layer_name,
+        GC::Ptr<CSSStyleDeclaration const> source,
+        GC::Ptr<DOM::ShadowRoot const> source_shadow_root) const;
 
     GC::Ref<DOM::Document> m_document;
 

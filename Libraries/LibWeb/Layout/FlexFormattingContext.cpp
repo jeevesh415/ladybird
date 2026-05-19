@@ -1657,9 +1657,10 @@ void FlexFormattingContext::align_all_flex_lines()
     CSSPixels cross_size_of_flex_container = inner_cross_size(m_flex_container_state);
 
     if (is_single_line()) {
-        // For single-line flex containers, we only need to center the line along the cross axis.
+        // https://drafts.csswg.org/css-flexbox-1/#flex-lines
+        // 'align-content' does not apply to single-line flex containers, so place the line at cross-start.
         auto& flex_line = m_flex_lines[0];
-        CSSPixels center_of_line = cross_size_of_flex_container / 2;
+        CSSPixels center_of_line = flex_line.cross_size / 2;
         for (auto& item : flex_line.items) {
             item.cross_offset += center_of_line;
         }
@@ -2279,7 +2280,13 @@ void FlexFormattingContext::resolve_cross_axis_auto_margins()
 
             // If its outer cross size (treating those auto margins as zero) is less than the cross size of its flex line,
             // distribute the difference in those sizes equally to the auto margins.
-            auto outer_cross_size = item.cross_size.value() + item.padding.cross_before + item.padding.cross_after + item.borders.cross_before + item.borders.cross_after;
+            // NB: Auto cross-axis margins are stored as 0, so including them here treats them as zero while keeping
+            //     non-auto cross-axis margins in the outer cross size.
+            auto outer_cross_size = item.cross_size.value()
+                + item.padding.cross_before + item.padding.cross_after
+                + item.borders.cross_before + item.borders.cross_after
+                + item.margins.cross_before + item.margins.cross_after;
+
             if (outer_cross_size < line.cross_size) {
                 CSSPixels remainder = line.cross_size - outer_cross_size;
                 if (item.margins.cross_before_is_auto && item.margins.cross_after_is_auto) {

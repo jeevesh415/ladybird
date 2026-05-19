@@ -7,9 +7,11 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/Optional.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Forward.h>
 #include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Bindings/ViewTransitionPrototype.h>
+#include <LibWeb/Bindings/ViewTransition.h>
 #include <LibWeb/CSS/Filter.h>
 #include <LibWeb/CSS/PreferredColorScheme.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
@@ -41,9 +43,9 @@ class ReplacedNamedViewTransitionPseudoElement
     GC_CELL(ReplacedNamedViewTransitionPseudoElement, NamedViewTransitionPseudoElement);
     GC_DECLARE_ALLOCATOR(ReplacedNamedViewTransitionPseudoElement);
 
-    ReplacedNamedViewTransitionPseudoElement(CSS::PseudoElement, FlyString, RefPtr<Gfx::ImmutableBitmap>);
+    ReplacedNamedViewTransitionPseudoElement(CSS::PseudoElement, FlyString, Optional<Gfx::DecodedImageFrame>);
 
-    RefPtr<Gfx::ImmutableBitmap> m_content;
+    Optional<Gfx::DecodedImageFrame> m_content;
 };
 
 // https://drafts.csswg.org/css-view-transitions-1/#captured-element
@@ -51,7 +53,7 @@ struct CapturedElement : public JS::Cell {
     GC_CELL(CapturedElement, JS::Cell)
     GC_DECLARE_ALLOCATOR(CapturedElement);
 
-    RefPtr<Gfx::ImmutableBitmap> old_image {};
+    Optional<Gfx::DecodedImageFrame> old_image {};
     CSSPixels old_width = 0;
     CSSPixels old_height = 0;
     // FIXME: Make this an identity transform function by default.

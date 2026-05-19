@@ -60,7 +60,7 @@ public:
         Optional<Chunk> try_commit_chunk(size_t start, size_t end, bool has_breaking_newline, bool has_breaking_tab, bool can_break_after, Gfx::Font const&, Gfx::GlyphRun::TextType) const;
 
         [[nodiscard]] bool is_at_line_break_opportunity() const;
-        [[nodiscard]] Gfx::Font const& font_for_space(size_t at_index) const;
+        [[nodiscard]] Gfx::Font const& font_for_space(size_t at_index, u32 space_code_point) const;
 
         bool const m_should_wrap_lines;
         bool const m_should_respect_linebreaks;
@@ -83,7 +83,7 @@ public:
     Unicode::Segmenter& grapheme_segmenter() const;
     Unicode::Segmenter& line_segmenter() const;
 
-    virtual GC::Ptr<Painting::Paintable> create_paintable() const override;
+    virtual RefPtr<Painting::Paintable> create_paintable() const override;
 
 private:
     virtual bool is_text_node() const final { return true; }

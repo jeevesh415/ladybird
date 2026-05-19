@@ -5,13 +5,13 @@
  */
 
 #include <LibJS/Runtime/Realm.h>
-#include <LibWeb/Bindings/EXTTextureNorm16Prototype.h>
+#include <LibWeb/Bindings/EXTTextureNorm16.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/WebGL/Extensions/EXTTextureNorm16.h>
 #include <LibWeb/WebGL/OpenGLContext.h>
 #include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
 GC_DEFINE_ALLOCATOR(EXTTextureNorm16);
 

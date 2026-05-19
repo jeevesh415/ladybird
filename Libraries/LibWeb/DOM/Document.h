@@ -12,7 +12,10 @@
 
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/HashTable.h>
+#include <AK/Optional.h>
 #include <AK/OwnPtr.h>
+#include <AK/RefPtr.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
@@ -22,10 +25,12 @@
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibUnicode/Forward.h>
+#include <LibWeb/Bindings/NavigationType.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/EnvironmentVariable.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/DOM/AnchorNameMap.h>
+#include <LibWeb/DOM/HoverEventData.h>
 #include <LibWeb/DOM/ParentNode.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/ViewportClient.h>
@@ -33,8 +38,8 @@
 #include <LibWeb/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWeb/HTML/DocumentReadyState.h>
 #include <LibWeb/HTML/Focus.h>
-#include <LibWeb/HTML/NavigationType.h>
 #include <LibWeb/HTML/PaintConfig.h>
+#include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/VisibilityState.h>
@@ -55,8 +60,7 @@ enum class QuirksMode {
     X(DocumentAddAnElementToTheTopLayer)                  \
     X(DocumentRequestAnElementToBeRemovedFromTheTopLayer) \
     X(DocumentImmediatelyRemoveElementFromTheTopLayer)    \
-    X(DocumentPendingTopLayerRemovalsProcessed)           \
-    X(ShadowRootSetInnerHTML)
+    X(DocumentPendingTopLayerRemovalsProcessed)
 
 enum class InvalidateLayoutTreeReason {
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASON(e) e,
@@ -162,24 +166,14 @@ struct DocumentUnloadTimingInfo {
     double unload_event_end_time { 0 };
 };
 
-// https://dom.spec.whatwg.org/#dictdef-elementcreationoptions
-struct ElementCreationOptions {
-    Optional<GC::Ptr<HTML::CustomElementRegistry>> custom_element_registry;
-    Optional<String> is;
-};
-
-// https://dom.spec.whatwg.org/#dictdef-importnodeoptions
-struct ImportNodeOptions {
-    GC::Ptr<HTML::CustomElementRegistry> custom_element_registry;
-    bool self_only = false;
-};
-
 enum class PolicyControlledFeature : u8 {
     Autoplay,
+    Camera,
     EncryptedMedia,
     FocusWithoutUserActivation,
     Fullscreen,
     Gamepad,
+    Microphone,
     WindowManagement,
 };
 
@@ -264,7 +258,7 @@ public:
     void update_base_element(Badge<HTML::HTMLBaseElement>);
     GC::Ptr<HTML::HTMLBaseElement> first_base_element_with_href_in_tree_order() const;
     GC::Ptr<HTML::HTMLBaseElement> first_base_element_with_target_in_tree_order() const;
-    void respond_to_base_url_changes();
+    void respond_to_base_url_changes(URL::URL const& old_document_url, URL::URL const& old_base_url);
 
     String url_string() const { return m_url.to_string(); }
     String document_uri() const { return url_string(); }
@@ -297,9 +291,7 @@ public:
 
     virtual FlyString node_name() const override { return "#document"_fly_string; }
 
-    void invalidate_style_for_elements_affected_by_pseudo_class_change(CSS::PseudoClass, auto& element_slot, Node& old_new_common_ancestor, auto node);
-
-    void set_hovered_node(GC::Ptr<Node>);
+    void set_hovered_node(GC::Ptr<Node>, Optional<HoverEventData> = {});
     Node* hovered_node() { return m_hovered_node.ptr(); }
     Node const* hovered_node() const { return m_hovered_node.ptr(); }
 
@@ -379,6 +371,7 @@ public:
 
     void update_style();
     void update_style_if_needed_for_element(AbstractElement const&);
+    void update_style_for_element(AbstractElement const&);
     [[nodiscard]] bool element_needs_style_update(AbstractElement const&) const;
     void update_layout(UpdateLayoutReason);
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
@@ -397,11 +390,11 @@ public:
     Layout::Viewport const* unsafe_layout_node() const;
     Layout::Viewport* unsafe_layout_node();
 
-    Painting::ViewportPaintable const* paintable() const;
-    Painting::ViewportPaintable* paintable();
+    RefPtr<Painting::ViewportPaintable const> paintable() const;
+    RefPtr<Painting::ViewportPaintable> paintable();
 
-    Painting::ViewportPaintable const* unsafe_paintable() const;
-    Painting::ViewportPaintable* unsafe_paintable();
+    RefPtr<Painting::ViewportPaintable const> unsafe_paintable() const;
+    RefPtr<Painting::ViewportPaintable> unsafe_paintable();
 
     GC::Ref<NodeList> get_elements_by_name(FlyString const&);
 
@@ -427,8 +420,8 @@ public:
 
     HTML::EnvironmentSettingsObject& relevant_settings_object() const;
 
-    WebIDL::ExceptionOr<GC::Ref<Element>> create_element(String const& local_name, Variant<String, ElementCreationOptions> const& options);
-    WebIDL::ExceptionOr<GC::Ref<Element>> create_element_ns(Optional<FlyString> const& namespace_, String const& qualified_name, Variant<String, ElementCreationOptions> const& options);
+    WebIDL::ExceptionOr<GC::Ref<Element>> create_element(String const& local_name, Variant<String, Bindings::ElementCreationOptions> const& options);
+    WebIDL::ExceptionOr<GC::Ref<Element>> create_element_ns(Optional<FlyString> const& namespace_, String const& qualified_name, Variant<String, Bindings::ElementCreationOptions> const& options);
     GC::Ref<DocumentFragment> create_document_fragment();
     GC::Ref<Text> create_text_node(Utf16String data);
     WebIDL::ExceptionOr<GC::Ref<CDATASection>> create_cdata_section(Utf16String data);
@@ -444,6 +437,14 @@ public:
     void set_pending_parsing_blocking_script(HTML::HTMLScriptElement*);
     HTML::HTMLScriptElement* pending_parsing_blocking_script() { return m_pending_parsing_blocking_script.ptr(); }
     GC::Ref<HTML::HTMLScriptElement> take_pending_parsing_blocking_script(Badge<HTML::HTMLParser>);
+
+    void set_pending_parsing_blocking_svg_script(SVG::SVGScriptElement*);
+    SVG::SVGScriptElement* pending_parsing_blocking_svg_script() { return m_pending_parsing_blocking_svg_script.ptr(); }
+    GC::Ref<SVG::SVGScriptElement> take_pending_parsing_blocking_svg_script(Badge<HTML::HTMLParser>);
+    bool has_pending_parsing_blocking_script() const
+    {
+        return m_pending_parsing_blocking_script.ptr() || m_pending_parsing_blocking_svg_script.ptr();
+    }
 
     void add_script_to_execute_when_parsing_has_finished(Badge<HTML::HTMLScriptElement>, HTML::HTMLScriptElement&);
     Vector<GC::Root<HTML::HTMLScriptElement>> take_scripts_to_execute_when_parsing_has_finished(Badge<HTML::HTMLParser>);
@@ -474,7 +475,7 @@ public:
     // https://dom.spec.whatwg.org/#xml-document
     bool is_xml_document() const { return m_type == Type::XML; }
 
-    WebIDL::ExceptionOr<GC::Ref<Node>> import_node(GC::Ref<Node> node, Variant<bool, ImportNodeOptions>);
+    WebIDL::ExceptionOr<GC::Ref<Node>> import_node(GC::Ref<Node> node, Variant<bool, Bindings::ImportNodeOptions>);
     void adopt_node(Node&);
     WebIDL::ExceptionOr<GC::Ref<Node>> adopt_node_binding(GC::Ref<Node>);
 
@@ -496,6 +497,11 @@ public:
 
     Element const* target_element() const { return m_target_element.ptr(); }
     void set_target_element(GC::Ptr<Element>);
+
+    Vector<GC::Ref<Element>>& autofocus_candidates() { return m_autofocus_candidates; }
+    bool autofocus_processed_flag() const { return m_autofocus_processed_flag; }
+    void set_autofocus_processed_flag(bool value) { m_autofocus_processed_flag = value; }
+    void flush_autofocus_candidates();
 
     void try_to_scroll_to_the_fragment();
     void scroll_to_the_fragment();
@@ -616,6 +622,7 @@ public:
 
     void set_parser(Badge<HTML::HTMLParser>, HTML::HTMLParser&);
     void detach_parser();
+    GC::Ptr<HTML::HTMLParser> parser() const { return m_parser; }
 
     [[nodiscard]] bool is_temporary_document_for_fragment_parsing() const { return m_temporary_document_for_fragment_parsing == TemporaryDocumentForFragmentParsing::Yes; }
 
@@ -758,6 +765,14 @@ public:
     HTML::ListOfAvailableImages& list_of_available_images();
     HTML::ListOfAvailableImages const& list_of_available_images() const;
 
+    // https://html.spec.whatwg.org/multipage/links.html#map-of-preloaded-resources
+    HashMap<HTML::PreloadKey, GC::Ref<HTML::PreloadEntry>>& map_of_preloaded_resources() { return m_map_of_preloaded_resources; }
+    HashMap<HTML::PreloadKey, GC::Ref<HTML::PreloadEntry>> const& map_of_preloaded_resources() const { return m_map_of_preloaded_resources; }
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#list-of-speculative-fetch-urls
+    bool has_speculative_fetch_url(URL::URL const& url) const { return m_list_of_speculative_fetch_urls.contains(url); }
+    void add_speculative_fetch_url(URL::URL url) { m_list_of_speculative_fetch_urls.set(move(url)); }
+
     void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserver&);
     void unregister_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserver&);
 
@@ -782,6 +797,7 @@ public:
     void update_for_history_step_application(NonnullRefPtr<HTML::SessionHistoryEntry>, bool do_not_reactivate, size_t script_history_length, size_t script_history_index, Optional<Bindings::NavigationType> navigation_type, Optional<Vector<NonnullRefPtr<HTML::SessionHistoryEntry>>> entries_for_navigation_api = {}, RefPtr<HTML::SessionHistoryEntry> previous_entry_for_activation = {}, bool update_navigation_api = true);
 
     HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
+    void prune_image_resource_caches();
 
     void restore_the_history_object_state(NonnullRefPtr<HTML::SessionHistoryEntry> entry);
 
@@ -799,13 +815,16 @@ public:
     };
     void append_pending_animation_event(PendingAnimationEvent const&);
     void update_animations_and_send_events(double timestamp);
+    void dispatch_events_for_animation_if_necessary(GC::Ref<Animations::Animation>);
     void remove_replaced_animations();
 
     WebIDL::ExceptionOr<Vector<GC::Ref<Animations::Animation>>> get_animations();
+    HashTable<GC::Ref<Animations::AnimationTimeline>> const& associated_animation_timelines() const { return m_associated_animation_timelines; }
 
     bool ready_to_run_scripts() const { return m_ready_to_run_scripts; }
     void set_ready_to_run_scripts();
     void set_deferred_parser_start(GC::Ref<GC::Function<void()>>);
+    bool has_deferred_parser_start() const { return m_deferred_parser_start; }
 
     void set_latest_entry(RefPtr<HTML::SessionHistoryEntry>);
 
@@ -832,9 +851,32 @@ public:
     GC::RootVector<GC::Ref<Element>> elements_from_point(double x, double y);
     GC::Ptr<Element const> scrolling_element() const;
 
-    void set_needs_animated_style_update() { m_needs_animated_style_update = true; }
+    void set_needs_animated_style_update();
 
     void set_needs_invalidation_of_elements_affected_by_has() { m_needs_invalidation_of_elements_affected_by_has = true; }
+
+    // Test-only counters for observing style invalidation and recomputation work. See Internals.idl.
+    struct StyleInvalidationCounters {
+        u64 has_ancestor_walk_invocations { 0 };
+        u64 has_ancestor_walk_visits { 0 };
+        u64 has_ancestor_sibling_element_checks { 0 };
+        u64 has_invalidation_metadata_candidates { 0 };
+        u64 has_match_invocations { 0 };
+        u64 has_result_cache_hits { 0 };
+        u64 has_result_cache_misses { 0 };
+        u64 full_style_invalidations { 0 };
+        u64 style_invalidations { 0 };
+        u64 element_style_recomputations { 0 };
+        u64 element_style_noop_recomputations { 0 };
+        u64 element_inherited_style_recomputations { 0 };
+        u64 element_inherited_style_noop_recomputations { 0 };
+        u64 previous_sibling_invalidation_walk_visits { 0 };
+    };
+    StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
+    void reset_style_invalidation_counters() const;
+    void record_style_invalidation() const;
+    void record_full_style_invalidation() const;
+    static void set_style_invalidation_counter_dump_interval(Optional<u64>);
 
     void set_needs_accumulated_visual_contexts_update(bool value) { m_needs_accumulated_visual_contexts_update = value; }
     bool needs_accumulated_visual_contexts_update() const { return m_needs_accumulated_visual_contexts_update; }
@@ -894,7 +936,7 @@ public:
     size_t transition_generation() const { return m_transition_generation; }
 
     // Does document represent an embedded svg img
-    [[nodiscard]] bool is_decoded_svg() const;
+    [[nodiscard]] bool is_decoded_svg() const { return m_is_decoded_svg; }
 
     Vector<GC::Root<Range>> find_matching_text(String const&, CaseSensitivity);
 
@@ -914,18 +956,15 @@ public:
     GC::Ptr<HTML::Navigable> navigable() const;
     void set_navigable(GC::Ptr<HTML::Navigable>);
 
-    template<OneOf<Painting::Paintable, HTML::Navigable, CSS::VisualViewport, Web::EventHandler> T>
+    template<OneOf<Node, Painting::Paintable, HTML::Navigable, CSS::VisualViewport, Web::EventHandler> T>
     void set_needs_repaint(Badge<T>, InvalidateDisplayList should_invalidate_display_list = InvalidateDisplayList::Yes)
     {
         set_needs_repaint(should_invalidate_display_list);
     }
 
-    void notify_css_background_image_loaded();
+    RefPtr<Painting::DisplayList> record_display_list(HTML::PaintConfig, Painting::DisplayListResourceStorage&);
 
-    RefPtr<Painting::DisplayList> cached_display_list() const;
-    RefPtr<Painting::DisplayList> record_display_list(HTML::PaintConfig);
-
-    void invalidate_display_list();
+    void set_needs_to_record_display_list();
 
     Unicode::Segmenter& grapheme_segmenter() const;
     Unicode::Segmenter& line_segmenter() const;
@@ -961,7 +1000,7 @@ public:
     GC::Ptr<ViewTransition::ViewTransition> active_view_transition() const { return m_active_view_transition; }
     void set_active_view_transition(GC::Ptr<ViewTransition::ViewTransition> view_transition) { m_active_view_transition = view_transition; }
     bool rendering_suppression_for_view_transitions() const { return m_rendering_suppression_for_view_transitions; }
-    void set_rendering_suppression_for_view_transitions(bool value) { m_rendering_suppression_for_view_transitions = value; }
+    void set_rendering_suppression_for_view_transitions(bool);
     GC::Ptr<CSS::CSSStyleSheet> dynamic_view_transition_style_sheet() const { return m_dynamic_view_transition_style_sheet; }
     void set_show_view_transition_tree(bool value) { m_show_view_transition_tree = value; }
     Vector<GC::Ptr<ViewTransition::ViewTransition>>& update_callback_queue() { return m_update_callback_queue; }
@@ -1035,7 +1074,7 @@ public:
     String dump_display_list();
     String dump_stacking_context_tree();
 
-    StyleInvalidator& style_invalidator() { return m_style_invalidator; }
+    CSS::Invalidation::StyleInvalidator& style_invalidator() { return m_style_invalidator; }
 
     Optional<Vector<CSS::Parser::ComponentValue>> environment_variable_value(CSS::EnvironmentVariable, Span<i32> indices = {}) const;
 
@@ -1043,14 +1082,15 @@ public:
     HashMap<FlyString, CSS::CustomPropertyRegistration>& registered_property_set();
     Optional<CSS::CustomPropertyRegistration const&> get_registered_custom_property(FlyString const& name) const;
     NonnullRefPtr<CSS::StyleValue const> custom_property_initial_value(FlyString const& name) const;
+    size_t custom_property_registration_generation() const { return m_custom_property_registration_generation; }
+    void did_change_custom_property_registrations();
 
     CSS::StyleScope const& style_scope() const { return m_style_scope; }
     CSS::StyleScope& style_scope() { return m_style_scope; }
 
     void exit_pointer_lock();
 
-    Optional<CSS::SelectorList> const* cached_query_selector_result(String const& selector_text) const;
-    void cache_query_selector_result(String selector_text, Optional<CSS::SelectorList>);
+    Optional<CSS::SelectorList> const& parse_or_cache_selector_list(StringView) const;
 
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> custom_element_registry) { m_custom_element_registry = custom_element_registry; }
@@ -1098,7 +1138,6 @@ private:
     Element* find_a_potential_indicated_element(FlyString const& fragment) const;
 
     void dispatch_events_for_transition(GC::Ref<CSS::CSSTransition>);
-    void dispatch_events_for_animation_if_necessary(GC::Ref<Animations::Animation>);
 
     template<typename GetNotifier, typename... Args>
     void notify_each_document_observer(GetNotifier&& get_notifier, Args&&... args)
@@ -1126,7 +1165,7 @@ private:
         GC::Ptr<HTML::CustomElementRegistry> registry;
         Optional<String> is;
     };
-    WebIDL::ExceptionOr<RegistryAndIs> flatten_element_creation_options(Variant<String, ElementCreationOptions> const&) const;
+    WebIDL::ExceptionOr<RegistryAndIs> flatten_element_creation_options(Variant<String, Bindings::ElementCreationOptions> const&) const;
 
     GC::Ref<Page> m_page;
     GC::Ptr<CSS::StyleComputer> m_style_computer;
@@ -1161,6 +1200,7 @@ private:
     String m_source;
 
     GC::Ptr<HTML::HTMLScriptElement> m_pending_parsing_blocking_script;
+    GC::Ptr<SVG::SVGScriptElement> m_pending_parsing_blocking_svg_script;
 
     Vector<GC::Ref<HTML::HTMLScriptElement>> m_scripts_to_execute_when_parsing_has_finished;
 
@@ -1186,6 +1226,12 @@ private:
 
     GC::Ptr<Element> m_active_element;
     GC::Ptr<Element> m_target_element;
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#autofocus-candidates
+    Vector<GC::Ref<Element>> m_autofocus_candidates;
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#autofocus-processed-flag
+    bool m_autofocus_processed_flag { false };
 
     bool m_created_for_appropriate_template_contents { false };
     GC::Ptr<Document> m_associated_inert_template_document;
@@ -1256,6 +1302,8 @@ private:
 
     bool m_needs_full_style_update { false };
     bool m_needs_full_layout_tree_update { false };
+
+    bool m_is_decoded_svg { false };
 
     bool m_is_running_update_layout { false };
 
@@ -1329,6 +1377,13 @@ private:
     // https://html.spec.whatwg.org/multipage/images.html#list-of-available-images
     GC::Ptr<HTML::ListOfAvailableImages> m_list_of_available_images;
 
+    // https://html.spec.whatwg.org/multipage/links.html#map-of-preloaded-resources
+    // FIXME: Entries leak until document destruction if a <link rel=preload> is never consumed.
+    HashMap<HTML::PreloadKey, GC::Ref<HTML::PreloadEntry>> m_map_of_preloaded_resources;
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#list-of-speculative-fetch-urls
+    HashTable<URL::URL> m_list_of_speculative_fetch_urls;
+
     GC::Ptr<CSS::VisualViewport> m_visual_viewport;
 
     // NOTE: Not in the spec per se, but Document must be able to access all IntersectionObservers whose root is in the document.
@@ -1387,6 +1442,9 @@ private:
     bool m_needs_accumulated_visual_contexts_update { false };
     bool m_needs_invalidation_of_elements_affected_by_has { false };
 
+    mutable StyleInvalidationCounters m_style_invalidation_counters;
+    mutable u64 m_style_invalidations_since_last_counter_dump { 0 };
+
     mutable GC::Ptr<WebIDL::ObservableArray> m_adopted_style_sheets;
 
     // Document should not visit ShadowRoot list to avoid leaks.
@@ -1421,7 +1479,7 @@ private:
 
     GC::Ptr<JS::ConsoleClient> m_console_client;
 
-    RefPtr<Core::Timer> m_cursor_blink_timer;
+    GC::Ptr<GC::Timer> m_cursor_blink_timer;
     bool m_cursor_blink_state { false };
 
     // NOTE: This is GC::Weak, not GC::Ptr, on purpose. We don't want the document to keep some old detached navigable alive.
@@ -1430,9 +1488,6 @@ private:
     Core::SharedVersion m_cookie_version { Core::INVALID_SHARED_VERSION };
     Optional<Core::SharedVersionIndex> m_cookie_version_index;
     String m_cookie;
-
-    Optional<HTML::PaintConfig> m_cached_display_list_paint_config;
-    RefPtr<Painting::DisplayList> m_cached_display_list;
 
     mutable OwnPtr<Unicode::Segmenter> m_grapheme_segmenter;
     mutable OwnPtr<Unicode::Segmenter> m_line_segmenter;
@@ -1480,20 +1535,20 @@ private:
     // https://drafts.csswg.org/css-view-transitions-1/#document-update-callback-queue
     Vector<GC::Ptr<ViewTransition::ViewTransition>> m_update_callback_queue = {};
 
-    GC::Ref<StyleInvalidator> m_style_invalidator;
+    GC::Ref<CSS::Invalidation::StyleInvalidator> m_style_invalidator;
 
     // https://www.w3.org/TR/css-properties-values-api-1/#dom-window-registeredpropertyset-slot
     HashMap<FlyString, CSS::CustomPropertyRegistration> m_registered_property_set;
     HashMap<FlyString, CSS::CustomPropertyRegistration> m_cached_registered_properties_from_css_property_rules;
+    size_t m_custom_property_registration_generation { 0 };
 
     CSS::StyleScope m_style_scope;
 
     // https://drafts.csswg.org/css-values-5/#random-caching
     HashMap<CSS::RandomCachingKey, double> m_element_shared_css_random_base_value_cache;
 
-    // Cache of parsed selector lists for querySelectorAll/querySelector.
-    static constexpr size_t max_selector_query_cache_size = 256;
-    HashMap<String, Optional<CSS::SelectorList>> m_selector_query_cache;
+    // Cache of parsed selector lists for querySelectorAll/querySelector/matches/closest.
+    mutable HashMap<String, Optional<CSS::SelectorList>> m_selector_query_cache;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

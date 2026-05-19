@@ -13,6 +13,7 @@
 #include <LibCore/ArgsParser.h>
 #include <LibCore/ConfigFile.h>
 #include <LibCore/StandardPaths.h>
+#include <LibCrypto/Hash/SHA2.h>
 #include <LibJS/Bytecode/Debug.h>
 #include <LibJS/Console.h>
 #include <LibJS/Contrib/Test262/GlobalObject.h>
@@ -65,6 +66,7 @@ private:
     JS_DECLARE_NATIVE_FUNCTION(load_json);
     JS_DECLARE_NATIVE_FUNCTION(last_value_getter);
     JS_DECLARE_NATIVE_FUNCTION(print);
+    JS_DECLARE_NATIVE_FUNCTION(gc);
 };
 
 GC_DEFINE_ALLOCATOR(ReplObject);
@@ -85,6 +87,7 @@ private:
     JS_DECLARE_NATIVE_FUNCTION(load_ini);
     JS_DECLARE_NATIVE_FUNCTION(load_json);
     JS_DECLARE_NATIVE_FUNCTION(print);
+    JS_DECLARE_NATIVE_FUNCTION(gc);
 };
 
 GC_DEFINE_ALLOCATOR(ScriptObject);
@@ -100,7 +103,7 @@ static RefPtr<Line::Editor> s_editor;
 #endif
 static String s_history_path = String {};
 [[maybe_unused]] static int s_repl_line_level = 0;
-static bool s_keep_running_repl = true;
+[[maybe_unused]] static bool s_keep_running_repl = true;
 static int s_exit_code = 0;
 
 static ErrorOr<void> print_inline(JS::Value value, Stream& stream)
@@ -308,6 +311,7 @@ void ReplObject::initialize(JS::Realm& realm)
     define_native_function(realm, "loadINI"_utf16_fly_string, load_ini, 1, attr);
     define_native_function(realm, "loadJSON"_utf16_fly_string, load_json, 1, attr);
     define_native_function(realm, "print"_utf16_fly_string, print, 1, attr);
+    define_native_function(realm, "gc"_utf16_fly_string, gc, 0, attr);
 
     define_native_accessor(
         realm,
@@ -381,6 +385,12 @@ JS_DEFINE_NATIVE_FUNCTION(ReplObject::print)
     return JS::js_undefined();
 }
 
+JS_DEFINE_NATIVE_FUNCTION(ReplObject::gc)
+{
+    vm.heap().collect_garbage();
+    return JS::js_undefined();
+}
+
 void ScriptObject::initialize(JS::Realm& realm)
 {
     Base::initialize(realm);
@@ -390,6 +400,7 @@ void ScriptObject::initialize(JS::Realm& realm)
     define_native_function(realm, "loadINI"_utf16_fly_string, load_ini, 1, attr);
     define_native_function(realm, "loadJSON"_utf16_fly_string, load_json, 1, attr);
     define_native_function(realm, "print"_utf16_fly_string, print, 1, attr);
+    define_native_function(realm, "gc"_utf16_fly_string, gc, 0, attr);
 }
 
 JS_DEFINE_NATIVE_FUNCTION(ScriptObject::load_ini)
@@ -408,6 +419,12 @@ JS_DEFINE_NATIVE_FUNCTION(ScriptObject::print)
     if (result.is_error())
         return g_vm->throw_completion<JS::InternalError>(TRY_OR_THROW_OOM(*g_vm, String::formatted("Failed to print value(s): {}", result.error())));
 
+    return JS::js_undefined();
+}
+
+JS_DEFINE_NATIVE_FUNCTION(ScriptObject::gc)
+{
+    vm.heap().collect_garbage();
     return JS::js_undefined();
 }
 
@@ -772,11 +789,11 @@ static ErrorOr<int> run_repl(bool gc_on_every_allocation, bool syntax_highlight)
         Vector<Line::CompletionSuggestion> results;
 
         Function<void(JS::Shape const&, Utf16FlyString const&)> list_all_properties = [&results, &list_all_properties](JS::Shape const& shape, Utf16FlyString const& property_pattern) {
-            for (auto const& descriptor : shape.property_table()) {
-                if (!descriptor.key.is_string())
-                    continue;
+            shape.for_each_property_in_insertion_order([&](auto const& property_key, auto const&) {
+                if (!property_key.is_string())
+                    return;
 
-                auto key = descriptor.key.as_string().to_utf16_string();
+                auto key = property_key.as_string().to_utf16_string();
 
                 if (key.starts_with(property_pattern.view())) {
                     Line::CompletionSuggestion completion { key.to_utf8_but_should_be_ported_to_utf16(), Line::CompletionSuggestion::ForSearch };
@@ -785,7 +802,7 @@ static ErrorOr<int> run_repl(bool gc_on_every_allocation, bool syntax_highlight)
                         results.last().invariant_offset = property_pattern.length_in_code_units();
                     }
                 }
-            }
+            });
             if (auto const* prototype = shape.prototype()) {
                 list_all_properties(prototype->shape(), property_pattern);
             }

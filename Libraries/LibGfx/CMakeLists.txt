@@ -1,17 +1,16 @@
-include(skia)
-include(vulkan)
-
 set(SOURCES
     AffineTransform.cpp
     Bitmap.cpp
+    BitmapExport.cpp
     BitmapSequence.cpp
     CMYKBitmap.cpp
     Color.cpp
+    ColorConversion.cpp
     ColorSpace.cpp
+    CornerRadii.cpp
     Cursor.cpp
     Filter.cpp
     Font/Font.cpp
-    Font/FontData.cpp
     Font/FontDatabase.cpp
     Font/FontSupport.cpp
     Font/PathFontProvider.cpp
@@ -24,7 +23,6 @@ set(SOURCES
     ImageFormats/AVIFLoader.cpp
     ImageFormats/BMPLoader.cpp
     ImageFormats/BMPWriter.cpp
-    ImageFormats/BooleanDecoder.cpp
     ImageFormats/CCITTDecoder.cpp
     ImageFormats/GIFLoader.cpp
     ImageFormats/ICOLoader.cpp
@@ -40,7 +38,7 @@ set(SOURCES
     ImageFormats/WebPSharedLossless.cpp
     ImageFormats/WebPWriter.cpp
     ImageFormats/WebPWriterLossless.cpp
-    ImmutableBitmap.cpp
+    DecodedImageFrameSkiaImageCache.cpp
     PaintStyle.cpp
     Painter.cpp
     PainterSkia.cpp
@@ -77,12 +75,10 @@ endif()
 
 ladybird_lib(LibGfx gfx)
 
-target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibUnicode)
+target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibSync LibUnicode)
 
 set(generated_sources TIFFMetadata.h TIFFTagHandler.cpp)
 list(TRANSFORM generated_sources PREPEND "ImageFormats/")
-
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 add_custom_command(
         OUTPUT  ${generated_sources}
@@ -104,18 +100,11 @@ if (ENABLE_INSTALL_HEADERS)
     install(FILES ${generated_sources} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibGfx/ImageFormats")
 endif()
 
-# Third-party
-find_package(PkgConfig)
-
-pkg_check_modules(WOFF2 REQUIRED IMPORTED_TARGET libwoff2dec)
-find_package(JPEG REQUIRED)
-find_package(PNG REQUIRED)
-find_package(LIBAVIF REQUIRED)
-find_package(WebP REQUIRED)
-find_package(harfbuzz REQUIRED)
-
 target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG PNG::PNG avif WebP::webp WebP::webpdecoder
             WebP::webpdemux WebP::libwebpmux skia harfbuzz)
+
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libgfx_rust FFI_HEADER RustFFI.h)
+target_link_libraries(LibGfx PRIVATE libgfx_rust)
 
 if (HAS_FONTCONFIG)
     target_link_libraries(LibGfx PRIVATE Fontconfig::Fontconfig)
@@ -136,7 +125,6 @@ if (NOT LIBPNG_HAS_APNG)
 endif()
 
 if (NOT ANDROID)
-    pkg_check_modules(Jxl REQUIRED IMPORTED_TARGET libjxl)
     # FIXME: Build vcpkg libraries with clang-cl so they can also build in sanitize.
     # https://github.com/LadybirdBrowser/ladybird/issues/5224
     if (WIN32 AND ENABLE_ADDRESS_SANITIZER)
@@ -146,8 +134,6 @@ if (NOT ANDROID)
     endif()
     target_link_libraries(LibGfx PRIVATE PkgConfig::Jxl)
 else()
-    find_package(libjxl REQUIRED)
-    find_package(hwy REQUIRED)
     target_link_libraries(LibGfx PRIVATE libjxl::libjxl hwy::hwy)
 endif()
 

@@ -5,7 +5,7 @@
  */
 
 #include "CSSPerspective.h"
-#include <LibWeb/Bindings/CSSPerspectivePrototype.h>
+#include <LibWeb/Bindings/CSSPerspective.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSNumericValue.h>
 #include <LibWeb/CSS/CSSUnitValue.h>
@@ -80,7 +80,7 @@ void CSSPerspective::initialize(JS::Realm& realm)
 void CSSPerspective::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    m_length.visit([&visitor](auto const& it) { visitor.visit(it); });
+    visitor.visit(m_length);
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#serialize-a-cssperspective

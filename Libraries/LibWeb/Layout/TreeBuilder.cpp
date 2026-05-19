@@ -11,12 +11,13 @@
 
 #include <AK/Optional.h>
 #include <AK/TemporaryChange.h>
-#include <LibGfx/ImmutableBitmap.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -216,10 +217,10 @@ public:
     virtual Optional<CSSPixels> intrinsic_height() const override { return m_image->natural_height(); }
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override { return m_image->natural_aspect_ratio(); }
 
-    virtual RefPtr<Gfx::ImmutableBitmap> current_image_bitmap_sized(Gfx::IntSize size) const override
+    virtual Optional<Gfx::DecodedImageFrame> current_image_frame_sized(Gfx::IntSize size) const override
     {
         auto rect = DevicePixelRect { DevicePixelPoint {}, size.to_type<DevicePixels>() };
-        return const_cast<Gfx::ImmutableBitmap*>(m_image->current_frame_bitmap(rect));
+        return m_image->current_frame(rect);
     }
 
     virtual void set_visible_in_viewport(bool) override { }
@@ -568,6 +569,49 @@ static bool is_ignorable_whitespace(Layout::Node const& node)
     return false;
 }
 
+static bool is_svg_resource_box(Node const& layout_node)
+{
+    return is<SVGPatternBox>(layout_node) || is<SVGMaskBox>(layout_node) || is<SVGClipBox>(layout_node);
+}
+
+static bool layout_node_is_attached_to_dom_subtree(Node const& layout_node, DOM::Node const& subtree_root)
+{
+    for (auto* ancestor = layout_node.parent(); ancestor; ancestor = ancestor->parent()) {
+        auto* dom_node = ancestor->dom_node();
+        if (dom_node && dom_node->is_shadow_including_inclusive_descendant_of(subtree_root))
+            return true;
+    }
+    return false;
+}
+
+TraversalDecision TreeBuilder::clear_stale_layout_and_paint_node(DOM::Node& node, DOM::Node const* content_visibility_hidden_root)
+{
+    node.set_needs_layout_tree_update(false, DOM::SetNeedsLayoutTreeUpdateReason::None);
+    node.set_child_needs_layout_tree_update(false);
+
+    // NB: Called during layout tree construction.
+    auto layout_node = node.unsafe_layout_node();
+    // SVGPatternBox, SVGMaskBox, and SVGClipBox are created on behalf of a referencing
+    // element and attached to that element's layout subtree. Skip them so they survive
+    // cleanup of their DOM ancestor, unless their layout attachment is inside the
+    // subtree being hidden too.
+    if (layout_node && is_svg_resource_box(*layout_node)
+        && (!content_visibility_hidden_root || !layout_node_is_attached_to_dom_subtree(*layout_node, *content_visibility_hidden_root))) {
+        return TraversalDecision::SkipChildrenAndContinue;
+    }
+
+    if (layout_node && layout_node->parent())
+        layout_node->remove();
+
+    node.detach_layout_node({});
+    node.clear_paintable();
+
+    if (is<DOM::Element>(node))
+        static_cast<DOM::Element&>(node).clear_pseudo_element_nodes({});
+
+    return TraversalDecision::Continue;
+}
+
 void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& context, MustCreateSubtree must_create_subtree)
 {
     // NB: Called during layout tree construction.
@@ -596,26 +640,10 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
 
     ScopeGuard remove_stale_layout_node_guard = [&] {
         // If we didn't create a layout node for this DOM node,
-        // go through the DOM tree and remove any old layout & paint nodes since they are now all stale.
+        // go through the shadow-including subtree and remove any old layout & paint nodes since they are now all stale.
         if (!layout_node) {
-            dom_node.for_each_in_inclusive_subtree([&](auto& node) {
-                node.set_needs_layout_tree_update(false, DOM::SetNeedsLayoutTreeUpdateReason::None);
-                node.set_child_needs_layout_tree_update(false);
-                // NB: Called during layout tree construction.
-                auto layout_node = node.unsafe_layout_node();
-                // SVGPatternBox, SVGMaskBox, and SVGClipBox are created on behalf of a referencing
-                // element and attached to that element's layout subtree. Skip them so they survive cleanup of their
-                // DOM ancestor.
-                if (layout_node && (is<SVGPatternBox>(*layout_node) || is<SVGMaskBox>(*layout_node) || is<SVGClipBox>(*layout_node)))
-                    return TraversalDecision::SkipChildrenAndContinue;
-                if (layout_node && layout_node->parent()) {
-                    layout_node->remove();
-                }
-                node.detach_layout_node({});
-                node.clear_paintable();
-                if (is<DOM::Element>(node))
-                    static_cast<DOM::Element&>(node).clear_pseudo_element_nodes({});
-                return TraversalDecision::Continue;
+            dom_node.for_each_shadow_including_inclusive_descendant([&](auto& node) {
+                return clear_stale_layout_and_paint_node(node);
             });
         }
     };
@@ -647,7 +675,16 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
             if (auto old_backdrop_node = element.get_pseudo_element_node(CSS::PseudoElement::Backdrop))
                 old_backdrop_node->remove();
             element.clear_pseudo_element_nodes({});
-            VERIFY(!element.needs_style_update());
+            // Elements inside a `display:none` subtree are skipped by
+            // `Document::update_style_recursively`, so a bypass path (top-layer iteration, slot
+            // projection, SVG mask/clip-path or pattern reference) may reach an element whose
+            // `needs_style_update` flag is still set or whose `computed_properties` is null. Route
+            // through `update_style_for_element`, which seeds the style computer's ancestor filter
+            // so descendant-combinator selectors continue to match during the lazy re-cascade.
+            if (element.needs_style_update() || !element.computed_properties()) {
+                document.update_style_for_element({ element });
+                element.set_needs_style_update(false);
+            }
             style = element.computed_properties();
             display = style->display();
             if (display.is_none())
@@ -738,6 +775,12 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
         update_layout_tree_before_children(dom_node, *layout_node, context, element_has_content_visibility_hidden);
     }
 
+    if (element_has_content_visibility_hidden) {
+        dom_node.for_each_shadow_including_descendant([&](auto& node) {
+            return clear_stale_layout_and_paint_node(node, &dom_node);
+        });
+    }
+
     if (should_create_layout_node || dom_node.child_needs_layout_tree_update()) {
         if ((dom_node.has_children() || shadow_root) && layout_node->can_have_children() && !element_has_content_visibility_hidden) {
             push_parent(as<NodeWithStyle>(*layout_node));
@@ -793,6 +836,16 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
             }
 
             pop_parent();
+        } else {
+            // Assigned slottables are not DOM descendants of the slot, so the generic
+            // content-visibility:hidden descendant cleanup above does not reach them.
+            for (auto const& slottable : slot_element.assigned_nodes_internal()) {
+                slottable.visit([&](DOM::Node& slottable_root) {
+                    slottable_root.for_each_shadow_including_inclusive_descendant([&](auto& node) {
+                        return clear_stale_layout_and_paint_node(node, &slottable_root);
+                    });
+                });
+            }
         }
     }
 

@@ -134,6 +134,10 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         qaction.setIcon(load_icon_from_uri("resource://icons/16x16/edit-copy.png"sv));
         qaction.setShortcut(QKeySequence::StandardKey::Copy);
         break;
+    case WebView::ActionID::CutSelection:
+        qaction.setIcon(load_icon_from_uri("resource://icons/16x16/edit-cut.png"sv));
+        qaction.setShortcut(QKeySequence::StandardKey::Cut);
+        break;
     case WebView::ActionID::Paste:
         qaction.setIcon(load_icon_from_uri("resource://icons/16x16/paste.png"sv));
         qaction.setShortcut(QKeySequence::StandardKey::Paste);
@@ -187,6 +191,10 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         break;
 
     case WebView::ActionID::OpenInNewTab:
+        qaction.setIcon(load_icon_from_uri("resource://icons/16x16/new-tab.png"sv));
+        break;
+    case WebView::ActionID::OpenInNewWindow:
+        // FIXME: should be a separate icon for new window.
         qaction.setIcon(load_icon_from_uri("resource://icons/16x16/new-tab.png"sv));
         break;
     case WebView::ActionID::CopyURL:
@@ -279,7 +287,6 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         break;
     case WebView::ActionID::CollectGarbage:
         qaction.setIcon(load_icon_from_uri("resource://icons/16x16/trash-can.png"sv));
-        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_G));
         break;
 
     default:

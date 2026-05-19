@@ -1,5 +1,3 @@
-include(fontconfig)
-
 set(SOURCES
     Application.cpp
     Attribute.cpp
@@ -11,6 +9,7 @@ set(SOURCES
     DOMNodeProperties.cpp
     FileDownloader.cpp
     HeadlessWebView.cpp
+    HistoryStore.cpp
     HelperProcess.cpp
     Menu.cpp
     Mutation.cpp
@@ -33,6 +32,7 @@ set(SOURCES
     WebUI/BookmarksUI.cpp
     WebUI/ProcessesUI.cpp
     WebUI/SettingsUI.cpp
+    WebUI/VersionUI.cpp
 )
 
 set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
@@ -56,6 +56,8 @@ set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
+    ../../Services/WebContent/CompositorClientEndpoint.h
+    ../../Services/WebContent/CompositorServerEndpoint.h
     ../../Services/WebContent/WebContentClientEndpoint.h
     ../../Services/WebContent/WebContentServerEndpoint.h
     ../../Services/WebContent/WebDriverClientEndpoint.h
@@ -67,15 +69,17 @@ set(GENERATED_SOURCES
     UIProcessServerEndpoint.h
 )
 
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/CompositorClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/CompositorClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/CompositorServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/CompositorServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebDriverClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebDriverClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebDriverServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebDriverServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIServerEndpoint.h)
 
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibWebView PRIVATE LibCore LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibJS LibWeb LibUnicode LibURL LibSyntax LibTextCodec)
+target_link_libraries(LibWebView PRIVATE LibCore LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibJS LibWeb LibUnicode LibURL LibSync LibSyntax LibTextCodec)
 
 # Third-party
 if (HAS_FONTCONFIG)

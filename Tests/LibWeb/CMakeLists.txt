@@ -4,13 +4,16 @@ set(TEST_SOURCES
     TestControlMessageQueue.cpp
     TestCSSInheritedProperty.cpp
     TestCSSPixels.cpp
+    TestCSSStyleSheetInvalidation.cpp
     TestCSSSyntaxParser.cpp
+    TestCSSTokenizer.cpp
     TestCSSTokenStream.cpp
     TestFetchURL.cpp
     TestHTMLTokenizer.cpp
     TestMicrosyntax.cpp
     TestMimeSniff.cpp
     TestNumbers.cpp
+    TestRefCountedTreeNode.cpp
     TestSourceHighlighter.cpp
     TestStrings.cpp
 )
@@ -19,9 +22,10 @@ foreach(source IN LISTS TEST_SOURCES)
     ladybird_test("${source}" LibWeb LIBS LibWeb)
 endforeach()
 
-lagom_utility(css-tokenizer SOURCES css-tokenizer.cpp LIBS LibFileSystem LibMain LibWeb)
+ladybird_utility(css-tokenizer SOURCES css-tokenizer.cpp LIBS LibFileSystem LibMain LibWeb)
 
 target_link_libraries(TestContentFilter PRIVATE LibURL)
+target_link_libraries(TestControlMessageQueue PRIVATE LibSync)
 target_link_libraries(TestFetchURL PRIVATE LibURL)
 target_link_libraries(TestSourceHighlighter PRIVATE LibURL LibWebView)
 

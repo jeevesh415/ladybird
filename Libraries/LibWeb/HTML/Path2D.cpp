@@ -7,7 +7,7 @@
  */
 
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/Path2DPrototype.h>
+#include <LibWeb/Bindings/Path2D.h>
 #include <LibWeb/Geometry/DOMMatrix.h>
 #include <LibWeb/HTML/Path2D.h>
 #include <LibWeb/SVG/AttributeParser.h>
@@ -66,7 +66,7 @@ void Path2D::initialize(JS::Realm& realm)
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-path2d-addpath
-WebIDL::ExceptionOr<void> Path2D::add_path(GC::Ref<Path2D> path, Geometry::DOMMatrix2DInit& transform)
+WebIDL::ExceptionOr<void> Path2D::add_path(GC::Ref<Path2D> path, Bindings::DOMMatrix2DInit& transform)
 {
     // The addPath(path, transform) method, when invoked on a Path2D object a, must run these steps:
 

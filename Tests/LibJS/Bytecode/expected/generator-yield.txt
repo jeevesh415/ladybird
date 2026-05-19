@@ -1,4 +1,4 @@
-$9403c830 generator-yield.js:11:1
+$205805b7 generator-yield.js:11:1
   Registers: 9
   Blocks:    1
   Constants:
@@ -6,18 +6,18 @@ $9403c830 generator-yield.js:11:1
 
 block0:
   [   0] GetGlobal dst:reg6, `multi_yield`
-  [  18] Call dst:reg5, callee:reg6, this_value:Undefined, multi_yield
-  [  38] SetGlobal `g`, src:reg5
-  [  50] GetGlobal dst:reg6, `g`
-  [  68] GetById dst:reg7, base:reg6, `next` (g.next)
-  [  88] Call dst:reg5, callee:reg7, this_value:reg6, g.next
-  [  a8] GetGlobal dst:reg7, `g`
-  [  c0] GetById dst:reg8, base:reg7, `next` (g.next)
-  [  e0] Call dst:reg6, callee:reg8, this_value:reg7, g.next
-  [ 100] End value:reg6
+  [  10] Call dst:reg5, callee:reg6, this_value:Undefined, multi_yield
+  [  30] SetGlobal `g`, src:reg5
+  [  40] GetGlobal dst:reg6, `g`
+  [  50] GetById dst:reg7, base:reg6, `next` (g.next)
+  [  68] Call dst:reg5, callee:reg7, this_value:reg6, g.next
+  [  88] GetGlobal dst:reg6, `g`
+  [  98] GetById dst:reg8, base:reg6, `next` (g.next)
+  [  b0] Call dst:reg7, callee:reg8, this_value:reg6, g.next
+  [  d0] End value:reg7
 
 
-multi_yield$617e06b7 generator-yield.js:7:5
+multi_yield$7e2d183f generator-yield.js:7:5
   Registers: 10
   Blocks:    12
   Constants:
@@ -50,18 +50,18 @@ block6:
   [  88] Yield value:reg7
 
 block7:
-  [  98] Mov dst:reg5, src:reg0
-  [  a8] GetCompletionFields type_dst:reg6, value_dst:reg7, completion:reg5
-  [  b8] JumpStrictlyEquals lhs:reg6, rhs:Int32(1), true_target:block8, false_target:block9
+  [  98] Mov dst:reg7, src:reg0
+  [  a8] GetCompletionFields type_dst:reg5, value_dst:reg6, completion:reg7
+  [  b8] JumpStrictlyEquals lhs:reg5, rhs:Int32(1), true_target:block8, false_target:block9
 
 block8:
   [  d0] Yield value:Undefined
 
 block9:
-  [  e0] JumpStrictlyEquals lhs:reg6, rhs:Int32(5), true_target:block10, false_target:block11
+  [  e0] JumpStrictlyEquals lhs:reg5, rhs:Int32(5), true_target:block10, false_target:block11
 
 block10:
-  [  f8] Throw src:reg7
+  [  f8] Throw src:reg6
 
 block11:
-  [ 100] Yield value:reg7
+  [ 100] Yield value:reg6

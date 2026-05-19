@@ -9,6 +9,7 @@ import socket
 import socketserver
 import sys
 import time
+import urllib.parse
 
 from typing import Dict
 from typing import Optional
@@ -56,6 +57,9 @@ class Echo:
 # In-memory store for echo responses
 echo_store: Dict[str, Echo] = {}
 
+# Headers from the most recent request at each echo path, queryable via GET /recorded-request-headers<echo-path>.
+recorded_request_headers: Dict[str, Dict[str, list]] = {}
+
 
 class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     static_directory: str
@@ -98,6 +102,8 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/echo"):
             self.handle_echo()
+        elif self.path.startswith("/recorded-request-headers/"):
+            self._serve_recorded_request_headers()
         else:
             self._serve_static_request()
 
@@ -170,7 +176,7 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         # Return 409: Conflict if the method+path combination already exists
-        key = f"{echo.method} {echo.path}"
+        key = f"{echo.method} {urllib.parse.urlparse(echo.path).path}"
         if key in echo_store and echo_store[key] != echo:
             self.send_response(409)
             self.send_header("Content-Type", "text/plain")
@@ -201,9 +207,33 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(fetch_config).encode("utf-8"))
 
+    def _serve_recorded_request_headers(self):
+        echo_path = self.path[len("/recorded-request-headers") :]
+        headers = recorded_request_headers.get(echo_path)
+        if headers is None:
+            self.send_error(404, f"No recorded request at {echo_path}")
+            return
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(headers).encode("utf-8"))
+
     def handle_echo(self):
         method = self.command.upper()
+        parsed_url = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed_url.query)
         key = f"{method} {self.path}"
+        if key not in echo_store:
+            key = f"{method} {parsed_url.path}"
+
+        headers_for_path: Dict[str, list[str]] = {}
+        for header, value in self.headers.items():
+            headers_for_path.setdefault(header, []).append(value)
+        recorded_request_headers[self.path] = headers_for_path
+
+        if parsed_url.path != self.path:
+            recorded_request_headers[parsed_url.path] = recorded_request_headers[self.path]
 
         is_revalidation_request = "If-Modified-Since" in self.headers
         send_not_modified = is_revalidation_request and "X-Ladybird-Respond-With-Not-Modified" in self.headers
@@ -285,9 +315,26 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 response_body = response_body[int(start) :]
 
         if echo.body_encoding == "base64":
-            self.wfile.write(base64.b64decode(response_body))
+            response_body_bytes = base64.b64decode(response_body)
         else:
-            self.wfile.write(response_body.encode("utf-8"))
+            response_body_bytes = response_body.encode("utf-8")
+
+        chunks = query.get("chunks", [])
+        chunk_delay_ms = int(query.get("chunk_delay_ms", [0])[0] or 0)
+        if chunks:
+            chunk_sizes = [int(chunk_size) for chunk_size in chunks[0].split(",") if chunk_size]
+            offset = 0
+            for chunk_size in chunk_sizes:
+                self.wfile.write(response_body_bytes[offset : offset + chunk_size])
+                self.wfile.flush()
+                offset += chunk_size
+                if chunk_delay_ms > 0:
+                    time.sleep(chunk_delay_ms / 1000)
+            if offset < len(response_body_bytes):
+                self.wfile.write(response_body_bytes[offset:])
+            return
+
+        self.wfile.write(response_body_bytes)
 
     def do_other(self):
         if self.path.startswith("/echo"):

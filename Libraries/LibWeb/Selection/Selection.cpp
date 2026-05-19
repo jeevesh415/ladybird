@@ -7,7 +7,7 @@
 
 #include <LibUnicode/Segmenter.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SelectionPrototype.h>
+#include <LibWeb/Bindings/Selection.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/Position.h>
@@ -734,7 +734,7 @@ void Selection::scroll_focus_into_view()
 
     m_document->update_layout(DOM::UpdateLayoutReason::ScrollCursorIntoView);
 
-    auto* paintable = focus->paintable();
+    auto paintable = focus->paintable();
     if (!paintable)
         return;
 

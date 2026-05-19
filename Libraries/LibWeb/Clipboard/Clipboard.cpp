@@ -7,7 +7,7 @@
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibTextCodec/Decoder.h>
-#include <LibWeb/Bindings/ClipboardPrototype.h>
+#include <LibWeb/Bindings/Clipboard.h>
 #include <LibWeb/Clipboard/Clipboard.h>
 #include <LibWeb/Clipboard/ClipboardItem.h>
 #include <LibWeb/Clipboard/SystemClipboard.h>
@@ -167,7 +167,7 @@ static bool check_clipboard_write_permission(JS::Realm& realm)
 }
 
 // https://w3c.github.io/clipboard-apis/#dom-clipboard-readtext
-GC::Ref<WebIDL::Promise> Clipboard::read(ClipboardUnsanitizedFormats formats)
+GC::Ref<WebIDL::Promise> Clipboard::read(Bindings::ClipboardUnsanitizedFormats formats)
 {
     // 1. Let realm be this's relevant realm.
     auto& realm = HTML::relevant_realm(*this);
@@ -398,7 +398,7 @@ GC::Ref<WebIDL::Promise> Clipboard::read_text()
 }
 
 // https://w3c.github.io/clipboard-apis/#dom-clipboard-write
-GC::Ref<WebIDL::Promise> Clipboard::write(GC::RootVector<GC::Root<ClipboardItem>>& data)
+GC::Ref<WebIDL::Promise> Clipboard::write(Vector<GC::Root<ClipboardItem>> const& data)
 {
     // 1. Let realm be this's relevant realm.
     auto& realm = HTML::relevant_realm(*this);

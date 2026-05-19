@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <AK/ByteString.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibWeb/CSS/Fetch.h>
@@ -34,12 +35,14 @@ struct FontFaceKey {
     FlyString family_name;
     FontWeightRange weight;
     int slope { 0 };
-    [[nodiscard]] u32 hash() const { return pair_int_hash(family_name.ascii_case_insensitive_hash(), pair_int_hash(weight.hash(), slope)); }
+    int width { 100 };
+    [[nodiscard]] u32 hash() const { return pair_int_hash(family_name.ascii_case_insensitive_hash(), pair_int_hash(weight.hash(), pair_int_hash(slope, width))); }
     [[nodiscard]] bool operator==(FontFaceKey const& other) const
     {
         return family_name.equals_ignoring_ascii_case(other.family_name)
             && weight == other.weight
-            && slope == other.slope;
+            && slope == other.slope
+            && width == other.width;
     }
 };
 
@@ -74,10 +77,12 @@ public:
 
     FlyString family_name() const { return m_family_name; }
 
+    void subscribe(GC::Ref<GC::Function<void(RefPtr<Gfx::Typeface const>)>>);
+
 private:
     virtual void visit_edges(Visitor&) override;
 
-    ErrorOr<NonnullRefPtr<Gfx::Typeface const>> try_load_font(Fetch::Infrastructure::Response const&, ByteBuffer const&);
+    Optional<ByteString> try_load_font_mime_type_essence(Fetch::Infrastructure::Response const&, ByteBuffer const&);
 
     void font_did_load_or_fail(RefPtr<Gfx::Typeface const>);
 
@@ -88,7 +93,8 @@ private:
     RefPtr<Gfx::Typeface const> m_typeface;
     Vector<URL> m_urls;
     GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
-    GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> m_on_load;
+    Vector<GC::Ref<GC::Function<void(RefPtr<Gfx::Typeface const>)>>> m_subscribers;
+    bool m_has_completed { false };
 };
 
 class WEB_API FontComputer final : public GC::Cell {
@@ -129,13 +135,14 @@ private:
     RefPtr<Gfx::FontCascadeList const> find_matching_font_weight_ascending(Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values, bool inclusive) const;
     RefPtr<Gfx::FontCascadeList const> find_matching_font_weight_descending(Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values, bool inclusive) const;
     NonnullRefPtr<Gfx::FontCascadeList const> compute_font_for_style_values_impl(StyleValue const& font_family, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const;
-    RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FlyString const& family_name, int weight, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values) const;
+    RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FlyString const& family_name, int weight, Percentage const& font_width, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values) const;
 
     HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values_for_family(FlyString const& family_name) const;
 
     GC::Ref<DOM::Document> m_document;
 
     HashMap<FontFaceKey, Vector<GC::Ref<FontFace>>> m_font_faces;
+    HashMap<String, GC::Ref<FontLoader>> m_loaders_by_url;
 
     mutable HashMap<ComputedFontCacheKey, NonnullRefPtr<Gfx::FontCascadeList const>> m_computed_font_cache;
     mutable HashMap<FlyString, HashMap<FontFeatureValueKey, Vector<u32>>> m_font_feature_values_cache;

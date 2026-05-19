@@ -256,6 +256,8 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
         else
             (void)as<Web::HTML::ModuleScript>(*script).run();
 
+        as<WebWorker::PageHost>(page->client()).did_finish_loading_worker_script();
+
         // FIXME: 11. Enable outside port's port message queue.
 
         // 12. If is shared is false, enable the port message queue of the worker's implicit port.
@@ -273,7 +275,7 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
                 auto& vm = realm.vm();
                 Web::HTML::TemporaryExecutionContext const context(realm);
 
-                Web::HTML::MessageEventInit event_init {};
+                Web::Bindings::MessageEventInit event_init {};
                 event_init.data = GC::Ref { vm.empty_string() };
                 event_init.ports = { inside_port };
                 event_init.source = Web::HTML::NullableMessageEventSource { inside_port };

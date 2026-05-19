@@ -54,29 +54,16 @@ Optional<SelectorList> Parser::parse_as_relative_selector(SelectorParsingMode pa
 
 Optional<Selector::PseudoElementSelector> Parser::parse_as_pseudo_element_selector()
 {
-    // FIXME: This is quite janky. Selector parsing is not at all designed to allow parsing just a single part of a selector.
-    //        So, this code parses a whole selector, then rejects it if it's not a single pseudo-element simple selector.
-    //        Come back and fix this, future Sam!
-    auto maybe_selector_list = parse_a_selector_list(m_token_stream, SelectorType::Standalone, SelectorParsingMode::Standard);
-    if (maybe_selector_list.is_error())
+    auto component_values = consume_a_list_of_component_values(m_token_stream);
+    TokenStream tokens { component_values };
+    auto maybe_simple_selector = parse_pseudo_element_simple_selector(tokens);
+    if (maybe_simple_selector.is_error())
         return {};
-    auto& selector_list = maybe_selector_list.value();
-
-    if (selector_list.size() != 1)
+    if (tokens.has_next_token())
         return {};
-    auto& selector = selector_list.first();
-
-    if (selector->compound_selectors().size() != 1)
-        return {};
-    auto& first_compound_selector = selector->compound_selectors().first();
-
-    if (first_compound_selector.simple_selectors.size() != 1)
-        return {};
-    auto& simple_selector = first_compound_selector.simple_selectors.first();
-
+    auto simple_selector = maybe_simple_selector.release_value();
     if (simple_selector.type != Selector::SimpleSelector::Type::PseudoElement)
         return {};
-
     return simple_selector.pseudo_element();
 }
 
@@ -101,6 +88,74 @@ static NonnullRefPtr<Selector> create_invalid_selector(Selector::Combinator comb
         .simple_selectors = { move(simple) }
     };
     return Selector::create({ move(compound) });
+}
+
+static Vector<Selector::CompoundSelector> normalize_pseudo_element_transitions(Vector<Selector::CompoundSelector>&& compound_selectors)
+{
+    // Splits up any CompoundSelectors including pseudo-elements, so that they are separated by a PseudoElement
+    // combinator, while ensuring that any pseudo-element CompoundSelectors are preceded by a CompoundSelector for
+    // their originating element.
+    // Any that don't have one specified explicitly receive an implicit `*` before them:
+    // eg, `::before` becomes two CompoundSelectors, for the implicit `*` and for the `::before` pseudo-element.
+
+    // If we don't have any pseudo-elements, return the original CompoundSelectors unchanged.
+    bool contains_pseudo_element = false;
+    for (auto const& compound_selector : compound_selectors) {
+        for (auto const& simple_selector : compound_selector.simple_selectors) {
+            if (simple_selector.type != Selector::SimpleSelector::Type::PseudoElement)
+                continue;
+            contains_pseudo_element = true;
+            break;
+        }
+        if (contains_pseudo_element)
+            break;
+    }
+    if (!contains_pseudo_element)
+        return move(compound_selectors);
+
+    Vector<Selector::CompoundSelector> normalized_compound_selectors;
+
+    auto append_compound = [&](Selector::Combinator combinator, Vector<Selector::SimpleSelector>&& simple_selectors) {
+        if (simple_selectors.is_empty())
+            return;
+        normalized_compound_selectors.append({
+            .combinator = combinator,
+            .simple_selectors = move(simple_selectors),
+        });
+    };
+
+    for (auto& compound_selector : compound_selectors) {
+        auto current_combinator = compound_selector.combinator;
+        Vector<Selector::SimpleSelector> current_simple_selectors;
+        current_simple_selectors.ensure_capacity(compound_selector.simple_selectors.size());
+
+        for (auto& simple_selector : compound_selector.simple_selectors) {
+            if (simple_selector.type == Selector::SimpleSelector::Type::PseudoElement) {
+                if (current_simple_selectors.is_empty()) {
+                    normalized_compound_selectors.append({
+                        .combinator = current_combinator,
+                        .is_implicit_universal_anchor = true,
+                        .simple_selectors = { Selector::SimpleSelector {
+                            .type = Selector::SimpleSelector::Type::Universal,
+                            .value = Selector::SimpleSelector::QualifiedName {
+                                .namespace_type = Selector::SimpleSelector::QualifiedName::NamespaceType::Any,
+                                .name = Selector::SimpleSelector::Name { "*"_fly_string },
+                            },
+                        } },
+                    });
+                } else {
+                    append_compound(current_combinator, move(current_simple_selectors));
+                    current_simple_selectors = {};
+                }
+                current_combinator = Selector::Combinator::PseudoElement;
+            }
+            current_simple_selectors.append(move(simple_selector));
+        }
+
+        append_compound(current_combinator, move(current_simple_selectors));
+    }
+
+    return normalized_compound_selectors;
 }
 
 template<typename T>
@@ -139,7 +194,7 @@ template Parser::ParseErrorOr<SelectorList> Parser::parse_a_selector_list(TokenS
 
 Parser::ParseErrorOr<NonnullRefPtr<Selector>> Parser::parse_complex_selector(TokenStream<ComponentValue>& tokens, SelectorType mode)
 {
-    Vector<Selector::CompoundSelector> compound_selectors;
+    Vector<Selector::CompoundSelector> raw_compound_selectors;
 
     auto first_combinator = parse_selector_combinator(tokens);
 
@@ -174,7 +229,7 @@ Parser::ParseErrorOr<NonnullRefPtr<Selector>> Parser::parse_complex_selector(Tok
     }
 
     first_selector.combinator = first_combinator.value_or(Selector::Combinator::None);
-    compound_selectors.append(move(first_selector));
+    raw_compound_selectors.append(move(first_selector));
 
     while (tokens.has_next_token()) {
         auto combinator = parse_selector_combinator(tokens);
@@ -193,10 +248,10 @@ Parser::ParseErrorOr<NonnullRefPtr<Selector>> Parser::parse_complex_selector(Tok
         }
 
         compound_selector.combinator = combinator.release_value();
-        compound_selectors.append(move(compound_selector));
+        raw_compound_selectors.append(move(compound_selector));
     }
 
-    if (compound_selectors.is_empty()) {
+    if (raw_compound_selectors.is_empty()) {
         ErrorReporter::the().report(InvalidSelectorError {
             .value_string = tokens.dump_string(),
             .description = "Selector contains no compound-selectors."_string,
@@ -212,36 +267,34 @@ Parser::ParseErrorOr<NonnullRefPtr<Selector>> Parser::parse_complex_selector(Tok
         return ParseError::SyntaxError;
     }
 
-    auto parsed_selector = Selector::create(move(compound_selectors));
+    auto parsed_selector = Selector::create(normalize_pseudo_element_transitions(move(raw_compound_selectors)));
 
-    // The rest of our code assumes selectors have at most 1 pseudo-element, in the final compound selector,
-    // so reject anything else for now.
-    // FIXME: Remove this once we support them elsewhere.
-    for (auto i = 0u; i < parsed_selector->compound_selectors().size() - 1; ++i) {
-        for (auto const& simple_selector : parsed_selector->compound_selectors()[i].simple_selectors) {
-            if (simple_selector.type == Selector::SimpleSelector::Type::PseudoElement) {
-                ErrorReporter::the().report(InvalidSelectorError {
-                    .value_string = parsed_selector->serialize(),
-                    .description = "Pseudo elements before the final compound-selector are not yet supported."_string,
-                });
-                return ParseError::SyntaxError;
-            }
-        }
-    }
-    // https://drafts.csswg.org/css-shadow-1/#selectordef-part
-    // The ::part() pseudo-element can be followed by other pseudo-elements to style pseudo-elements of the part itself.
     auto pseudo_element_count = 0;
     Optional<PseudoElement> first_pseudo_element;
     Optional<PseudoElement> second_pseudo_element;
-    for (auto const& simple_selector : parsed_selector->compound_selectors().last().simple_selectors) {
-        if (simple_selector.type == Selector::SimpleSelector::Type::PseudoElement) {
+    bool saw_pseudo_element_transition = false;
+    for (auto const& compound_selector : parsed_selector->compound_selectors()) {
+        if (saw_pseudo_element_transition && compound_selector.combinator != Selector::Combinator::PseudoElement) {
+            ErrorReporter::the().report(InvalidSelectorError {
+                .value_string = parsed_selector->serialize(),
+                .description = "Pseudo-elements cannot be followed by a non-pseudo-element combinator."_string,
+            });
+            return ParseError::SyntaxError;
+        }
+        if (compound_selector.combinator == Selector::Combinator::PseudoElement)
+            saw_pseudo_element_transition = true;
+
+        if (!compound_selector.simple_selectors.is_empty()
+            && compound_selector.simple_selectors.first().type == Selector::SimpleSelector::Type::PseudoElement) {
             ++pseudo_element_count;
+            auto pseudo_element = compound_selector.simple_selectors.first().pseudo_element().type();
             if (!first_pseudo_element.has_value())
-                first_pseudo_element = simple_selector.pseudo_element().type();
+                first_pseudo_element = pseudo_element;
             else if (!second_pseudo_element.has_value())
-                second_pseudo_element = simple_selector.pseudo_element().type();
+                second_pseudo_element = pseudo_element;
         }
     }
+
     if (pseudo_element_count > 1) {
         // FIXME: Other pseudo-elements can also be chained (e.g. ::highlight()::before).
         //        For now, only ::part() followed by one other pseudo-element is supported.
@@ -278,7 +331,10 @@ Parser::ParseErrorOr<Selector::CompoundSelector> Parser::parse_compound_selector
         simple_selectors.append(component.release_value());
     }
 
-    return Selector::CompoundSelector { Selector::Combinator::None, move(simple_selectors) };
+    return Selector::CompoundSelector {
+        .combinator = Selector::Combinator::None,
+        .simple_selectors = move(simple_selectors),
+    };
 }
 
 Optional<Selector::Combinator> Parser::parse_selector_combinator(TokenStream<ComponentValue>& tokens)
@@ -437,19 +493,25 @@ Parser::ParseErrorOr<Selector::SimpleSelector> Parser::parse_attribute_simple_se
     if (!attribute_tokens.has_next_token())
         return simple_selector;
 
-    auto const& delim_part = attribute_tokens.consume_a_token();
-    if (!delim_part.is(Token::Type::Delim)) {
-        ErrorReporter::the().report(InvalidSelectorError {
-            .value_string = first_value.to_string(),
-            .description = MUST(String::formatted("Expected delim for attribute comparison, got: '{}'.", delim_part.to_debug_string())),
-        });
-        return ParseError::SyntaxError;
-    }
+    auto parse_attribute_match_type = [&first_value](auto& tokens) -> ParseErrorOr<Selector::SimpleSelector::Attribute::MatchType> {
+        // This is one of: `=`, `~=`, `*=`, `|=`, `^=`, `$=`
+        auto transaction = tokens.begin_transaction();
 
-    if (delim_part.token().delim() == '=') {
-        simple_selector.attribute().match_type = Selector::SimpleSelector::Attribute::MatchType::ExactValueMatch;
-    } else {
-        if (!attribute_tokens.has_next_token()) {
+        auto const& first_delim = tokens.consume_a_token();
+        if (!first_delim.is(Token::Type::Delim)) {
+            ErrorReporter::the().report(InvalidSelectorError {
+                .value_string = first_value.to_string(),
+                .description = MUST(String::formatted("Expected delim for attribute comparison, got: '{}'.", first_delim.to_debug_string())),
+            });
+            return ParseError::SyntaxError;
+        }
+
+        if (first_delim.token().delim() == '=') {
+            transaction.commit();
+            return Selector::SimpleSelector::Attribute::MatchType::ExactValueMatch;
+        }
+
+        if (!tokens.has_next_token()) {
             ErrorReporter::the().report(InvalidSelectorError {
                 .value_string = first_value.to_string(),
                 .description = "Attribute selector ended part way through a match type."_string,
@@ -457,34 +519,40 @@ Parser::ParseErrorOr<Selector::SimpleSelector> Parser::parse_attribute_simple_se
             return ParseError::SyntaxError;
         }
 
-        auto const& delim_second_part = attribute_tokens.consume_a_token();
-        if (!delim_second_part.is_delim('=')) {
+        auto const& second_delim = tokens.consume_a_token();
+        if (!second_delim.is_delim('=')) {
             ErrorReporter::the().report(InvalidSelectorError {
                 .value_string = first_value.to_string(),
-                .description = MUST(String::formatted("Expected a double delim for attribute comparison, got: '{}{}'.", delim_part.to_debug_string(), delim_second_part.to_debug_string())),
+                .description = MUST(String::formatted("Expected a double delim for attribute comparison, got: '{}{}'.", first_delim.to_debug_string(), second_delim.to_debug_string())),
             });
             return ParseError::SyntaxError;
         }
-        switch (delim_part.token().delim()) {
+        switch (first_delim.token().delim()) {
         case '~':
-            simple_selector.attribute().match_type = Selector::SimpleSelector::Attribute::MatchType::ContainsWord;
-            break;
+            transaction.commit();
+            return Selector::SimpleSelector::Attribute::MatchType::ContainsWord;
         case '*':
-            simple_selector.attribute().match_type = Selector::SimpleSelector::Attribute::MatchType::ContainsString;
-            break;
+            transaction.commit();
+            return Selector::SimpleSelector::Attribute::MatchType::ContainsString;
         case '|':
-            simple_selector.attribute().match_type = Selector::SimpleSelector::Attribute::MatchType::StartsWithSegment;
-            break;
+            transaction.commit();
+            return Selector::SimpleSelector::Attribute::MatchType::StartsWithSegment;
         case '^':
-            simple_selector.attribute().match_type = Selector::SimpleSelector::Attribute::MatchType::StartsWithString;
-            break;
+            transaction.commit();
+            return Selector::SimpleSelector::Attribute::MatchType::StartsWithString;
         case '$':
-            simple_selector.attribute().match_type = Selector::SimpleSelector::Attribute::MatchType::EndsWithString;
-            break;
+            transaction.commit();
+            return Selector::SimpleSelector::Attribute::MatchType::EndsWithString;
         default:
-            attribute_tokens.reconsume_current_input_token();
+            ErrorReporter::the().report(InvalidSelectorError {
+                .value_string = first_value.to_string(),
+                .description = MUST(String::formatted("Invalid attribute selector match type `{:c}=`", first_delim.token().delim())),
+            });
+            return ParseError::SyntaxError;
         }
-    }
+    };
+
+    simple_selector.attribute().match_type = TRY(parse_attribute_match_type(attribute_tokens));
 
     attribute_tokens.discard_whitespace();
     if (!attribute_tokens.has_next_token()) {
@@ -814,7 +882,7 @@ Parser::ParseErrorOr<Selector::SimpleSelector> Parser::parse_pseudo_class_simple
                 auto& maybe_integer = level_token_stream.consume_a_token();
                 level_token_stream.discard_whitespace();
 
-                if (!maybe_integer.is(Token::Type::Number) || !maybe_integer.token().number().is_integer()) {
+                if (!maybe_integer.is(Token::Type::Number) || !maybe_integer.token().is_integer()) {
                     ErrorReporter::the().report(InvalidPseudoClassOrElementError {
                         .name = MUST(String::formatted(":{}", pseudo_function.name)),
                         .value_string = pseudo_function.name.to_string(),
@@ -832,7 +900,7 @@ Parser::ParseErrorOr<Selector::SimpleSelector> Parser::parse_pseudo_class_simple
                     return ParseError::SyntaxError;
                 }
 
-                levels.append(maybe_integer.token().number().integer_value());
+                levels.append(maybe_integer.token().to_integer());
             }
 
             return Selector::SimpleSelector {
@@ -1115,6 +1183,13 @@ Parser::ParseErrorOr<Optional<Selector::SimpleSelector>> Parser::parse_simple_se
     if (tokens.next_token().is(Token::Type::Colon))
         return TRY(parse_pseudo_class_simple_selector(tokens));
 
+    if (tokens.next_token().is(Token::Type::Delim)
+        && first_is_one_of(static_cast<char>(tokens.next_token().token().delim()), '>', '+', '~', '|')) {
+        // Whitespace is not required between the compound-selector and a combinator.
+        // So, if we see a combinator, return that this compound-selector is done, instead of a syntax error.
+        return Optional<Selector::SimpleSelector> {};
+    }
+
     auto const& first_value = tokens.consume_a_token();
 
     if (first_value.is(Token::Type::Delim)) {
@@ -1144,14 +1219,6 @@ Parser::ParseErrorOr<Optional<Selector::SimpleSelector>> Parser::parse_simple_se
                 .value = Selector::SimpleSelector::Name { class_name_value.token().ident() }
             };
         }
-        case '>':
-        case '+':
-        case '~':
-        case '|':
-            // Whitespace is not required between the compound-selector and a combinator.
-            // So, if we see a combinator, return that this compound-selector is done, instead of a syntax error.
-            tokens.reconsume_current_input_token();
-            return Optional<Selector::SimpleSelector> {};
         default:
             ErrorReporter::the().report(InvalidSelectorError {
                 .value_string = tokens.dump_string(),
@@ -1185,6 +1252,7 @@ Parser::ParseErrorOr<Optional<Selector::SimpleSelector>> Parser::parse_simple_se
     return ParseError::SyntaxError;
 }
 
+// https://drafts.csswg.org/css-syntax-3/#anb-microsyntax
 Optional<Selector::SimpleSelector::ANPlusBPattern> Parser::parse_a_n_plus_b_pattern(TokenStream<ComponentValue>& values)
 {
     auto transaction = values.begin_transaction();
@@ -1192,103 +1260,101 @@ Optional<Selector::SimpleSelector::ANPlusBPattern> Parser::parse_a_n_plus_b_patt
     auto is_sign = [](ComponentValue const& value) -> bool {
         return value.is(Token::Type::Delim) && (value.token().delim() == '+' || value.token().delim() == '-');
     };
-    auto is_n_dimension = [](ComponentValue const& value) -> bool {
-        if (!value.is(Token::Type::Dimension))
+
+    auto is_series_of_1_or_more_digits = [](StringView string) -> bool {
+        if (string.is_empty())
             return false;
-        if (!value.token().number().is_integer())
-            return false;
-        if (!value.token().dimension_unit().equals_ignoring_ascii_case("n"sv))
-            return false;
-        return true;
-    };
-    auto is_ndash_dimension = [](ComponentValue const& value) -> bool {
-        if (!value.is(Token::Type::Dimension))
-            return false;
-        if (!value.token().number().is_integer())
-            return false;
-        if (!value.token().dimension_unit().equals_ignoring_ascii_case("n-"sv))
-            return false;
-        return true;
-    };
-    auto is_ndashdigit_dimension = [](ComponentValue const& value) -> bool {
-        if (!value.is(Token::Type::Dimension))
-            return false;
-        if (!value.token().number().is_integer())
-            return false;
-        auto dimension_unit = value.token().dimension_unit();
-        if (!dimension_unit.starts_with_bytes("n-"sv, CaseSensitivity::CaseInsensitive))
-            return false;
-        for (size_t i = 2; i < dimension_unit.bytes_as_string_view().length(); ++i) {
-            if (!is_ascii_digit(dimension_unit.bytes_as_string_view()[i]))
+        for (char c : string) {
+            if (!is_ascii_digit(c))
                 return false;
         }
         return true;
-    };
-    auto is_ndashdigit_ident = [](ComponentValue const& value) -> bool {
-        if (!value.is(Token::Type::Ident))
-            return false;
-        auto ident = value.token().ident();
-        if (!ident.starts_with_bytes("n-"sv, CaseSensitivity::CaseInsensitive))
-            return false;
-        for (size_t i = 2; i < ident.bytes_as_string_view().length(); ++i) {
-            if (!is_ascii_digit(ident.bytes_as_string_view()[i]))
-                return false;
-        }
-        return true;
-    };
-    auto is_dashndashdigit_ident = [](ComponentValue const& value) -> bool {
-        if (!value.is(Token::Type::Ident))
-            return false;
-        auto ident = value.token().ident();
-        if (!ident.starts_with_bytes("-n-"sv, CaseSensitivity::CaseInsensitive))
-            return false;
-        if (ident.bytes_as_string_view().length() == 3)
-            return false;
-        for (size_t i = 3; i < ident.bytes_as_string_view().length(); ++i) {
-            if (!is_ascii_digit(ident.bytes_as_string_view()[i]))
-                return false;
-        }
-        return true;
-    };
-    auto is_integer = [](ComponentValue const& value) -> bool {
-        return value.is(Token::Type::Number) && value.token().number().is_integer();
-    };
-    auto is_signed_integer = [](ComponentValue const& value) -> bool {
-        return value.is(Token::Type::Number) && value.token().number().is_integer_with_explicit_sign();
-    };
-    auto is_signless_integer = [](ComponentValue const& value) -> bool {
-        return value.is(Token::Type::Number) && !value.token().number().is_integer_with_explicit_sign();
     };
 
-    // https://www.w3.org/TR/css-syntax-3/#the-anb-type
-    // Unfortunately these can't be in the same order as in the spec.
+    // <n-dimension> is a <dimension-token> with its type flag set to "integer", and a unit that is an ASCII
+    // case-insensitive match for "n"
+    auto is_n_dimension = [](ComponentValue const& value) -> bool {
+        return value.is(Token::Type::Dimension)
+            && value.token().is_integer()
+            && value.token().dimension_unit().equals_ignoring_ascii_case("n"sv);
+    };
+
+    // <ndash-dimension> is a <dimension-token> with its type flag set to "integer", and a unit that is an ASCII
+    // case-insensitive match for "n-"
+    auto is_ndash_dimension = [](ComponentValue const& value) -> bool {
+        return value.is(Token::Type::Dimension)
+            && value.token().is_integer()
+            && value.token().dimension_unit().equals_ignoring_ascii_case("n-"sv);
+    };
+
+    // <ndashdigit-dimension> is a <dimension-token> with its type flag set to "integer", and a unit that is an ASCII
+    // case-insensitive match for "n-*", where "*" is a series of one or more digits
+    auto is_ndashdigit_dimension = [&](ComponentValue const& value) -> bool {
+        return value.is(Token::Type::Dimension)
+            && value.token().is_integer()
+            && value.token().dimension_unit().starts_with_bytes("n-"sv, CaseSensitivity::CaseInsensitive)
+            && is_series_of_1_or_more_digits(value.token().dimension_unit().bytes_as_string_view().substring_view(2));
+    };
+
+    // <ndashdigit-ident> is an <ident-token> whose value is an ASCII case-insensitive match for "n-*", where "*" is a
+    // series of one or more digits
+    auto is_ndashdigit_ident = [&](ComponentValue const& value) -> bool {
+        return value.is(Token::Type::Ident)
+            && value.token().ident().starts_with_bytes("n-"sv, CaseSensitivity::CaseInsensitive)
+            && is_series_of_1_or_more_digits(value.token().ident().bytes_as_string_view().substring_view(2));
+    };
+
+    // <dashndashdigit-ident> is an <ident-token> whose value is an ASCII case-insensitive match for "-n-*", where "*"
+    // is a series of one or more digits
+    auto is_dashndashdigit_ident = [&](ComponentValue const& value) -> bool {
+        return value.is(Token::Type::Ident)
+            && value.token().ident().starts_with_bytes("-n-"sv, CaseSensitivity::CaseInsensitive)
+            && is_series_of_1_or_more_digits(value.token().ident().bytes_as_string_view().substring_view(3));
+    };
+
+    // <integer> is a <number-token> with its type flag set to "integer"
+    auto is_integer = [](ComponentValue const& value) -> bool {
+        return value.is(Token::Type::Number) && value.token().is_integer();
+    };
+
+    // <signed-integer> is a <number-token> with its type flag set to "integer", and a sign character
+    auto is_signed_integer = [](ComponentValue const& value) -> bool {
+        return value.is(Token::Type::Number) && value.token().is_integer_with_explicit_sign();
+    };
+
+    // <signless-integer> is a <number-token> with its type flag set to "integer", and no sign character
+    auto is_signless_integer = [](ComponentValue const& value) -> bool {
+        return value.is(Token::Type::Number)
+            && value.token().is_integer()
+            && !value.token().is_integer_with_explicit_sign();
+    };
 
     values.discard_whitespace();
-    auto const& first_value = values.consume_a_token();
 
     // odd | even
-    if (first_value.is(Token::Type::Ident)) {
-        auto ident = first_value.token().ident();
-        if (ident.equals_ignoring_ascii_case("odd"sv)) {
-            transaction.commit();
-            return Selector::SimpleSelector::ANPlusBPattern { 2, 1 };
-        }
-        if (ident.equals_ignoring_ascii_case("even"sv)) {
-            transaction.commit();
-            return Selector::SimpleSelector::ANPlusBPattern { 2, 0 };
-        }
+    if (values.next_token().is_ident("odd"sv)) {
+        values.discard_a_token(); // odd
+        transaction.commit();
+        return Selector::SimpleSelector::ANPlusBPattern { 2, 1 };
     }
+    if (values.next_token().is_ident("even"sv)) {
+        values.discard_a_token(); // even
+        transaction.commit();
+        return Selector::SimpleSelector::ANPlusBPattern { 2, 0 };
+    }
+
     // <integer>
-    if (is_integer(first_value)) {
-        int b = first_value.token().to_integer();
+    if (is_integer(values.next_token())) {
+        int b = values.consume_a_token().token().to_integer();
         transaction.commit();
         return Selector::SimpleSelector::ANPlusBPattern { 0, b };
     }
+
     // <n-dimension>
     // <n-dimension> <signed-integer>
     // <n-dimension> ['+' | '-'] <signless-integer>
-    if (is_n_dimension(first_value)) {
-        int a = first_value.token().dimension_value_int();
+    if (is_n_dimension(values.next_token())) {
+        int a = values.consume_a_token().token().dimension_value_int();
         values.discard_whitespace();
 
         // <n-dimension> <signed-integer>
@@ -1316,9 +1382,11 @@ Optional<Selector::SimpleSelector::ANPlusBPattern> Parser::parse_a_n_plus_b_patt
         transaction.commit();
         return Selector::SimpleSelector::ANPlusBPattern { a, 0 };
     }
+
     // <ndash-dimension> <signless-integer>
-    if (is_ndash_dimension(first_value)) {
+    if (is_ndash_dimension(values.next_token())) {
         values.discard_whitespace();
+        auto const& first_value = values.consume_a_token();
         auto const& second_value = values.consume_a_token();
         if (is_signless_integer(second_value)) {
             int a = first_value.token().dimension_value_int();
@@ -1329,9 +1397,10 @@ Optional<Selector::SimpleSelector::ANPlusBPattern> Parser::parse_a_n_plus_b_patt
 
         return {};
     }
+
     // <ndashdigit-dimension>
-    if (is_ndashdigit_dimension(first_value)) {
-        auto const& dimension = first_value.token();
+    if (is_ndashdigit_dimension(values.next_token())) {
+        auto const& dimension = values.consume_a_token().token();
         int a = dimension.dimension_value_int();
         auto maybe_b = dimension.dimension_unit().bytes_as_string_view().substring_view(1).to_number<int>();
         if (maybe_b.has_value()) {
@@ -1341,9 +1410,10 @@ Optional<Selector::SimpleSelector::ANPlusBPattern> Parser::parse_a_n_plus_b_patt
 
         return {};
     }
+
     // <dashndashdigit-ident>
-    if (is_dashndashdigit_ident(first_value)) {
-        auto maybe_b = first_value.token().ident().bytes_as_string_view().substring_view(2).to_number<int>();
+    if (is_dashndashdigit_ident(values.next_token())) {
+        auto maybe_b = values.consume_a_token().token().ident().bytes_as_string_view().substring_view(2).to_number<int>();
         if (maybe_b.has_value()) {
             transaction.commit();
             return Selector::SimpleSelector::ANPlusBPattern { -1, maybe_b.value() };
@@ -1351,10 +1421,12 @@ Optional<Selector::SimpleSelector::ANPlusBPattern> Parser::parse_a_n_plus_b_patt
 
         return {};
     }
+
     // -n
     // -n <signed-integer>
     // -n ['+' | '-'] <signless-integer>
-    if (first_value.is_ident("-n"sv)) {
+    if (values.next_token().is_ident("-n"sv)) {
+        values.discard_a_token(); // -n
         values.discard_whitespace();
 
         // -n <signed-integer>
@@ -1383,7 +1455,8 @@ Optional<Selector::SimpleSelector::ANPlusBPattern> Parser::parse_a_n_plus_b_patt
         return Selector::SimpleSelector::ANPlusBPattern { -1, 0 };
     }
     // -n- <signless-integer>
-    if (first_value.is_ident("-n-"sv)) {
+    if (values.next_token().is_ident("-n-"sv)) {
+        values.discard_a_token(); // -n-
         values.discard_whitespace();
         auto const& second_value = values.consume_a_token();
         if (is_signless_integer(second_value)) {
@@ -1402,9 +1475,9 @@ Optional<Selector::SimpleSelector::ANPlusBPattern> Parser::parse_a_n_plus_b_patt
     // '+'?† n- <signless-integer>
     // '+'?† <ndashdigit-ident>
     // In all of these cases, the + is optional, and has no effect.
-    // So, we just skip the +, and carry on.
-    if (!first_value.is_delim('+')) {
-        values.reconsume_current_input_token();
+    // So, we consume the + if it's there.
+    if (values.next_token().is_delim('+')) {
+        values.discard_a_token(); // +
         // We do *not* skip whitespace here.
     }
 

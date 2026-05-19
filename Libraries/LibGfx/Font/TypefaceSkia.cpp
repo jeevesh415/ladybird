@@ -6,6 +6,7 @@
  */
 
 #include <AK/LsanSuppressions.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/TypefaceSkia.h>
 
@@ -31,7 +32,14 @@ namespace Gfx {
 static sk_sp<SkFontMgr> s_font_manager;
 
 struct TypefaceSkia::Impl {
+    Impl(sk_sp<SkTypeface> skia_typeface, std::unique_ptr<SkStreamAsset> stream = {})
+        : skia_typeface(move(skia_typeface))
+        , stream(move(stream))
+    {
+    }
+
     sk_sp<SkTypeface> skia_typeface;
+    std::unique_ptr<SkStreamAsset> stream;
 };
 
 static SkFontMgr& font_manager()
@@ -103,27 +111,24 @@ ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::find_typeface_for_code_point(u32 cod
     auto ttc_index = static_cast<u32>(skia_ttc_index);
 
     if (stream && stream->getMemoryBase()) {
-        auto buffer = TRY(ByteBuffer::copy({ static_cast<u8 const*>(stream->getMemoryBase()),
-            stream->getLength() }));
-        auto font_data = FontData::create_from_byte_buffer(move(buffer));
-        auto bytes = font_data->bytes();
-
-        auto result = adopt_ref(*new TypefaceSkia {
-            make<TypefaceSkia::Impl>(skia_typeface),
+        // NB: Safe to reference without copying because we hold on to the stream.
+        ReadonlyBytes bytes { static_cast<u8 const*>(stream->getMemoryBase()), stream->getLength() };
+        return adopt_ref(*new TypefaceSkia {
+            make<TypefaceSkia::Impl>(skia_typeface, std::move(stream)),
             bytes,
             ttc_index });
-        result->m_font_data = move(font_data);
-        return result;
     }
 
     auto data = skia_typeface->serialize(SkTypeface::SerializeBehavior::kDoIncludeData);
     if (!data)
         return Error::from_string_literal("Failed to get font data from typeface");
 
-    auto buffer = TRY(ByteBuffer::copy({ data->data(), data->size() }));
-    auto font_data = FontData::create_from_byte_buffer(move(buffer));
-    auto result = TRY(load_from_buffer(font_data->bytes(), ttc_index));
-    result->m_font_data = move(font_data);
+    auto anonymous_buffer = TRY(Core::AnonymousBuffer::create_with_size(data->size()));
+    if (data->size() > 0)
+        memcpy(anonymous_buffer.data<void>(), data->data(), data->size());
+
+    auto result = TRY(load_from_buffer(anonymous_buffer.bytes(), ttc_index));
+    result->set_anonymous_font_data(move(anonymous_buffer));
     return result;
 }
 
@@ -170,7 +175,9 @@ RefPtr<TypefaceSkia const> TypefaceSkia::clone_with_variations(Vector<FontVariat
     if (!skia_typeface)
         return {};
 
-    return adopt_ref(*new TypefaceSkia { make<TypefaceSkia::Impl>(skia_typeface), m_buffer, m_ttc_index });
+    auto typeface = adopt_ref(*new TypefaceSkia { make<TypefaceSkia::Impl>(skia_typeface), m_buffer, m_ttc_index });
+    typeface->copy_font_data_from(*this);
+    return typeface;
 }
 
 SkTypeface const* TypefaceSkia::sk_typeface() const

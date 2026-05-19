@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Debug.h>
 #include <AK/Error.h>
+#include <AK/ScopeGuard.h>
 #include <AK/String.h>
-#include <AK/TemporaryChange.h>
 #include <AK/Time.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/Timer.h>
@@ -17,7 +18,9 @@
 #include <LibWeb/Infra/Strings.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BookmarkStore.h>
+#include <LibWebView/ErrorHTML.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
@@ -98,8 +101,12 @@ void ViewImplementation::set_url(URL::URL url)
     if (m_url == url)
         return;
 
+    auto previous_host = current_host();
     m_url = move(url);
     update_bookmark_action();
+
+    if (current_host() != previous_host)
+        apply_zoom_for_current_host();
 }
 
 void ViewImplementation::set_favicon(Badge<WebContentClient>, Gfx::Bitmap const& favicon)
@@ -111,8 +118,10 @@ void ViewImplementation::set_favicon(Badge<WebContentClient>, Gfx::Bitmap const&
             m_favicon_base64_png = favicon_base64_png.release_value();
     }
 
-    if (m_favicon_base64_png.has_value())
+    if (m_favicon_base64_png.has_value()) {
         Application::bookmark_store().update_favicon(m_url, *m_favicon_base64_png);
+        Application::history_store().update_favicon(m_url, *m_favicon_base64_png);
+    }
 
     if (on_favicon_change)
         on_favicon_change(favicon);
@@ -139,16 +148,22 @@ void ViewImplementation::create_new_process_for_cross_site_navigation(URL::URL c
 
 void ViewImplementation::server_did_paint(Badge<WebContentClient>, i32 bitmap_id, Gfx::IntSize size)
 {
+    bool did_swap_bitmap = false;
     if (m_client_state.back_bitmap.id == bitmap_id) {
         m_client_state.has_usable_bitmap = true;
         m_client_state.back_bitmap.last_painted_size = size.to_type<Web::DevicePixels>();
         swap(m_client_state.back_bitmap, m_client_state.front_bitmap);
         m_backup_shared_image_buffer = nullptr;
-        if (on_ready_to_paint)
-            on_ready_to_paint();
+        did_swap_bitmap = true;
     }
 
-    client().async_ready_to_paint(page_id());
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received presented bitmap {} for page {} size={}x{} did_swap={} front={} back={}",
+        bitmap_id, page_id(), size.width(), size.height(), did_swap_bitmap, m_client_state.front_bitmap.id, m_client_state.back_bitmap.id);
+
+    client().notify_presented_bitmap_ready_to_paint(page_id(), bitmap_id);
+
+    if (did_swap_bitmap && on_ready_to_paint)
+        on_ready_to_paint();
 }
 
 void ViewImplementation::set_window_position(Gfx::IntPoint position)
@@ -183,6 +198,17 @@ void ViewImplementation::load_html(StringView html)
     client().async_load_html(page_id(), html);
 }
 
+void ViewImplementation::load_navigation_error_page(StringView text)
+{
+    auto message = MUST(String::formatted("Failed to load \"{}\"", text));
+
+    StringBuilder builder;
+    builder.appendff(ERROR_HTML_HEADER, ERROR_SVG, message);
+    builder.append("<p>If you were trying to enter a search query, please enable search in <a href=\"about:settings#search\">settings</a>.</p>"sv);
+    builder.append(ERROR_HTML_FOOTER);
+    load_html(builder.string_view());
+}
+
 void ViewImplementation::reload()
 {
     client().async_reload(page_id());
@@ -199,6 +225,7 @@ void ViewImplementation::zoom_in()
         return;
     m_zoom_level = round_to<int>((m_zoom_level + ZOOM_STEP) * 100) / 100.0;
     update_zoom();
+    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::zoom_out()
@@ -207,6 +234,7 @@ void ViewImplementation::zoom_out()
         return;
     m_zoom_level = round_to<int>((m_zoom_level - ZOOM_STEP) * 100) / 100.0;
     update_zoom();
+    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::set_zoom(double zoom_level)
@@ -220,10 +248,40 @@ void ViewImplementation::reset_zoom()
     m_zoom_level = 1.0;
     update_zoom();
     client().async_reset_zoom(m_client_state.page_index);
+    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 {
+    if (auto* mouse_event = event.get_pointer<Web::MouseEvent>();
+        Application::web_content_options().enable_async_scrolling == EnableAsyncScrolling::Yes
+        && m_client_state.has_usable_bitmap
+        && mouse_event) {
+        if (mouse_event->type == Web::MouseEvent::Type::MouseWheel) {
+            auto wheel_delta_x = mouse_event->wheel_delta_x;
+            auto wheel_delta_y = mouse_event->wheel_delta_y;
+            if (mouse_event->modifiers & Web::UIEvents::KeyModifier::Mod_Shift)
+                swap(wheel_delta_x, wheel_delta_y);
+
+            auto device_pixels_per_css_pixel = static_cast<float>(device_pixel_ratio() * zoom_level());
+            auto position = Gfx::FloatPoint {
+                static_cast<float>(mouse_event->position.x().value()),
+                static_cast<float>(mouse_event->position.y().value()),
+            };
+            auto delta_in_device_pixels = Gfx::FloatPoint { wheel_delta_x, wheel_delta_y }.scaled(device_pixels_per_css_pixel);
+            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI attempting compositor wheel bypass for page {} at {},{} device delta {},{}",
+                m_client_state.page_index, position.x(), position.y(), delta_in_device_pixels.x(), delta_in_device_pixels.y());
+            if (client().send_async_scroll_to_compositor(m_client_state.page_index, position, delta_in_device_pixels))
+                mouse_event->async_scroll_performed_default_action = true;
+            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor wheel bypass result for page {}: {}",
+                m_client_state.page_index, mouse_event->async_scroll_performed_default_action ? "accepted"sv : "rejected"sv);
+        } else if (client().send_mouse_event_to_compositor(m_client_state.page_index, *mouse_event)) {
+            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor handled mouse event for page {} at {},{}",
+                m_client_state.page_index, mouse_event->position.x().value(), mouse_event->position.y().value());
+            return;
+        }
+    }
+
     // Send the next event over to the WebContent to be handled by JS. We'll later get a message to say whether JS
     // prevented the default event behavior, at which point we either discard or handle that event, and then try to
     // process the next one.
@@ -324,6 +382,11 @@ Optional<Core::SharedVersion> ViewImplementation::document_cookie_version(URL::U
 ByteString ViewImplementation::selected_text()
 {
     return client().get_selected_text(page_id());
+}
+
+ByteString ViewImplementation::cut_selected_text()
+{
+    return client().cut_selected_text(page_id());
 }
 
 Optional<String> ViewImplementation::selected_text_with_whitespace_collapsed()
@@ -589,6 +652,8 @@ void ViewImplementation::did_update_navigation_buttons_state(Badge<WebContentCli
 
 void ViewImplementation::did_allocate_backing_stores(Badge<WebContentClient>, i32 front_bitmap_id, Gfx::SharedImage front_backing_store, i32 back_bitmap_id, Gfx::SharedImage back_backing_store)
 {
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI installing backing stores for page {} front={} back={} had_usable_bitmap={}",
+        page_id(), front_bitmap_id, back_bitmap_id, m_client_state.has_usable_bitmap);
     if (m_client_state.has_usable_bitmap) {
         // NOTE: We keep the outgoing front bitmap as a backup so we have something to paint until we get a new one.
         m_backup_shared_image_buffer = move(m_client_state.front_bitmap.shared_image_buffer);
@@ -611,6 +676,23 @@ void ViewImplementation::update_zoom()
     }
 
     client().async_set_zoom_level(m_client_state.page_index, m_zoom_level);
+}
+
+String ViewImplementation::current_host() const
+{
+    if (!m_url.host().has_value())
+        return {};
+    return m_url.serialized_host();
+}
+
+void ViewImplementation::apply_zoom_for_current_host()
+{
+    auto& settings = Application::settings();
+    auto zoom_level = settings.zoom_for_host(current_host()).value_or(settings.default_zoom_level_factor());
+    if (zoom_level == m_zoom_level)
+        return;
+    m_zoom_level = zoom_level;
+    update_zoom();
 }
 
 void ViewImplementation::handle_resize()
@@ -689,32 +771,26 @@ void ViewImplementation::handle_web_content_process_crash(LoadErrorPage load_err
     handle_resize();
 
     if (load_error_page == LoadErrorPage::Yes) {
+        auto escaped_url = escape_html_entities(m_url.serialize());
+
         StringBuilder builder;
-        builder.append("<!DOCTYPE html>"sv);
-        builder.append("<html lang=\"en\"><head><meta charset=\"UTF-8\"><title>Error!</title><style>"
-                       ":root { color-scheme: light dark; font-family: system-ui, sans-serif; }"
-                       "body { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; box-sizing: border-box; margin: 0; padding: 1rem; text-align: center; }"
-                       "header { display: flex; flex-direction: column; align-items: center; gap: 2rem; margin-bottom: 1rem; }"
-                       "svg { height: 64px; width: auto; stroke: currentColor; fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }"
-                       "h1 { margin: 0; font-size: 1.5rem; }"
-                       "p { font-size: 1rem; color: #555; }"
-                       "</style></head><body>"sv);
-        builder.append("<header>"sv);
-        builder.append("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 17.5 21.5\">"sv);
-        builder.append("<path class=\"b\" d=\"M11.75.75h-9c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-13l-5-5z\"/>"sv);
-        builder.append("<path class=\"b\" d=\"M10.75.75v4c0 1.1.9 2 2 2h4M4.75 9.75l2 2M10.75 9.75l2 2M12.75 9.75l-2 2M6.75 9.75l-2 2M5.75 16.75c1-2.67 5-2.67 6 0\"/></svg>"sv);
-        auto escaped_url = escape_html_entities(m_url.to_byte_string());
-        builder.append("<h1>Ladybird flew off-course!</h1>"sv);
+        builder.appendff(ERROR_HTML_HEADER, CRASH_ERROR_SVG, "Ladybird flew off-course!"sv);
         builder.appendff("<p>The web page <a href=\"{}\">{}</a> has crashed.<br><br>You can reload the page to try again.</p>", escaped_url, escaped_url);
-        builder.append("</body></html>"sv);
-        load_html(builder.to_byte_string());
+        builder.append(ERROR_HTML_FOOTER);
+        load_html(builder.string_view());
     }
 }
 
 void ViewImplementation::default_zoom_level_factor_changed()
 {
-    auto const default_zoom_level_factor = Application::settings().default_zoom_level_factor();
-    set_zoom(default_zoom_level_factor);
+    apply_zoom_for_current_host();
+}
+
+void ViewImplementation::zoom_per_host_changed(StringView host)
+{
+    if (current_host() != host)
+        return;
+    apply_zoom_for_current_host();
 }
 
 void ViewImplementation::languages_changed()
@@ -968,6 +1044,9 @@ void ViewImplementation::initialize_context_menus()
     m_open_in_new_tab_action = Action::create("Open in New Tab"sv, ActionID::OpenInNewTab, [this]() {
         Application::the().open_url_in_new_tab(m_context_menu_url, Web::HTML::ActivateTab::No);
     });
+    m_open_in_new_window_action = Action::create("Open in New Window"sv, ActionID::OpenInNewWindow, [this]() {
+        Application::the().open_url_in_new_window(m_context_menu_url);
+    });
     m_copy_url_action = Action::create("Copy URL"sv, ActionID::CopyURL, [this]() {
         Application::the().insert_clipboard_entry({ url_text_to_copy(m_context_menu_url), "text/plain"_string });
     });
@@ -1036,6 +1115,7 @@ void ViewImplementation::initialize_context_menus()
     m_page_context_menu->add_action(*m_navigate_forward_action);
     m_page_context_menu->add_action(application.reload_action());
     m_page_context_menu->add_separator();
+    m_page_context_menu->add_action(application.cut_selection_action());
     m_page_context_menu->add_action(application.copy_selection_action());
     m_page_context_menu->add_action(application.paste_action());
     m_page_context_menu->add_action(application.select_all_action());
@@ -1049,6 +1129,7 @@ void ViewImplementation::initialize_context_menus()
 
     m_link_context_menu = Menu::create("Link Context Menu"sv);
     m_link_context_menu->add_action(*m_open_in_new_tab_action);
+    m_link_context_menu->add_action(*m_open_in_new_window_action);
     m_link_context_menu->add_action(*m_copy_url_action);
 
     m_image_context_menu = Menu::create("Image Context Menu"sv);
@@ -1078,12 +1159,18 @@ void ViewImplementation::initialize_context_menus()
     m_media_context_menu->add_action(*m_copy_url_action);
 }
 
-void ViewImplementation::did_request_page_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position)
+void ViewImplementation::did_request_page_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
 {
-    auto const& search_engine = Application::settings().search_engine();
+    auto& cut_selection_action = Application::the().cut_selection_action();
+    cut_selection_action.set_visible(for_input_events_target == Web::ContextMenuForInputEventsTarget::Yes);
 
-    auto selected_text = search_engine.has_value() ? selected_text_with_whitespace_collapsed() : OptionalNone {};
-    TemporaryChange change_url { m_search_text, move(selected_text) };
+    auto const& search_engine = Application::settings().search_engine();
+    m_search_text = search_engine.has_value() ? selected_text_with_whitespace_collapsed() : OptionalNone {};
+
+    ScopeGuard guard { [&]() {
+        cut_selection_action.set_visible(true);
+        m_search_text.clear();
+    } };
 
     if (m_search_text.has_value()) {
         m_search_selected_text_action->set_text(search_engine->format_search_query_for_display(*m_search_text));

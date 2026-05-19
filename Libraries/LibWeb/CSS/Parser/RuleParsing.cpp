@@ -515,7 +515,9 @@ GC::Ptr<CSSKeyframesRule> Parser::convert_to_keyframes_rule(AtRule const& rule)
         return {};
     }
 
-    auto name = name_token.to_string();
+    // Store the logical keyframes name instead of the serialized token text so @keyframes "foo" and
+    // animation-name: "foo" compare on the same value.
+    auto name = name_token.is(Token::Type::String) ? name_token.string() : name_token.ident();
 
     GC::RootVector<GC::Ref<CSSRule>> keyframes(realm().heap());
     rule.for_each_as_qualified_rule_list([&](auto& qualified_rule) {
@@ -536,45 +538,44 @@ GC::Ptr<CSSKeyframesRule> Parser::convert_to_keyframes_rule(AtRule const& rule)
             }
         }
 
-        auto selectors = Vector<CSS::Percentage> {};
+        auto selectors = Vector<Percentage> {};
         TokenStream child_tokens { qualified_rule.prelude };
         while (child_tokens.has_next_token()) {
             child_tokens.discard_whitespace();
             if (!child_tokens.has_next_token())
                 break;
-            auto tok = child_tokens.consume_a_token();
-            if (!tok.is_token()) {
+            auto& next_token = child_tokens.next_token();
+            if (!next_token.is_token()) {
                 ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
                     .rule_name = "keyframe"_fly_string,
                     .prelude = child_tokens.dump_string(),
                     .description = "Invalid selector."_string,
                 });
-                child_tokens.reconsume_current_input_token();
                 break;
             }
-            auto token = tok.token();
             auto read_a_selector = false;
-            if (token.is(Token::Type::Ident)) {
-                if (token.ident().equals_ignoring_ascii_case("from"sv)) {
-                    selectors.append(CSS::Percentage(0));
-                    read_a_selector = true;
-                }
-                if (token.ident().equals_ignoring_ascii_case("to"sv)) {
-                    selectors.append(CSS::Percentage(100));
-                    read_a_selector = true;
-                }
-            } else if (token.is(Token::Type::Percentage)) {
-                selectors.append(CSS::Percentage(token.percentage()));
+            if (next_token.is_ident("from"sv)) {
+                child_tokens.discard_a_token(); // from
+                selectors.append(Percentage(0));
+                read_a_selector = true;
+            } else if (next_token.is_ident("to"sv)) {
+                child_tokens.discard_a_token(); // to
+                selectors.append(Percentage(100));
+                read_a_selector = true;
+            } else if (next_token.is(Token::Type::Percentage)) {
+                child_tokens.discard_a_token(); // <percentage>
+                selectors.append(Percentage(next_token.token().percentage()));
                 read_a_selector = true;
             }
 
             if (read_a_selector) {
                 child_tokens.discard_whitespace();
-                if (child_tokens.consume_a_token().is(Token::Type::Comma))
+                if (child_tokens.next_token().is(Token::Type::Comma)) {
+                    child_tokens.discard_a_token(); // ,
                     continue;
+                }
             }
 
-            child_tokens.reconsume_current_input_token();
             break;
         }
 
@@ -843,7 +844,7 @@ template<typename NestedDeclarationsRule>
 GC::Ptr<CSSContainerRule> Parser::convert_to_container_rule(AtRule const& rule, Nested nested)
 {
     // @container <container-condition># {
-    //   <block-contents>
+    //   <rule-list>
     // }
     // <container-condition> = [ <container-name>? <container-query>? ]!
     // <container-name> = <custom-ident>
@@ -1177,7 +1178,7 @@ GC::Ptr<CSSFontFeatureValuesRule> Parser::convert_to_font_feature_values_rule(At
                     auto token = value_stream.consume_a_token();
 
                     // FIXME: Support calc()
-                    if (!token.is(Token::Type::Number) || !token.token().number().is_integer() || token.token().number().value() < 0) {
+                    if (!token.is(Token::Type::Number) || !token.token().is_integer() || token.token().to_integer() < 0) {
                         ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
                             .rule_name = MUST(String::formatted("@{}", at_rule.name)),
                             .prelude = value_stream.dump_string(),
@@ -1187,7 +1188,7 @@ GC::Ptr<CSSFontFeatureValuesRule> Parser::convert_to_font_feature_values_rule(At
                         return;
                     }
 
-                    values.append(token.token().number().integer_value());
+                    values.append(token.token().to_integer());
 
                     value_stream.discard_whitespace();
                 }
@@ -1307,7 +1308,7 @@ Optional<Parser::FunctionPrelude> Parser::parse_function_prelude(TokenStream<Com
 
         // [ : <default-value> ]?
         Optional<Vector<ComponentValue>> default_value;
-        if (parameter_tokens.peek_token().is(Token::Type::Colon)) {
+        if (parameter_tokens.next_token().is(Token::Type::Colon)) {
             parameter_tokens.discard_a_token(); // :
             parameter_tokens.discard_whitespace();
 
@@ -1349,7 +1350,7 @@ Optional<Parser::FunctionPrelude> Parser::parse_function_prelude(TokenStream<Com
     tokens.discard_whitespace();
 
     NonnullOwnPtr<SyntaxNode> return_type = UniversalSyntaxNode::create();
-    if (tokens.peek_token().is_ident("returns"sv)) {
+    if (tokens.next_token().is_ident("returns"sv)) {
         tokens.discard_a_token();
         tokens.discard_whitespace();
 

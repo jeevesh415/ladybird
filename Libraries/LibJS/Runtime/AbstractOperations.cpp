@@ -820,11 +820,16 @@ ThrowCompletionOr<void> eval_declaration_instantiation(VM& vm, EvalDeclarationDa
                 for (auto const& name : data.var_names) {
                     // a. If ! thisEnv.HasBinding(name) is true, then
                     if (MUST(this_environment->has_binding(name))) {
-                        // i. Throw a SyntaxError exception.
-                        return vm.throw_completion<SyntaxError>(ErrorType::TopLevelVariableAlreadyDeclared, name);
-
-                        // FIXME: ii. NOTE: Annex B.3.4 defines alternate semantics for the above step.
-                        // In particular it only throw the syntax error if it is not an environment from a catchclause.
+                        // B.3.4 Changes to EvalDeclarationInstantiation, https://tc39.es/ecma262/#sec-evaldeclarationinstantiation
+                        // i. Normative Optional
+                        //     If the host is a web browser or otherwise supports VariableStatements in Catch Blocks, then
+                        //         i. If thisEnv is not the Environment Record for a Catch clause, throw a SyntaxError exception.
+                        // ii. Else,
+                        //     i. Throw a SyntaxError exception.
+                        // AD-HOC: We are a web browser, so we only implement the web browser branch.
+                        if (!this_environment->is_catch_environment()) {
+                            return vm.throw_completion<SyntaxError>(ErrorType::EvalVarHoistingConflict, name);
+                        }
                     }
                     // b. NOTE: A direct eval will not hoist var declaration over a like-named lexical declaration.
                 }
@@ -997,9 +1002,7 @@ ThrowCompletionOr<void> eval_declaration_instantiation(VM& vm, EvalDeclarationDa
     }
 
     // 17. For each Parse Node f of functionsToInitialize, do
-    // NB: We iterate in reverse order since we appended the functions
-    //     instead of prepending during pre-computation.
-    for (auto const& function_to_initialize : data.functions_to_initialize.in_reverse()) {
+    for (auto const& function_to_initialize : data.functions_to_initialize) {
         // a. Let fn be the sole element of the BoundNames of f.
         // b. Let fo be InstantiateFunctionObject of f with arguments lexEnv and privateEnv.
         auto function = ECMAScriptFunctionObject::create_from_function_data(

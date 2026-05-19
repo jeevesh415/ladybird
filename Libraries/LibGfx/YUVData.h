@@ -9,6 +9,8 @@
 #include <AK/Error.h>
 #include <AK/FixedArray.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/NonnullRefPtr.h>
+#include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
 #include <LibMedia/Color/CodingIndependentCodePoints.h>
 #include <LibMedia/Subsampling.h>
@@ -25,7 +27,7 @@ struct YUVDataImpl;
 
 // Holds planar YUV data with metadata needed for GPU conversion.
 // Uses FixedArray for deterministic buffer sizing.
-// Not ref-counted - owned directly by ImmutableBitmap via NonnullOwnPtr.
+// Not ref-counted - owned directly by decoded video frame objects via NonnullOwnPtr.
 class YUVData final {
 public:
     static ErrorOr<NonnullOwnPtr<YUVData>> create(IntSize size, u8 bit_depth, Media::Subsampling, Media::CodingIndependentCodePoints);
@@ -42,7 +44,9 @@ public:
     Bytes u_data();
     Bytes v_data();
 
-    SkYUVAPixmaps const& skia_yuva_pixmaps() const;
+    ErrorOr<NonnullRefPtr<Bitmap>> to_bitmap() const;
+
+    SkYUVAPixmaps make_pixmaps() const;
 
 private:
     explicit YUVData(NonnullOwnPtr<Details::YUVDataImpl>);

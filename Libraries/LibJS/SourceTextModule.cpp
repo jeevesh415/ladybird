@@ -7,9 +7,11 @@
 
 #include <AK/Debug.h>
 #include <AK/QuickSort.h>
+#include <LibGC/RootHashTable.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Runtime/AsyncFunctionDriverWrapper.h>
 #include <LibJS/Runtime/ECMAScriptFunctionObject.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/ModuleEnvironment.h>
 #include <LibJS/Runtime/PromiseCapability.h>
@@ -23,6 +25,39 @@
 namespace JS {
 
 GC_DEFINE_ALLOCATOR(SourceTextModule);
+
+static size_t import_attributes_external_memory_size(Vector<ImportAttribute> const& attributes)
+{
+    size_t size = vector_external_memory_size(attributes);
+    for (auto const& attribute : attributes) {
+        size = saturating_add_external_memory_size(size, utf16_string_external_memory_size(attribute.key));
+        size = saturating_add_external_memory_size(size, utf16_string_external_memory_size(attribute.value));
+    }
+    return size;
+}
+
+static size_t module_request_external_memory_size(Optional<ModuleRequest> const& request)
+{
+    if (!request.has_value())
+        return 0;
+    return import_attributes_external_memory_size(request->attributes);
+}
+
+static size_t import_entries_external_memory_size(Vector<ImportEntry> const& entries)
+{
+    size_t size = vector_external_memory_size(entries);
+    for (auto const& entry : entries)
+        size = saturating_add_external_memory_size(size, module_request_external_memory_size(entry.m_module_request));
+    return size;
+}
+
+static size_t export_entries_external_memory_size(Vector<ExportEntry> const& entries)
+{
+    size_t size = vector_external_memory_size(entries);
+    for (auto const& entry : entries)
+        size = saturating_add_external_memory_size(size, module_request_external_memory_size(entry.m_module_request));
+    return size;
+}
 
 SourceTextModule::SourceTextModule(Realm& realm, StringView filename, Script::HostDefined* host_defined, bool has_top_level_await,
     Vector<ModuleRequest> requested_modules, Vector<ImportEntry> import_entries,
@@ -60,10 +95,69 @@ void SourceTextModule::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_tla_shared_data);
 }
 
+size_t SourceTextModule::external_memory_size() const
+{
+    size_t size = Base::external_memory_size();
+    size = saturating_add_external_memory_size(size, import_entries_external_memory_size(m_import_entries));
+    size = saturating_add_external_memory_size(size, export_entries_external_memory_size(m_local_export_entries));
+    size = saturating_add_external_memory_size(size, export_entries_external_memory_size(m_indirect_export_entries));
+    size = saturating_add_external_memory_size(size, export_entries_external_memory_size(m_star_export_entries));
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_var_declared_names));
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_lexical_bindings));
+    size = saturating_add_external_memory_size(size, vector_external_memory_size(m_functions_to_initialize));
+    return size;
+}
+
 Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse_from_pre_parsed(FFI::ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm& realm, Script::HostDefined* host_defined)
 {
     auto filename = source_code->filename();
     auto rust_result = RustIntegration::compile_parsed_module(parsed, move(source_code), realm);
+    // Always from the Rust pipeline, so the Optional must have a value.
+    VERIFY(rust_result.has_value());
+    if (rust_result->is_error())
+        return rust_result->release_error();
+    auto& module_result = rust_result->value();
+    GC::ConservativeVector<FunctionToInitialize> functions_to_initialize(realm.heap());
+    functions_to_initialize.ensure_capacity(module_result.functions_to_initialize.size());
+    for (auto& f : module_result.functions_to_initialize)
+        functions_to_initialize.append({ *f.shared_data, move(f.name) });
+    return realm.heap().allocate<SourceTextModule>(
+        realm, filename, host_defined, module_result.has_top_level_await,
+        move(module_result.requested_modules), move(module_result.import_entries),
+        move(module_result.local_export_entries), move(module_result.indirect_export_entries),
+        move(module_result.star_export_entries), move(module_result.default_export_binding_name),
+        move(module_result.var_declared_names), move(module_result.lexical_bindings),
+        move(functions_to_initialize),
+        module_result.executable.ptr(), module_result.tla_shared_data.ptr());
+}
+
+Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse_from_pre_compiled(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm, Script::HostDefined* host_defined)
+{
+    auto filename = source_code->filename();
+    auto rust_result = RustIntegration::materialize_compiled_module(compiled, move(source_code), realm);
+    // Always from the Rust pipeline, so the Optional must have a value.
+    VERIFY(rust_result.has_value());
+    if (rust_result->is_error())
+        return rust_result->release_error();
+    auto& module_result = rust_result->value();
+    Vector<FunctionToInitialize> functions_to_initialize;
+    functions_to_initialize.ensure_capacity(module_result.functions_to_initialize.size());
+    for (auto& f : module_result.functions_to_initialize)
+        functions_to_initialize.append({ *f.shared_data, move(f.name) });
+    return realm.heap().allocate<SourceTextModule>(
+        realm, filename, host_defined, module_result.has_top_level_await,
+        move(module_result.requested_modules), move(module_result.import_entries),
+        move(module_result.local_export_entries), move(module_result.indirect_export_entries),
+        move(module_result.star_export_entries), move(module_result.default_export_binding_name),
+        move(module_result.var_declared_names), move(module_result.lexical_bindings),
+        move(functions_to_initialize),
+        module_result.executable.ptr(), module_result.tla_shared_data.ptr());
+}
+
+Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse_from_bytecode_cache(FFI::DecodedBytecodeCacheBlob* bytecode_cache, NonnullRefPtr<SourceCode const> source_code, Realm& realm, Script::HostDefined* host_defined)
+{
+    auto filename = source_code->filename();
+    auto rust_result = RustIntegration::materialize_bytecode_cache_module(bytecode_cache, move(source_code), realm);
     // Always from the Rust pipeline, so the Optional must have a value.
     VERIFY(rust_result.has_value());
     if (rust_result->is_error())
@@ -93,7 +187,7 @@ Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse(S
         return rust_result->release_error();
 
     auto& module_result = rust_result->value();
-    Vector<FunctionToInitialize> functions_to_initialize;
+    GC::ConservativeVector<FunctionToInitialize> functions_to_initialize(realm.heap());
     functions_to_initialize.ensure_capacity(module_result.functions_to_initialize.size());
     for (auto& f : module_result.functions_to_initialize)
         functions_to_initialize.append({ *f.shared_data, move(f.name) });
@@ -108,7 +202,7 @@ Result<GC::Ref<SourceTextModule>, Vector<ParserError>> SourceTextModule::parse(S
 }
 
 // 16.2.1.7.2.1 GetExportedNames ( [ exportStarSet ] ), https://tc39.es/ecma262/#sec-getexportednames
-Vector<Utf16FlyString> SourceTextModule::get_exported_names(VM& vm, HashTable<Module const*>& export_star_set)
+Vector<Utf16FlyString> SourceTextModule::get_exported_names(VM& vm, GC::RootHashTable<GC::Ref<Module const>>& export_star_set)
 {
     dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] get_export_names of {}", filename());
 
@@ -119,7 +213,7 @@ Vector<Utf16FlyString> SourceTextModule::get_exported_names(VM& vm, HashTable<Mo
     // NOTE: This is done by Module.
 
     // 3. If exportStarSet contains module, then
-    if (export_star_set.contains(this)) {
+    if (export_star_set.contains(GC::Ref<Module const>(*this))) {
         // a. Assert: We've reached the starting point of an export * circularity.
         // FIXME: How do we check that?
 
@@ -128,7 +222,7 @@ Vector<Utf16FlyString> SourceTextModule::get_exported_names(VM& vm, HashTable<Mo
     }
 
     // 4. Append module to exportStarSet.
-    export_star_set.set(this);
+    export_star_set.set(GC::Ref<Module const>(*this));
 
     // 5. Let exportedNames be a new empty List.
     Vector<Utf16FlyString> exported_names;
@@ -562,7 +656,8 @@ ThrowCompletionOr<void> SourceTextModule::execute_module(VM& vm, GC::Ptr<Promise
         auto& env = as<DeclarativeEnvironment>(*module_context->lexical_environment);
 
         // e. Set result to Completion(DisposeResources(env.[[DisposeCapability]], result)).
-        result = dispose_resources(vm, env.dispose_capability(), result);
+        if (auto* dispose_capability = env.dispose_capability_if_exists())
+            result = dispose_resources(vm, *dispose_capability, result);
 
         // f. Suspend moduleContext and remove it from the execution context stack.
         vm.pop_execution_context();

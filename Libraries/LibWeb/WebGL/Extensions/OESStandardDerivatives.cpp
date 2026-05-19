@@ -6,12 +6,12 @@
 
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/OESStandardDerivativesPrototype.h>
+#include <LibWeb/Bindings/OESStandardDerivatives.h>
 #include <LibWeb/WebGL/Extensions/OESStandardDerivatives.h>
 #include <LibWeb/WebGL/OpenGLContext.h>
 #include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
 GC_DEFINE_ALLOCATOR(OESStandardDerivatives);
 

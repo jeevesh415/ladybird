@@ -66,6 +66,7 @@ private:
     virtual void connect_to_web_ui(u64 page_id, IPC::TransportHandle handle) override;
     virtual void connect_to_request_server(IPC::TransportHandle handle) override;
     virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
+    virtual void connect_to_compositor(IPC::TransportHandle handle) override;
     virtual void update_system_theme(u64 page_id, Core::AnonymousBuffer) override;
     virtual void update_screen_rects(u64 page_id, Vector<Web::DevicePixelRect>, u32) override;
     virtual void load_url(u64 page_id, URL::URL) override;
@@ -77,7 +78,6 @@ private:
     virtual void mouse_event(u64 page_id, Web::MouseEvent) override;
     virtual void drag_event(u64 page_id, Web::DragEvent) override;
     virtual void pinch_event(u64 page_id, Web::PinchEvent) override;
-    virtual void ready_to_paint(u64 page_id) override;
     virtual void debug_request(u64 page_id, ByteString, ByteString) override;
     virtual void get_source(u64 page_id) override;
     virtual void inspect_dom_tree(u64 page_id) override;
@@ -155,6 +155,7 @@ private:
     virtual void request_internal_page_info(u64 page_id, WebView::PageInfoType) override;
 
     virtual Messages::WebContentServer::GetSelectedTextResponse get_selected_text(u64 page_id) override;
+    virtual Messages::WebContentServer::CutSelectedTextResponse cut_selected_text(u64 page_id) override;
     virtual void select_all(u64 page_id) override;
 
     virtual void find_in_page(u64 page_id, String query, CaseSensitivity) override;

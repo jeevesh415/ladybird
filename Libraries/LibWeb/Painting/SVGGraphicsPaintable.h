@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <LibGfx/ImmutableBitmap.h>
 #include <LibWeb/Layout/SVGGraphicsBox.h>
 #include <LibWeb/Painting/SVGMaskable.h>
 #include <LibWeb/Painting/SVGPaintable.h>
@@ -15,9 +14,6 @@ namespace Web::Painting {
 
 class SVGGraphicsPaintable : public SVGPaintable
     , public SVGMaskable {
-    GC_CELL(SVGGraphicsPaintable, SVGPaintable);
-    GC_DECLARE_ALLOCATOR(SVGGraphicsPaintable);
-
 public:
     class ComputedTransforms {
     public:
@@ -49,7 +45,8 @@ public:
         Gfx::AffineTransform m_svg_transform {};
     };
 
-    static GC::Ref<SVGGraphicsPaintable> create(Layout::SVGGraphicsBox const&);
+    static NonnullRefPtr<SVGGraphicsPaintable> create(Layout::SVGGraphicsBox const&);
+    virtual StringView class_name() const override { return "SVGGraphicsPaintable"sv; }
 
     virtual GC::Ptr<DOM::Node const> dom_node_of_svg() const override { return dom_node(); }
     virtual Optional<CSSPixelRect> get_mask_area() const override { return get_svg_mask_area(); }

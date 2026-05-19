@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGStyleElementPrototype.h>
+#include <LibWeb/Bindings/SVGStyleElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
 
 namespace Web::SVG {
@@ -38,14 +38,14 @@ void SVGStyleElement::children_changed(ChildrenChangedMetadata const& metadata)
 
 void SVGStyleElement::inserted()
 {
-    update_a_style_block();
     Base::inserted();
+    update_a_style_block();
 }
 
-void SVGStyleElement::removed_from(Node* old_parent, Node& old_root)
+void SVGStyleElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, Node& old_root)
 {
+    Base::removed_from(is_subtree_root, old_ancestor, old_root);
     update_a_style_block();
-    Base::removed_from(old_parent, old_root);
 }
 
 }

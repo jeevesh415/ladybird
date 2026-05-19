@@ -9,6 +9,7 @@
 #pragma once
 
 #include <AK/ByteBuffer.h>
+#include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/Time.h>
 #include <AK/Variant.h>
@@ -21,7 +22,7 @@
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/MediaControls.h>
-#include <LibWeb/Painting/ExternalContentSource.h>
+#include <LibWeb/Painting/DisplayListResourceIds.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/WebIDL/DOMException.h>
 
@@ -114,6 +115,7 @@ public:
     void set_current_playback_position(double);
 
     double duration() const;
+    JS::Object* get_start_date();
     bool show_poster() const { return m_show_poster; }
     bool paused() const { return m_paused; }
     bool ended() const;
@@ -169,7 +171,11 @@ public:
 
     RefPtr<Media::DisplayingVideoSink> const& selected_video_track_sink() const { return m_selected_video_track_sink; }
 
-    Painting::ExternalContentSource& ensure_external_content_source();
+    Painting::VideoFrameResourceId ensure_video_frame_resource_id();
+    Optional<Painting::VideoFrameResourceId> video_frame_resource_id() const { return m_video_frame_resource_id; }
+
+    virtual bool update_intrinsic_video_dimensions() { return false; }
+    virtual void update_natural_dimensions() { }
 
 protected:
     HTMLMediaElement(DOM::Document&, DOM::QualifiedName);
@@ -179,7 +185,7 @@ protected:
     virtual void visit_edges(Cell::Visitor&) override;
 
     virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
-    virtual void removed_from(DOM::Node* old_parent, DOM::Node& old_root) override;
+    virtual void removed_from(IsSubtreeRoot, DOM::Node* old_ancestor, DOM::Node& old_root) override;
     virtual void children_changed(ChildrenChangedMetadata const& metadata) override;
 
 private:
@@ -241,6 +247,9 @@ private:
 
     void volume_or_muted_attribute_changed();
     void update_volume();
+    void update_compositor_video_frame(NonnullRefPtr<Media::VideoFrame const>);
+    void clear_compositor_video_frame();
+    void update_current_video_frame();
 
     bool is_eligible_for_autoplay() const;
 
@@ -316,6 +325,9 @@ private:
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-duration
     double m_duration { NAN };
 
+    // https://html.spec.whatwg.org/multipage/media.html#timeline-offset
+    Optional<AK::UnixDateTime> m_timeline_offset;
+
     // https://html.spec.whatwg.org/multipage/media.html#list-of-pending-play-promises
     Vector<GC::Ref<WebIDL::Promise>> m_pending_play_promises;
 
@@ -373,7 +385,7 @@ private:
     bool m_has_enabled_preferred_audio_track { false };
     bool m_has_selected_preferred_video_track { false };
 
-    RefPtr<Painting::ExternalContentSource> m_external_content_source;
+    Optional<Painting::VideoFrameResourceId> m_video_frame_resource_id;
 };
 
 }

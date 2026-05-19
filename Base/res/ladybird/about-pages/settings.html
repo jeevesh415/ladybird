@@ -378,6 +378,16 @@
                             Scroll pages by pressing the middle mouse button and moving the mouse.
                         </p>
                     </div>
+                    <hr />
+                    <div class="card-group">
+                        <div class="inline-container">
+                            <label for="enable-primary-paste">Enable primary pasting</label>
+                            <input id="enable-primary-paste" type="checkbox" switch />
+                        </div>
+                        <p class="description">
+                            Paste text from the clipboard when the middle mouse button is clicked.
+                        </p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -607,6 +617,13 @@
                     <label for="clear-browsing-data-cached-files">
                         Cached files<span id="clear-browsing-data-cached-files-size"></span>
                         <p class="description">Remove items that help pages load faster</p>
+                    </label>
+                </div>
+                <div class="input-field-container">
+                    <input id="clear-browsing-data-history" type="checkbox" value="" checked />
+                    <label for="clear-browsing-data-history">
+                        Browsing history
+                        <p class="description">Remove visited pages from history and address bar suggestions</p>
                     </label>
                 </div>
                 <div class="input-field-container">

@@ -7,11 +7,12 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/ARIA/ARIAMixin.h>
 #include <LibWeb/Animations/Animatable.h>
-#include <LibWeb/Bindings/ElementPrototype.h>
+#include <LibWeb/Bindings/Element.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/ShadowRootPrototype.h>
+#include <LibWeb/Bindings/ShadowRoot.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/DOM/ChildNode.h>
@@ -29,7 +30,6 @@
 #include <LibWeb/HTML/TagNames.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
-#include <LibWeb/IntersectionObserver/IntersectionObserverRegistration.h>
 #include <LibWeb/TrustedTypes/TrustedHTML.h>
 #include <LibWeb/TrustedTypes/TrustedScript.h>
 #include <LibWeb/TrustedTypes/TrustedScriptURL.h>
@@ -37,36 +37,6 @@
 #include <LibWeb/WebIDL/Types.h>
 
 namespace Web::DOM {
-
-struct ShadowRootInit {
-    Bindings::ShadowRootMode mode;
-    bool delegates_focus = false;
-    Bindings::SlotAssignmentMode slot_assignment { Bindings::SlotAssignmentMode::Named };
-    bool clonable = false;
-    bool serializable = false;
-    Optional<GC::Ptr<HTML::CustomElementRegistry>> custom_element_registry {};
-};
-
-struct GetHTMLOptions {
-    bool serializable_shadow_roots { false };
-    Vector<GC::Root<ShadowRoot>> shadow_roots {};
-};
-
-// https://w3c.github.io/csswg-drafts/cssom-view-1/#dictdef-scrollintoviewoptions
-struct ScrollIntoViewOptions : public HTML::ScrollOptions {
-    Bindings::ScrollLogicalPosition block { Bindings::ScrollLogicalPosition::Start };
-    Bindings::ScrollLogicalPosition inline_ { Bindings::ScrollLogicalPosition::Nearest };
-    Bindings::ScrollIntoViewContainer container { Bindings::ScrollIntoViewContainer::All };
-};
-
-// https://drafts.csswg.org/cssom-view-1/#dictdef-checkvisibilityoptions
-struct CheckVisibilityOptions {
-    bool check_opacity = false;
-    bool check_visibility_css = false;
-    bool content_visibility_auto = false;
-    bool opacity_property = false;
-    bool visibility_property = false;
-};
 
 // https://html.spec.whatwg.org/multipage/custom-elements.html#upgrade-reaction
 // An upgrade reaction, which will upgrade the custom element and contains a custom element definition; or
@@ -100,11 +70,6 @@ enum class ProximityToTheViewport : u8 {
     FarAwayFromTheViewport,
     // - The element’s proximity to the viewport is not determined:
     NotDetermined,
-};
-
-// https://w3c.github.io/pointerlock/#pointerlockoptions-dictionary
-struct PointerLockOptions {
-    bool unadjusted_movement = false;
 };
 
 class WEB_API Element
@@ -196,7 +161,7 @@ public:
     GC::Ref<DOMTokenList> part_list();
     ReadonlySpan<FlyString> part_names() const { return m_parts; }
 
-    WebIDL::ExceptionOr<GC::Ref<ShadowRoot>> attach_shadow(ShadowRootInit init);
+    WebIDL::ExceptionOr<GC::Ref<ShadowRoot>> attach_shadow(Bindings::ShadowRootInit const&);
     WebIDL::ExceptionOr<void> attach_a_shadow_root(Bindings::ShadowRootMode mode, bool clonable, bool serializable, bool delegates_focus, Bindings::SlotAssignmentMode slot_assignment, GC::Ptr<HTML::CustomElementRegistry> registry);
     GC::Ptr<ShadowRoot> shadow_root_for_bindings() const;
 
@@ -220,7 +185,7 @@ public:
     virtual bool supports_dimension_attributes() const { return false; }
 
     virtual bool is_presentational_hint(FlyString const&) const { return false; }
-    virtual void apply_presentational_hints(GC::Ref<CSS::CascadedProperties>) const { }
+    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const { }
 
     void run_attribute_change_steps(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_);
 
@@ -239,9 +204,6 @@ public:
     GC::Ptr<CSS::ComputedProperties> computed_properties(Optional<CSS::PseudoElement> = {});
     GC::Ptr<CSS::ComputedProperties const> computed_properties(Optional<CSS::PseudoElement> = {}) const;
     void set_computed_properties(Optional<CSS::PseudoElement>, GC::Ptr<CSS::ComputedProperties>);
-
-    [[nodiscard]] GC::Ptr<CSS::CascadedProperties> cascaded_properties(Optional<CSS::PseudoElement>) const;
-    void set_cascaded_properties(Optional<CSS::PseudoElement>, GC::Ptr<CSS::CascadedProperties>);
 
     Optional<PseudoElement&> get_pseudo_element(CSS::PseudoElement) const;
 
@@ -264,7 +226,7 @@ public:
 
     WebIDL::ExceptionOr<void> set_html_unsafe(TrustedTypes::TrustedHTMLOrString const&);
 
-    WebIDL::ExceptionOr<String> get_html(GetHTMLOptions const&) const;
+    WebIDL::ExceptionOr<String> get_html(Bindings::GetHTMLOptions const&) const;
 
     WebIDL::ExceptionOr<void> insert_adjacent_html(String const& position, TrustedTypes::TrustedHTMLOrString const&);
 
@@ -306,6 +268,8 @@ public:
     void set_custom_property_data(Optional<CSS::PseudoElement>, RefPtr<CSS::CustomPropertyData const>);
     [[nodiscard]] RefPtr<CSS::CustomPropertyData const> custom_property_data(Optional<CSS::PseudoElement>) const;
 
+    [[nodiscard]] bool refresh_inherited_custom_property_data();
+
     bool style_uses_attr_css_function() const { return m_style_uses_attr_css_function; }
     void set_style_uses_attr_css_function() { m_style_uses_attr_css_function = true; }
     bool style_uses_var_css_function() const { return m_style_uses_var_css_function; }
@@ -338,6 +302,9 @@ public:
     [[nodiscard]] Vector<CSSPixelRect> get_client_rects() const;
     [[nodiscard]] GC::Ref<Geometry::DOMRectList> get_client_rects_for_bindings() const;
 
+    [[nodiscard]] Vector<CSSPixelRect> client_rects_assuming_layout_clean() const;
+    [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean() const;
+
     virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>);
     virtual void adjust_computed_style(CSS::ComputedProperties&) { }
 
@@ -349,7 +316,16 @@ public:
     static GC::Ptr<Layout::NodeWithStyle> create_layout_node_for_display_type(DOM::Document&, CSS::Display const&, GC::Ref<CSS::ComputedProperties>, Element*);
 
     [[nodiscard]] bool affected_by_pseudo_class(CSS::PseudoClass) const;
-    bool includes_properties_from_invalidation_set(CSS::InvalidationSet const&) const;
+    void clear_removed_attributes_for_style_invalidation() { m_removed_attributes_for_style_invalidation.clear(); }
+    bool has_removed_attribute_for_style_invalidation(FlyString const& attribute_name) const
+    {
+        return m_removed_attributes_for_style_invalidation.contains_slow(attribute_name);
+    }
+    void remember_removed_attribute_for_style_invalidation(FlyString const& attribute_name)
+    {
+        if (!m_removed_attributes_for_style_invalidation.contains_slow(attribute_name))
+            m_removed_attributes_for_style_invalidation.append(attribute_name);
+    }
 
     void set_pseudo_element_node(Badge<Layout::TreeBuilder>, CSS::PseudoElement, GC::Ptr<Layout::NodeWithStyle>);
     GC::Ptr<Layout::NodeWithStyle> get_pseudo_element_node(CSS::PseudoElement) const;
@@ -384,7 +360,7 @@ public:
     WebIDL::ExceptionOr<void> insert_adjacent_text(String const& where, Utf16String const& data);
 
     // https://w3c.github.io/csswg-drafts/cssom-view-1/#dom-element-scrollintoview
-    GC::Ref<WebIDL::Promise> scroll_into_view(Optional<Variant<bool, ScrollIntoViewOptions>> = {});
+    GC::Ref<WebIDL::Promise> scroll_into_view(Optional<Variant<bool, Bindings::ScrollIntoViewOptions>> = {});
 
     // https://www.w3.org/TR/wai-aria-1.2/#ARIAMixin
 #define __ENUMERATE_ARIA_ATTRIBUTE(name, attribute) \
@@ -429,16 +405,15 @@ public:
     void set_custom_element_state(CustomElementState);
     void setup_custom_element_from_constructor(HTML::CustomElementDefinition& custom_element_definition, Optional<String> const& is_value);
 
-    GC::Ref<WebIDL::Promise> scroll(HTML::ScrollToOptions);
+    GC::Ref<WebIDL::Promise> scroll(Bindings::ScrollToOptions);
     GC::Ref<WebIDL::Promise> scroll(double x, double y);
-    GC::Ref<WebIDL::Promise> scroll_by(HTML::ScrollToOptions);
+    GC::Ref<WebIDL::Promise> scroll_by(Bindings::ScrollToOptions);
     GC::Ref<WebIDL::Promise> scroll_by(double x, double y);
 
-    bool check_visibility(Optional<CheckVisibilityOptions>);
+    bool check_visibility(Optional<Bindings::CheckVisibilityOptions>);
 
-    void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserverRegistration);
+    void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, GC::Ref<IntersectionObserver::IntersectionObserver>);
     void unregister_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, GC::Ref<IntersectionObserver::IntersectionObserver>);
-    IntersectionObserver::IntersectionObserverRegistration& get_intersection_observer_registration(Badge<DOM::Document>, IntersectionObserver::IntersectionObserver const&);
 
     CSSPixelPoint scroll_offset(Optional<CSS::PseudoElement> type) const;
     void set_scroll_offset(Optional<CSS::PseudoElement> type, CSSPixelPoint offset);
@@ -501,8 +476,6 @@ public:
     bool matches_link_pseudo_class() const;
     bool matches_local_link_pseudo_class() const;
 
-    void invalidate_style_if_affected_by_has();
-
     bool affected_by_has_pseudo_class_in_subject_position() const { return m_affected_by_has_pseudo_class_in_subject_position; }
     void set_affected_by_has_pseudo_class_in_subject_position(bool value) { m_affected_by_has_pseudo_class_in_subject_position = value; }
 
@@ -511,6 +484,19 @@ public:
 
     bool affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator() const { return m_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator; }
     void set_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator(bool value) { m_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator = value; }
+    // Set on any element reached by stepping through a + or ~ combinator while
+    // matching a :has() argument. Lets generic invalidation defer ancestor
+    // sibling scans until it reaches the sibling subtree root. Write-once,
+    // intentionally never cleared.
+    bool in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator() const { return m_in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator; }
+    void set_in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator(bool value) { m_in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator = value; }
+
+    // Set on any element that was traversed during matching of a :has() argument
+    // selector (i.e. the descendant/child/sibling walk inside :has()). Lets the
+    // invalidation walker terminate once it reaches an element whose state cannot
+    // affect any :has() anchor. Write-once, intentionally never cleared.
+    bool in_has_scope() const { return m_in_has_scope; }
+    void set_in_has_scope(bool value) { m_in_has_scope = value; }
 
     bool affected_by_direct_sibling_combinator() const { return m_affected_by_direct_sibling_combinator; }
     void set_affected_by_direct_sibling_combinator(bool value) { m_affected_by_direct_sibling_combinator = value; }
@@ -522,13 +508,23 @@ public:
     void set_affected_by_first_child_pseudo_class(bool value) { m_affected_by_first_child_pseudo_class = value; }
 
     bool affected_by_last_child_pseudo_class() const { return m_affected_by_last_child_pseudo_class; }
-    void set_affected_by_last_child_pseudo_class(bool value) { m_affected_by_last_child_pseudo_class = value; }
+    void set_affected_by_last_child_pseudo_class(bool value);
 
     bool affected_by_forward_positional_pseudo_class() const { return m_affected_by_forward_positional_pseudo_class; }
     void set_affected_by_forward_positional_pseudo_class(bool value) { m_affected_by_forward_positional_pseudo_class = value; }
 
     bool affected_by_backward_positional_pseudo_class() const { return m_affected_by_backward_positional_pseudo_class; }
-    void set_affected_by_backward_positional_pseudo_class(bool value) { m_affected_by_backward_positional_pseudo_class = value; }
+    void set_affected_by_backward_positional_pseudo_class(bool value);
+
+    // Write-once: this can be set while matching descendants, and recomputing this element's own style may not revisit
+    // those descendant selectors. Keeping it sticky is conservative and avoids stale descendant style after moves.
+    bool affected_by_structural_pseudo_class_in_non_subject_position() const { return m_affected_by_structural_pseudo_class_in_non_subject_position; }
+    void set_affected_by_structural_pseudo_class_in_non_subject_position() { m_affected_by_structural_pseudo_class_in_non_subject_position = true; }
+
+    // Write-once: this can be set while matching descendants, and recomputing this element's own style may not revisit
+    // those descendant selectors. Keeping it sticky is conservative and avoids stale descendant style after moves.
+    bool affected_by_sibling_combinator_in_non_subject_position() const { return m_affected_by_sibling_combinator_in_non_subject_position; }
+    void set_affected_by_sibling_combinator_in_non_subject_position() { m_affected_by_sibling_combinator_in_non_subject_position = true; }
 
     size_t sibling_invalidation_distance() const { return m_sibling_invalidation_distance; }
     void set_sibling_invalidation_distance(size_t value) { m_sibling_invalidation_distance = value; }
@@ -558,7 +554,7 @@ public:
     Optional<FlyString> document_scoped_view_transition_name();
 
     // https://drafts.csswg.org/css-view-transitions-1/#capture-the-image
-    RefPtr<Gfx::ImmutableBitmap> capture_the_image();
+    Optional<Gfx::DecodedImageFrame> capture_the_image();
 
     void set_pointer_capture(WebIDL::Long pointer_id);
     void release_pointer_capture(WebIDL::Long pointer_id);
@@ -582,7 +578,7 @@ public:
 
     double ensure_css_random_base_value(CSS::RandomCachingKey const&);
 
-    GC::Ref<WebIDL::Promise> request_pointer_lock(Optional<PointerLockOptions>);
+    GC::Ref<WebIDL::Promise> request_pointer_lock(Optional<Bindings::PointerLockOptions>);
 
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const { return m_custom_element_registry; }
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> registry) { m_custom_element_registry = registry; }
@@ -592,8 +588,8 @@ protected:
     virtual void initialize(JS::Realm&) override;
 
     virtual void inserted() override;
-    virtual void removed_from(Node* old_parent, Node& old_root) override;
-    virtual void moved_from(GC::Ptr<Node> old_parent) override;
+    virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
+    virtual void moved_from(IsSubtreeRoot, GC::Ptr<Node> old_ancestor) override;
 
     virtual void children_changed(ChildrenChangedMetadata const&) override;
     virtual i32 default_tab_index_value() const;
@@ -614,8 +610,6 @@ protected:
 
 private:
     FlyString make_html_uppercased_qualified_name() const;
-
-    void invalidate_style_after_attribute_change(FlyString const& attribute_name, Optional<String> const& old_value, Optional<String> const& new_value);
 
     void exit_fullscreen_on_element_removal();
 
@@ -646,7 +640,6 @@ private:
     GC::Ptr<ShadowRoot> m_shadow_root;
     GC::Ptr<DOMTokenList> m_part_list;
 
-    GC::Ptr<CSS::CascadedProperties> m_cascaded_properties;
     GC::Ptr<CSS::ComputedProperties> m_computed_properties;
     RefPtr<CSS::CustomPropertyData const> m_custom_property_data;
 
@@ -682,7 +675,7 @@ private:
 
     // https://www.w3.org/TR/intersection-observer/#dom-element-registeredintersectionobservers-slot
     // Element objects have an internal [[RegisteredIntersectionObservers]] slot, which is initialized to an empty list.
-    OwnPtr<Vector<IntersectionObserver::IntersectionObserverRegistration>> m_registered_intersection_observers;
+    OwnPtr<Vector<GC::Ref<IntersectionObserver::IntersectionObserver>>> m_registered_intersection_observers;
 
     // https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemapcache-slot
     // Every Element has a [[computedStyleMapCache]] internal slot, initially set to null, which caches the result of
@@ -690,6 +683,7 @@ private:
     GC::Ptr<CSS::StylePropertyMapReadOnly> m_computed_style_map_cache;
 
     CSSPixelPoint m_scroll_offset;
+    Vector<FlyString, 1> m_removed_attributes_for_style_invalidation;
 
     bool m_is_being_activated : 1 { false };
     bool m_in_top_layer : 1 { false };
@@ -708,7 +702,11 @@ private:
     bool m_affected_by_last_child_pseudo_class : 1 { false };
     bool m_affected_by_forward_positional_pseudo_class : 1 { false };
     bool m_affected_by_backward_positional_pseudo_class : 1 { false };
+    bool m_affected_by_structural_pseudo_class_in_non_subject_position : 1 { false };
+    bool m_affected_by_sibling_combinator_in_non_subject_position : 1 { false };
     bool m_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator : 1 { false };
+    bool m_in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator : 1 { false };
+    bool m_in_has_scope : 1 { false };
     bool m_fullscreen_flag : 1 { false };
 
     size_t m_sibling_invalidation_distance { 0 };

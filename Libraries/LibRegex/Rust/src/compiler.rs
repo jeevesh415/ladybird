@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 /// - <https://tc39.es/ecma262/#sec-runtime-semantics-unicodematchproperty-p>
 /// - <https://tc39.es/ecma262/#sec-runtime-semantics-unicodematchpropertyvalue-p-v>
 pub fn resolve_property(name: &str, value: Option<&str>) -> Option<ResolvedProperty> {
-    crate::unicode_ffi::resolve_property(name, value)
+    libunicode_rust::character_types::resolve_property(name, value)
 }
 
 /// Compile a parsed pattern into a bytecode program.
@@ -58,6 +58,34 @@ struct Compiler {
 }
 
 impl Compiler {
+    fn append_ascii_char_range(char_ranges: &mut Vec<CharRange>, start: u8, end: u8) {
+        char_ranges.push(CharRange {
+            start: u32::from(start),
+            end: u32::from(end),
+        });
+    }
+
+    fn append_builtin_class_ranges_for_legacy_positive_class(
+        char_ranges: &mut Vec<CharRange>,
+        builtin_class: BuiltinCharacterClass,
+    ) -> bool {
+        match builtin_class {
+            BuiltinCharacterClass::Digit => {
+                Self::append_ascii_char_range(char_ranges, b'0', b'9');
+                true
+            }
+            BuiltinCharacterClass::Word => {
+                // Legacy `\w` is ASCII-only: `[A-Za-z0-9_]`.
+                Self::append_ascii_char_range(char_ranges, b'0', b'9');
+                Self::append_ascii_char_range(char_ranges, b'A', b'Z');
+                Self::append_ascii_char_range(char_ranges, b'_', b'_');
+                Self::append_ascii_char_range(char_ranges, b'a', b'z');
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn new(pattern: &Pattern) -> Self {
         // Registers: 0-1 for group 0, then 2 per capture group.
         let register_count = 2 + pattern.capture_count * 2;
@@ -88,7 +116,7 @@ impl Compiler {
     /// match atomically, as described by `CompileClassSetString`.
     /// <https://tc39.es/ecma262/#sec-compileclasssetstring>
     fn get_string_property_strings(name: &str) -> Vec<Vec<u32>> {
-        let buf = crate::unicode_ffi::get_string_property_data(name);
+        let buf = libunicode_rust::character_types::get_string_property_data(name);
         if buf.is_empty() {
             return Vec::new();
         }
@@ -160,14 +188,12 @@ impl Compiler {
     }
 
     fn emit_unicode_property(&mut self, negated: bool, name: &str, value: Option<&str>) {
-        self.emit(Instruction::UnicodeProperty(Box::new(
-            UnicodePropertyData {
-                negated,
-                name: name.to_string(),
-                value: value.map(|v| v.to_string()),
-                resolved: None,
-            },
-        )));
+        self.emit(Instruction::UnicodeProperty(Box::new(UnicodePropertyData {
+            negated,
+            name: name.to_string(),
+            value: value.map(|v| v.to_string()),
+            resolved: None,
+        })));
     }
 
     fn emit_char_string(&mut self, chars: &[char]) {
@@ -198,14 +224,10 @@ impl Compiler {
 
     fn class_set_expression_lengths(&self, expr: &ClassSetExpression) -> BTreeSet<usize> {
         match expr {
-            ClassSetExpression::Union(operands) => {
-                operands
-                    .iter()
-                    .fold(BTreeSet::new(), |mut lengths, operand| {
-                        lengths.extend(self.class_set_operand_lengths(operand));
-                        lengths
-                    })
-            }
+            ClassSetExpression::Union(operands) => operands.iter().fold(BTreeSet::new(), |mut lengths, operand| {
+                lengths.extend(self.class_set_operand_lengths(operand));
+                lengths
+            }),
             ClassSetExpression::Intersection(operands) => {
                 let Some((first, rest)) = operands.split_first() else {
                     return BTreeSet::new();
@@ -226,9 +248,9 @@ impl Compiler {
 
     fn class_set_operand_lengths(&self, operand: &ClassSetOperand) -> BTreeSet<usize> {
         match operand {
-            ClassSetOperand::Char(_)
-            | ClassSetOperand::Range(_, _)
-            | ClassSetOperand::BuiltinClass(_) => Self::singleton_length_set(),
+            ClassSetOperand::Char(_) | ClassSetOperand::Range(_, _) | ClassSetOperand::BuiltinClass(_) => {
+                Self::singleton_length_set()
+            }
             ClassSetOperand::NestedClass(cc) => {
                 if cc.negated {
                     return Self::singleton_length_set();
@@ -241,7 +263,7 @@ impl Compiler {
             ClassSetOperand::UnicodeProperty(up) => {
                 if self.program.unicode_sets
                     && !up.negated
-                    && crate::unicode_ffi::is_string_property(&up.name)
+                    && libunicode_rust::character_types::is_string_property(&up.name)
                 {
                     let mut lengths = Self::singleton_length_set();
                     for string in Self::get_string_property_strings(&up.name) {
@@ -389,10 +411,7 @@ impl Compiler {
     }
 
     fn alternative_can_be_zero_width(&self, alternative: &Alternative) -> bool {
-        alternative
-            .terms
-            .iter()
-            .all(|term| self.term_can_be_zero_width(term))
+        alternative.terms.iter().all(|term| self.term_can_be_zero_width(term))
     }
 
     fn term_can_be_zero_width(&self, term: &Term) -> bool {
@@ -482,51 +501,22 @@ impl Compiler {
                 }
             }
             Atom::BuiltinCharacterClass(class) => Some(SimpleMatch::BuiltinClass(*class)),
-            Atom::CharacterClass(cc) => {
-                // Only use simple match for character classes without v-flag set operations.
-                let ranges_vec = match &cc.body {
-                    CharacterClassBody::Ranges(ranges) => ranges,
-                    CharacterClassBody::UnicodeSet(_) => return None,
-                };
-                let mut ranges = Vec::new();
-                for r in ranges_vec {
-                    match r {
-                        CharacterClassRange::Single(c) => {
-                            if *c > 0xFFFF && !self.program.unicode && !self.program.unicode_sets {
-                                return None;
-                            }
-                            ranges.push(CharRange { start: *c, end: *c });
-                        }
-                        CharacterClassRange::Range(lo, hi) => {
-                            ranges.push(CharRange {
-                                start: *lo,
-                                end: *hi,
-                            });
-                        }
-                        _ => return None, // BuiltinClass or UnicodeProperty in class
-                    }
-                }
-                // Sort ranges by start code point for binary search in the VM.
-                ranges.sort_by_key(|r| r.start);
-                Some(SimpleMatch::CharClass {
-                    ranges,
-                    negated: cc.negated,
-                })
-            }
+            Atom::CharacterClass(cc) => match &cc.body {
+                CharacterClassBody::Ranges(ranges_vec) => self.try_simple_match_for_ranges(ranges_vec, cc.negated),
+                CharacterClassBody::UnicodeSet(expr) => self.try_simple_match_for_unicode_set(expr, cc.negated),
+            },
             Atom::UnicodeProperty(up) => {
                 // String properties (e.g. Basic_Emoji) can match multi-character
                 // sequences and cannot use simple matching.
-                if self.program.unicode_sets && crate::unicode_ffi::is_string_property(&up.name) {
+                if self.program.unicode_sets && libunicode_rust::character_types::is_string_property(&up.name) {
                     return None;
                 }
-                Some(SimpleMatch::UnicodeProperty(Box::new(
-                    UnicodePropertyData {
-                        negated: up.negated,
-                        name: up.name.clone(),
-                        value: up.value.clone(),
-                        resolved: None, // Will be populated after compilation.
-                    },
-                )))
+                Some(SimpleMatch::UnicodeProperty(Box::new(UnicodePropertyData {
+                    negated: up.negated,
+                    name: up.name.clone(),
+                    value: up.value.clone(),
+                    resolved: None, // Will be populated after compilation.
+                })))
             }
             _ => None,
         }
@@ -767,12 +757,7 @@ impl Compiler {
         }
     }
 
-    fn compile_counted_optional_repetitions(
-        &mut self,
-        atom: &Atom,
-        optional_count: u32,
-        greedy: bool,
-    ) {
+    fn compile_counted_optional_repetitions(&mut self, atom: &Atom, optional_count: u32, greedy: bool) {
         let counter_reg = self.alloc_register();
         self.emit(Instruction::RepeatStart { counter_reg });
 
@@ -837,7 +822,7 @@ impl Compiler {
             Atom::UnicodeProperty(up) => {
                 if self.program.unicode_sets
                     && !up.negated
-                    && crate::unicode_ffi::is_string_property(&up.name)
+                    && libunicode_rust::character_types::is_string_property(&up.name)
                 {
                     self.emit_string_property_match(&up.name, up.value.as_deref());
                     return;
@@ -881,11 +866,7 @@ impl Compiler {
                 self.emit(Instruction::LookEnd);
                 let end = self.current_offset();
                 // Patch the end offset.
-                self.program.instructions[look_start as usize] = Instruction::LookStart {
-                    positive,
-                    forward,
-                    end,
-                };
+                self.program.instructions[look_start as usize] = Instruction::LookStart { positive, forward, end };
             }
 
             Atom::Backreference(br) => match br {
@@ -974,6 +955,7 @@ impl Compiler {
                 let mut has_builtin = false;
 
                 let split_surrogates = !self.program.unicode && !self.program.unicode_sets;
+                let can_inline_builtin_ranges = !cc.negated && !self.program.unicode && !self.program.unicode_sets;
                 for r in ranges {
                     match r {
                         CharacterClassRange::Single(cp) => {
@@ -983,20 +965,19 @@ impl Compiler {
                                 char_ranges.push(CharRange { start: hi, end: hi });
                                 char_ranges.push(CharRange { start: lo, end: lo });
                             } else {
-                                char_ranges.push(CharRange {
-                                    start: *cp,
-                                    end: *cp,
-                                });
+                                char_ranges.push(CharRange { start: *cp, end: *cp });
                             }
                         }
                         CharacterClassRange::Range(lo, hi) => {
-                            char_ranges.push(CharRange {
-                                start: *lo,
-                                end: *hi,
-                            });
+                            char_ranges.push(CharRange { start: *lo, end: *hi });
                         }
-                        CharacterClassRange::BuiltinClass(_)
-                        | CharacterClassRange::UnicodeProperty(_) => {
+                        CharacterClassRange::BuiltinClass(class)
+                            if can_inline_builtin_ranges
+                                && Self::append_builtin_class_ranges_for_legacy_positive_class(
+                                    &mut char_ranges,
+                                    *class,
+                                ) => {}
+                        CharacterClassRange::BuiltinClass(_) | CharacterClassRange::UnicodeProperty(_) => {
                             has_builtin = true;
                         }
                     }
@@ -1065,10 +1046,7 @@ impl Compiler {
             }
             CharacterClassRange::Range(lo, hi) => {
                 self.emit(Instruction::CharClass {
-                    ranges: vec![CharRange {
-                        start: *lo,
-                        end: *hi,
-                    }],
+                    ranges: vec![CharRange { start: *lo, end: *hi }],
                     negated: false,
                 });
             }
@@ -1079,6 +1057,263 @@ impl Compiler {
                 self.emit_unicode_property(up.negated, &up.name, up.value.as_deref());
             }
         }
+    }
+
+    /// Try to extract a `SimpleMatch` for a single `ClassSetOperand` in the context of
+    /// a `LazyLoop`/`GreedyLoop`. Returns `None` for operands that require multi-character
+    /// matching (string literals) or set operations that can't be represented as a simple test.
+    fn try_simple_match_for_operand(operand: &ClassSetOperand) -> Option<SimpleMatch> {
+        match operand {
+            ClassSetOperand::Char(c) => Some(SimpleMatch::Char(*c)),
+            ClassSetOperand::Range(lo, hi) => Some(SimpleMatch::CharClass {
+                ranges: vec![CharRange { start: *lo, end: *hi }],
+                negated: false,
+            }),
+            ClassSetOperand::BuiltinClass(bc) => Some(SimpleMatch::BuiltinClass(*bc)),
+            ClassSetOperand::UnicodeProperty(up) => {
+                if libunicode_rust::character_types::is_string_property(&up.name) {
+                    return None;
+                }
+                Some(SimpleMatch::UnicodeProperty(Box::new(UnicodePropertyData {
+                    negated: up.negated,
+                    name: up.name.clone(),
+                    value: up.value.clone(),
+                    resolved: None,
+                })))
+            }
+            ClassSetOperand::NestedClass(cc) => match &cc.body {
+                CharacterClassBody::Ranges(ranges_vec) => {
+                    let mut ranges = Vec::new();
+                    for r in ranges_vec {
+                        match r {
+                            CharacterClassRange::Single(cp) => {
+                                ranges.push(CharRange { start: *cp, end: *cp });
+                            }
+                            CharacterClassRange::Range(lo, hi) => {
+                                ranges.push(CharRange { start: *lo, end: *hi });
+                            }
+                            _ => return None,
+                        }
+                    }
+                    ranges.sort_by_key(|r| r.start);
+                    Some(SimpleMatch::CharClass {
+                        ranges,
+                        negated: cc.negated,
+                    })
+                }
+                CharacterClassBody::UnicodeSet(inner_expr) => {
+                    if cc.negated {
+                        let ClassSetExpression::Union(inner_operands) = inner_expr else {
+                            return None;
+                        };
+                        let matchers: Option<Vec<SimpleMatch>> =
+                            inner_operands.iter().map(Self::try_simple_match_for_operand).collect();
+                        let matchers = matchers?;
+                        Self::build_union_simple_match_negated(matchers)
+                    } else {
+                        let ClassSetExpression::Union(inner_operands) = inner_expr else {
+                            return None;
+                        };
+                        let matchers: Option<Vec<SimpleMatch>> =
+                            inner_operands.iter().map(Self::try_simple_match_for_operand).collect();
+                        let matchers = matchers?;
+                        Self::build_union_simple_match(matchers)
+                    }
+                }
+            },
+            ClassSetOperand::StringLiteral(_) => None,
+        }
+    }
+
+    fn build_union_simple_match(matchers: Vec<SimpleMatch>) -> Option<SimpleMatch> {
+        let mut iter = matchers.into_iter();
+        let first = iter.next()?;
+        Some(iter.fold(first, |acc, m| SimpleMatch::Union(Box::new(acc), Box::new(m))))
+    }
+
+    fn negate_simple_match(matcher: SimpleMatch) -> Option<SimpleMatch> {
+        match matcher {
+            SimpleMatch::CharClass { ranges, negated } => Some(SimpleMatch::CharClass {
+                ranges,
+                negated: !negated,
+            }),
+            SimpleMatch::UnicodeProperty(mut data) => {
+                data.negated = !data.negated;
+                Some(SimpleMatch::UnicodeProperty(data))
+            }
+            _ => None,
+        }
+    }
+
+    fn build_union_simple_match_negated(matchers: Vec<SimpleMatch>) -> Option<SimpleMatch> {
+        if matchers.len() == 1 {
+            return Self::negate_simple_match(matchers.into_iter().next().unwrap());
+        }
+        None
+    }
+
+    /// Try to build a `SimpleMatch` for a `CharacterClassBody::Ranges`.
+    ///
+    /// If all elements are plain chars/ranges, returns a single `CharClass`.
+    /// If the class is non-negated and contains builtins or Unicode properties,
+    /// collects plain ranges into one `CharClass` and each builtin/property into its
+    /// own `SimpleMatch`, then folds them into a `Union`.
+    fn try_simple_match_for_ranges(&self, ranges_vec: &[CharacterClassRange], negated: bool) -> Option<SimpleMatch> {
+        let has_complex = ranges_vec.iter().any(|r| {
+            matches!(
+                r,
+                CharacterClassRange::BuiltinClass(_) | CharacterClassRange::UnicodeProperty(_)
+            )
+        });
+
+        if !has_complex {
+            let mut ranges = Vec::new();
+            for r in ranges_vec {
+                match r {
+                    CharacterClassRange::Single(c) => {
+                        if *c > 0xFFFF && !self.program.unicode && !self.program.unicode_sets {
+                            return None;
+                        }
+                        ranges.push(CharRange { start: *c, end: *c });
+                    }
+                    CharacterClassRange::Range(lo, hi) => {
+                        ranges.push(CharRange { start: *lo, end: *hi });
+                    }
+                    _ => return None,
+                }
+            }
+            ranges.sort_by_key(|r| r.start);
+            return Some(SimpleMatch::CharClass { ranges, negated });
+        }
+
+        if negated {
+            return None;
+        }
+
+        let mut plain_ranges: Vec<CharRange> = Vec::new();
+        let mut matchers: Vec<SimpleMatch> = Vec::new();
+
+        for r in ranges_vec {
+            match r {
+                CharacterClassRange::Single(c) => {
+                    if *c > 0xFFFF && !self.program.unicode && !self.program.unicode_sets {
+                        return None;
+                    }
+                    plain_ranges.push(CharRange { start: *c, end: *c });
+                }
+                CharacterClassRange::Range(lo, hi) => {
+                    plain_ranges.push(CharRange { start: *lo, end: *hi });
+                }
+                CharacterClassRange::BuiltinClass(bc) => {
+                    matchers.push(SimpleMatch::BuiltinClass(*bc));
+                }
+                CharacterClassRange::UnicodeProperty(up) => {
+                    if libunicode_rust::character_types::is_string_property(&up.name) {
+                        return None;
+                    }
+                    matchers.push(SimpleMatch::UnicodeProperty(Box::new(UnicodePropertyData {
+                        negated: up.negated,
+                        name: up.name.clone(),
+                        value: up.value.clone(),
+                        resolved: None,
+                    })));
+                }
+            }
+        }
+
+        if !plain_ranges.is_empty() {
+            plain_ranges.sort_by_key(|r| r.start);
+            matchers.push(SimpleMatch::CharClass {
+                ranges: plain_ranges,
+                negated: false,
+            });
+        }
+
+        Self::build_union_simple_match(matchers)
+    }
+
+    /// Try to build a `SimpleMatch` for a `/v`-mode character class `UnicodeSet` body.
+    ///
+    /// For unions that can't be collapsed into a flat range set, we try to build a `SimpleMatch::Union`
+    /// so that quantifiers can still use the optimized `GreedyLoop`/`LazyLoop` path.
+    fn try_simple_match_for_unicode_set(&self, expr: &ClassSetExpression, negated: bool) -> Option<SimpleMatch> {
+        if let Some(ranges) = Self::try_extract_union_ranges(expr) {
+            let mut sorted = ranges;
+            sorted.sort_by_key(|r| r.start);
+            return Some(SimpleMatch::CharClass {
+                ranges: sorted,
+                negated,
+            });
+        }
+
+        if negated {
+            return None;
+        }
+
+        let ClassSetExpression::Union(operands) = expr else {
+            return None;
+        };
+
+        if operands.is_empty() {
+            return None;
+        }
+
+        let matchers: Option<Vec<SimpleMatch>> = operands.iter().map(Self::try_simple_match_for_operand).collect();
+        let matchers = matchers?;
+        Self::build_union_simple_match(matchers)
+    }
+
+    fn try_extract_union_ranges(expr: &ClassSetExpression) -> Option<Vec<CharRange>> {
+        let ClassSetExpression::Union(operands) = expr else {
+            return None;
+        };
+
+        let mut ranges = Vec::new();
+        for operand in operands {
+            match operand {
+                ClassSetOperand::Char(c) => {
+                    ranges.push(CharRange { start: *c, end: *c });
+                }
+                ClassSetOperand::Range(lo, hi) => {
+                    ranges.push(CharRange { start: *lo, end: *hi });
+                }
+                ClassSetOperand::NestedClass(cc) => match &cc.body {
+                    CharacterClassBody::Ranges(class_ranges) => {
+                        for r in class_ranges {
+                            match r {
+                                CharacterClassRange::Single(cp) => {
+                                    ranges.push(CharRange { start: *cp, end: *cp });
+                                }
+                                CharacterClassRange::Range(lo, hi) => {
+                                    ranges.push(CharRange { start: *lo, end: *hi });
+                                }
+                                CharacterClassRange::BuiltinClass(_) | CharacterClassRange::UnicodeProperty(_) => {
+                                    return None;
+                                }
+                            }
+                        }
+                        if cc.negated {
+                            return None;
+                        }
+                    }
+                    CharacterClassBody::UnicodeSet(inner_expr) => {
+                        if cc.negated {
+                            return None;
+                        }
+                        let inner = Self::try_extract_union_ranges(inner_expr)?;
+                        ranges.extend(inner);
+                    }
+                },
+                ClassSetOperand::BuiltinClass(_)
+                | ClassSetOperand::UnicodeProperty(_)
+                | ClassSetOperand::StringLiteral(_) => {
+                    return None;
+                }
+            }
+        }
+
+        ranges.sort_by_key(|r| r.start);
+        Some(ranges)
     }
 
     /// Lower a `/v` character class expression.
@@ -1097,8 +1332,11 @@ impl Compiler {
             return;
         }
 
-        // For now, compile unicode set classes as disjunctions of their operands.
-        // This is correct but not optimal — future optimization can merge ranges.
+        if let Some(ranges) = Self::try_extract_union_ranges(expr) {
+            self.emit(Instruction::CharClass { ranges, negated });
+            return;
+        }
+
         if negated {
             let forward = !self.backward;
             let look_start = self.emit(Instruction::LookStart {
@@ -1126,10 +1364,7 @@ impl Compiler {
     fn compile_class_set_expression(&mut self, expr: &ClassSetExpression) {
         // NB: Compile each exact match length separately, longest first, so
         // intersection/subtraction only compare equal-length alternatives.
-        let mut lengths: Vec<_> = self
-            .class_set_expression_lengths(expr)
-            .into_iter()
-            .collect();
+        let mut lengths: Vec<_> = self.class_set_expression_lengths(expr).into_iter().collect();
         lengths.sort_unstable_by(|a, b| b.cmp(a));
 
         if lengths.is_empty() {
@@ -1137,9 +1372,7 @@ impl Compiler {
             return;
         }
 
-        self.emit_split_chain(&lengths, |s, len| {
-            s.compile_class_set_expression_at_length(expr, *len)
-        });
+        self.emit_split_chain(&lengths, |s, len| s.compile_class_set_expression_at_length(expr, *len));
     }
 
     fn compile_class_set_expression_at_length(&mut self, expr: &ClassSetExpression, length: usize) {
@@ -1229,7 +1462,7 @@ impl Compiler {
                     self.emit(Instruction::Fail);
                     return;
                 }
-                self.emit_char_maybe_case_fold(*c as u32);
+                self.emit_char_maybe_case_fold(*c);
             }
             ClassSetOperand::Range(lo, hi) => {
                 if length != 1 {
@@ -1237,10 +1470,7 @@ impl Compiler {
                     return;
                 }
                 self.emit(Instruction::CharClass {
-                    ranges: vec![CharRange {
-                        start: *lo as u32,
-                        end: *hi as u32,
-                    }],
+                    ranges: vec![CharRange { start: *lo, end: *hi }],
                     negated: false,
                 });
             }
@@ -1277,7 +1507,7 @@ impl Compiler {
             ClassSetOperand::UnicodeProperty(up) => {
                 if self.program.unicode_sets
                     && !up.negated
-                    && crate::unicode_ffi::is_string_property(&up.name)
+                    && libunicode_rust::character_types::is_string_property(&up.name)
                 {
                     if length == 1 {
                         self.emit_unicode_property(up.negated, &up.name, up.value.as_deref());
@@ -1287,9 +1517,7 @@ impl Compiler {
                             self.emit(Instruction::Fail);
                             return;
                         }
-                        self.emit_split_chain(&strings, |s, string| {
-                            s.emit_code_point_string(string)
-                        });
+                        self.emit_split_chain(&strings, |s, string| s.emit_code_point_string(string));
                     }
                     return;
                 }

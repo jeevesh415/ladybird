@@ -5,7 +5,7 @@
  */
 
 #include <AK/ScopeGuard.h>
-#include <LibWeb/Bindings/HTMLLabelElementPrototype.h>
+#include <LibWeb/Bindings/HTMLLabelElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
@@ -86,7 +86,7 @@ void HTMLLabelElement::activation_behavior(DOM::Event const& event)
         document().update_layout(DOM::UpdateLayoutReason::HTMLLabelElementActivationBehavior);
 
         // Recompute offsetX/offsetY relative to the control element, since the original values are relative to the label.
-        if (auto const* paintable = control_element->paintable(); paintable && document().navigable()) {
+        if (auto paintable = control_element->paintable(); paintable && document().navigable()) {
             auto scroll_offset = document().navigable()->viewport_scroll_offset();
             auto page_position = CSSPixelPoint { CSSPixels(mouse_event.client_x()) + scroll_offset.x(), CSSPixels(mouse_event.client_y()) + scroll_offset.y() };
             auto box_position = paintable->box_type_agnostic_position();

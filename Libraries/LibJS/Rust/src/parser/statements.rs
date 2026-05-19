@@ -6,8 +6,7 @@
 
 //! Statement parsing: if, for, while, switch, try, etc.
 
-use std::collections::HashSet;
-use std::rc::Rc;
+use crate::fast_hash::HashSet;
 
 use crate::ast::*;
 use crate::parser::{Associativity, ForbiddenTokens, PRECEDENCE_COMMA, Parser, Position};
@@ -58,8 +57,7 @@ impl Parser<'_> {
                     self.syntax_error("Keyword must not contain escaped characters");
                 }
                 if self.match_identifier_name()
-                    && let Some(labelled) =
-                        self.try_parse_labelled_statement(allow_labelled_function)
+                    && let Some(labelled) = self.try_parse_labelled_statement(allow_labelled_function)
                 {
                     return labelled;
                 }
@@ -91,8 +89,8 @@ impl Parser<'_> {
         }
 
         self.consume_token(TokenType::CurlyClose);
-        let scope = ScopeData::shared_with_children(children);
-        self.scope_collector.set_scope_node(scope.clone());
+        let scope = self.make_scope(children);
+        self.scope_collector.set_scope_node(scope);
         self.scope_collector.close_scope();
         self.statement(start, StatementKind::Block(scope))
     }
@@ -102,20 +100,13 @@ impl Parser<'_> {
 
         if self.match_token(TokenType::Async) {
             let lookahead = self.next_token();
-            if lookahead.token_type == TokenType::Function && !lookahead.trivia_has_line_terminator
-            {
-                self.syntax_error(
-                    "Async function declaration not allowed in single-statement context",
-                );
+            if lookahead.token_type == TokenType::Function && !lookahead.trivia_has_line_terminator {
+                self.syntax_error("Async function declaration not allowed in single-statement context");
             }
         } else if self.match_token(TokenType::Function) || self.match_token(TokenType::Class) {
             let name = self.current_token.token_type.name();
-            self.syntax_error(&format!(
-                "{name} declaration not allowed in single-statement context"
-            ));
-        } else if self.match_token(TokenType::Let)
-            && self.next_token().token_type == TokenType::BracketOpen
-        {
+            self.syntax_error(&format!("{name} declaration not allowed in single-statement context"));
+        } else if self.match_token(TokenType::Let) && self.next_token().token_type == TokenType::BracketOpen {
             self.syntax_error("let followed by [ is not allowed in single-statement context");
         }
 
@@ -140,10 +131,7 @@ impl Parser<'_> {
         if self.current_token.trivia_has_line_terminator {
             return self.statement(start, StatementKind::Return(None));
         }
-        if self.match_token(TokenType::Semicolon)
-            || self.match_token(TokenType::CurlyClose)
-            || self.done()
-        {
+        if self.match_token(TokenType::Semicolon) || self.match_token(TokenType::CurlyClose) || self.done() {
             self.consume_or_insert_semicolon();
             return self.statement(start, StatementKind::Return(None));
         }
@@ -200,17 +188,10 @@ impl Parser<'_> {
         };
 
         if label.is_none() && !self.flags.in_break_context {
-            self.syntax_error(
-                "Unlabeled 'break' not allowed outside of a loop or switch statement",
-            );
+            self.syntax_error("Unlabeled 'break' not allowed outside of a loop or switch statement");
         }
 
-        self.statement(
-            start,
-            StatementKind::Break {
-                target_label: label,
-            },
-        )
+        self.statement(start, StatementKind::Break { target_label: label })
     }
 
     // https://tc39.es/ecma262/#sec-continue-statement
@@ -248,12 +229,7 @@ impl Parser<'_> {
 
         self.consume_or_insert_semicolon();
 
-        self.statement(
-            start,
-            StatementKind::Continue {
-                target_label: label,
-            },
-        )
+        self.statement(start, StatementKind::Continue { target_label: label })
     }
 
     fn parse_debugger_statement(&mut self) -> Statement {
@@ -288,9 +264,7 @@ impl Parser<'_> {
                 && self.match_token(TokenType::Function)
                 && self.next_token().token_type != TokenType::Asterisk
             {
-                Some(Box::new(
-                    self.parse_function_declaration_as_block_statement(start),
-                ))
+                Some(Box::new(self.parse_function_declaration_as_block_statement(start)))
             } else {
                 Some(Box::new(self.parse_statement(false)))
             }
@@ -315,8 +289,8 @@ impl Parser<'_> {
         let start = if_start;
         self.scope_collector.open_block_scope(None);
         let declaration = self.parse_function_declaration();
-        let scope = ScopeData::shared_with_children(vec![declaration]);
-        self.scope_collector.set_scope_node(scope.clone());
+        let scope = self.make_scope(vec![declaration]);
+        self.scope_collector.set_scope_node(scope);
         self.scope_collector.close_scope();
         self.statement(start, StatementKind::Block(scope))
     }
@@ -407,21 +381,15 @@ impl Parser<'_> {
         let init_starts_with_async_keyword = self.match_token(TokenType::Async);
         let is_var_init = self.match_token(TokenType::Var);
         let is_using = self.match_for_using_declaration();
-        let is_let = self.match_token(TokenType::Let)
-            && (self.flags.strict_mode || self.try_match_let_declaration());
-        let is_declaration =
-            is_var_init || is_using || is_let || self.match_token(TokenType::Const);
+        let is_let = self.match_token(TokenType::Let) && (self.flags.strict_mode || self.try_match_let_declaration());
+        let is_declaration = is_var_init || is_using || is_let || self.match_token(TokenType::Const);
         let init = if is_using {
             LocalForInit::Declaration(self.parse_using_declaration(true))
         } else if is_declaration {
             LocalForInit::Declaration(self.parse_variable_declaration(true))
         } else {
             let forbidden = ForbiddenTokens::with_in();
-            LocalForInit::Expression(self.parse_expression(
-                PRECEDENCE_COMMA,
-                Associativity::Right,
-                forbidden,
-            ))
+            LocalForInit::Expression(self.parse_expression(PRECEDENCE_COMMA, Associativity::Right, forbidden))
         };
 
         // Check for in
@@ -494,18 +462,16 @@ impl Parser<'_> {
                     // are still valid here.
                     if init_starts_with_async_keyword
                         && let LocalForInit::Expression(ref expression) = init
-                        && let ExpressionKind::Identifier(ref ident) = expression.inner
-                        && ident.name == utf16!("async")
+                        && let ExpressionKind::Identifier(ident) = expression.inner
+                        && self.arena.name_of(ident).as_slice() == utf16!("async")
                     {
-                        self.syntax_error(
-                            "for-of statement may not use 'async' as the left-hand side",
-                        );
+                        self.syntax_error("for-of statement may not use 'async' as the left-hand side");
                     }
                     // https://tc39.es/ecma262/#sec-for-in-and-for-of-statements
                     if let LocalForInit::Expression(ref expression) = init
                         && let ExpressionKind::Member(ref data) = expression.inner
-                        && let ExpressionKind::Identifier(ref ident) = data.object.inner
-                        && ident.name == utf16!("let")
+                        && let ExpressionKind::Identifier(ident) = data.object.inner
+                        && self.arena.name_of(ident).as_slice() == utf16!("let")
                     {
                         self.syntax_error("For of statement may not start with let.");
                     }
@@ -548,9 +514,7 @@ impl Parser<'_> {
         }
         self.consume_token(TokenType::Semicolon);
         let for_init = match init {
-            LocalForInit::Declaration(declaration) => {
-                Some(ForInit::Declaration(Box::new(declaration)))
-            }
+            LocalForInit::Declaration(declaration) => Some(ForInit::Declaration(Box::new(declaration))),
             LocalForInit::Expression(expression) => Some(ForInit::Expression(Box::new(expression))),
         };
         let result = self.parse_standard_for_loop(start, for_init);
@@ -560,8 +524,8 @@ impl Parser<'_> {
     /// Close the for-loop scope and wrap the for-loop statement in a Block
     /// with scope data.
     fn close_for_loop_scope(&mut self, start: Position, inner: Statement) -> Statement {
-        let scope = ScopeData::shared_with_children(vec![inner]);
-        self.scope_collector.set_scope_node(scope.clone());
+        let scope = self.make_scope(vec![inner]);
+        self.scope_collector.set_scope_node(scope);
         self.scope_collector.close_scope();
         self.statement(start, StatementKind::Block(scope))
     }
@@ -647,8 +611,8 @@ impl Parser<'_> {
 
         self.consume_token(TokenType::CurlyClose);
 
-        let scope = ScopeData::new_shared();
-        self.scope_collector.set_scope_node(scope.clone());
+        let scope = self.make_empty_scope();
+        self.scope_collector.set_scope_node(scope);
         self.scope_collector.close_scope();
 
         self.statement(
@@ -691,7 +655,7 @@ impl Parser<'_> {
 
         SwitchCase {
             range: self.range_from(start),
-            scope: ScopeData::shared_with_children(children),
+            scope: self.make_scope(children),
             test,
         }
     }
@@ -746,44 +710,46 @@ impl Parser<'_> {
 
         let parameter = if self.match_token(TokenType::ParenOpen) {
             self.consume();
-            let parameter = if self.match_token(TokenType::CurlyOpen)
-                || self.match_token(TokenType::BracketOpen)
-            {
+            let parameter = if self.match_token(TokenType::CurlyOpen) || self.match_token(TokenType::BracketOpen) {
                 self.pattern_bound_names.clear();
                 let pattern = self.parse_binding_pattern();
-                let names_to_check: Vec<SharedUtf16String> = self
+                // Materialize Utf16Strings for slice-based scope-collector calls.
+                let names_to_check: Vec<Utf16String> = self
                     .pattern_bound_names
                     .iter()
-                    .map(|(n, _)| n.clone())
+                    .map(|(n, _)| self.arena.strings[*n].clone())
                     .collect();
                 // https://tc39.es/ecma262/#sec-try-statement-static-semantics-early-errors
                 // It is a Syntax Error if BoundNames of CatchParameter
                 // contains any duplicate elements.
                 {
-                    let mut seen: HashSet<&[u16]> = HashSet::new();
+                    let mut seen: HashSet<&[u16]> = HashSet::default();
                     for name in &names_to_check {
                         if !seen.insert(name.as_slice()) {
                             let name_str = String::from_utf16_lossy(name);
-                            self.syntax_error(&format!(
-                                "Duplicate binding '{name_str}' in catch parameter"
-                            ));
+                            self.syntax_error(&format!("Duplicate binding '{name_str}' in catch parameter"));
                         }
                     }
                 }
                 for name in &names_to_check {
-                    self.check_identifier_name_for_assignment_validity(name, false);
+                    self.check_identifier_name_for_assignment_validity(name.as_slice(), false);
                 }
-                let bound_names: Vec<&[u16]> = self
-                    .pattern_bound_names
-                    .iter()
-                    .map(|(n, _)| n.as_slice())
-                    .collect();
-                self.scope_collector
-                    .add_catch_parameter_pattern(&bound_names);
+                let bound_names: Vec<&[u16]> = names_to_check.iter().map(|n| n.as_slice()).collect();
+                self.scope_collector.add_catch_parameter_pattern(&bound_names);
                 // Register each binding pattern identifier for scope analysis
                 // so they get is_local() annotations (matching variable declarations).
-                for (_name, id) in &self.pattern_bound_names {
-                    self.scope_collector.register_identifier(id.clone(), None);
+                let pattern_bound_ids: Vec<IdentifierId> = self.pattern_bound_names.iter().map(|(_, id)| *id).collect();
+                let Self {
+                    scope_collector, arena, ..
+                } = self;
+                for id in pattern_bound_ids {
+                    scope_collector.register_identifier(
+                        id,
+                        None,
+                        &mut arena.identifiers,
+                        &arena.strings,
+                        &mut arena.scopes,
+                    );
                 }
                 Some(CatchBinding::BindingPattern(pattern))
             } else if self.match_identifier() {
@@ -791,13 +757,22 @@ impl Parser<'_> {
                 let token = self.consume();
                 let value = self.token_value(&token).to_vec();
                 self.check_identifier_name_for_assignment_validity(&value, false);
-                let id = Rc::new(Identifier::new(
-                    self.range_from(parameter_start),
-                    self.token_identifier_name(&token),
-                ));
-                self.scope_collector.register_identifier(id.clone(), None);
-                self.scope_collector
-                    .add_catch_parameter_identifier(&value, id.clone());
+                let name = self.token_identifier_name(&token);
+                let id = self
+                    .arena
+                    .identifiers
+                    .insert(Identifier::new(self.range_from(parameter_start), name));
+                let Self {
+                    scope_collector, arena, ..
+                } = self;
+                scope_collector.register_identifier(
+                    id,
+                    None,
+                    &mut arena.identifiers,
+                    &arena.strings,
+                    &mut arena.scopes,
+                );
+                scope_collector.add_catch_parameter_identifier(&value, id);
                 Some(CatchBinding::Identifier(id))
             } else {
                 self.expected("catch parameter");
@@ -809,14 +784,10 @@ impl Parser<'_> {
             None
         };
 
-        // Collect catch parameter names for post-body validation.
-        let catch_names: Vec<SharedUtf16String> = match &parameter {
-            Some(CatchBinding::Identifier(id)) => vec![id.name.clone()],
-            Some(CatchBinding::BindingPattern(_)) => self
-                .pattern_bound_names
-                .iter()
-                .map(|(n, _)| n.clone())
-                .collect(),
+        // Collect catch parameter names (as StringIds) for post-body validation.
+        let catch_names: Vec<StringId> = match &parameter {
+            Some(CatchBinding::Identifier(id)) => vec![self.arena.identifiers[*id].name],
+            Some(CatchBinding::BindingPattern(_)) => self.pattern_bound_names.iter().map(|(n, _)| *n).collect(),
             None => Vec::new(),
         };
 
@@ -826,16 +797,17 @@ impl Parser<'_> {
         // It is a Syntax Error if any element of the BoundNames of
         // CatchParameter also occurs in the LexicallyDeclaredNames of Block.
         if !catch_names.is_empty()
-            && let StatementKind::Block(ref scope) = body.inner
+            && let StatementKind::Block(scope_id) = body.inner
         {
-            for child in &scope.borrow().children {
+            for child in &self.arena.scopes[scope_id].children.clone() {
                 match &child.inner {
                     StatementKind::VariableDeclaration(vd) if vd.kind != DeclarationKind::Var => {
                         for decl in &vd.declarations {
-                            if let VariableDeclaratorTarget::Identifier(ref id) = decl.target {
+                            if let VariableDeclaratorTarget::Identifier(id) = decl.target {
+                                let id_name = self.arena.identifiers[id].name;
                                 for cn in &catch_names {
-                                    if cn.as_slice() == id.name.as_slice() {
-                                        let n = String::from_utf16_lossy(cn);
+                                    if *cn == id_name {
+                                        let n = String::from_utf16_lossy(self.arena.strings[*cn].as_slice());
                                         self.syntax_error(&format!(
                                             "Identifier '{n}' already declared as catch parameter"
                                         ));
@@ -845,24 +817,22 @@ impl Parser<'_> {
                         }
                     }
                     StatementKind::FunctionDeclaration(fd) if fd.name.is_some() => {
-                        let id = fd.name.as_ref().unwrap();
+                        let id = fd.name.unwrap();
+                        let id_name = self.arena.identifiers[id].name;
                         for cn in &catch_names {
-                            if cn.as_slice() == id.name.as_slice() {
-                                let n = String::from_utf16_lossy(cn);
-                                self.syntax_error(&format!(
-                                    "Identifier '{n}' already declared as catch parameter"
-                                ));
+                            if *cn == id_name {
+                                let n = String::from_utf16_lossy(self.arena.strings[*cn].as_slice());
+                                self.syntax_error(&format!("Identifier '{n}' already declared as catch parameter"));
                             }
                         }
                     }
                     StatementKind::ClassDeclaration(data) => {
-                        if let Some(ref id) = data.name {
+                        if let Some(id) = data.name {
+                            let id_name = self.arena.identifiers[id].name;
                             for cn in &catch_names {
-                                if cn.as_slice() == id.name.as_slice() {
-                                    let n = String::from_utf16_lossy(cn);
-                                    self.syntax_error(&format!(
-                                        "Identifier '{n}' already declared as catch parameter"
-                                    ));
+                                if *cn == id_name {
+                                    let n = String::from_utf16_lossy(self.arena.strings[*cn].as_slice());
+                                    self.syntax_error(&format!("Identifier '{n}' already declared as catch parameter"));
                                 }
                             }
                         }
@@ -906,14 +876,11 @@ impl Parser<'_> {
         // https://tc39.es/ecma262/#sec-labelled-statements
         // LabelIdentifier : Identifier (not ReservedWord)
         // `true`, `false`, and `null` are reserved words and cannot be labels.
-        if token.token_type == TokenType::BoolLiteral || token.token_type == TokenType::NullLiteral
-        {
+        if token.token_type == TokenType::BoolLiteral || token.token_type == TokenType::NullLiteral {
             self.syntax_error("Reserved word cannot be used as a label");
         }
 
-        if self.flags.strict_mode
-            && (label == utf16!("let") || crate::parser::is_strict_reserved_word(&label))
-        {
+        if self.flags.strict_mode && (label == utf16!("let") || crate::parser::is_strict_reserved_word(&label)) {
             self.syntax_error("Strict mode reserved word is not allowed in label");
         }
         if self.flags.in_generator_function_context && label == utf16!("yield") {
@@ -932,9 +899,7 @@ impl Parser<'_> {
             self.syntax_error(&format!("Label '{label_str}' has already been declared"));
         }
 
-        if self.match_token(TokenType::Function)
-            && (!allow_labelled_function || self.flags.strict_mode)
-        {
+        if self.match_token(TokenType::Function) && (!allow_labelled_function || self.flags.strict_mode) {
             self.syntax_error("Not allowed to declare a function here");
         }
         if self.match_token(TokenType::Async) {
@@ -956,14 +921,10 @@ impl Parser<'_> {
             if let StatementKind::FunctionDeclaration(ref fd) = fn_decl.inner {
                 match fd.kind {
                     FunctionKind::Generator | FunctionKind::AsyncGenerator => {
-                        self.syntax_error(
-                            "Generator functions cannot be defined in labelled statements",
-                        );
+                        self.syntax_error("Generator functions cannot be defined in labelled statements");
                     }
                     FunctionKind::Async => {
-                        self.syntax_error(
-                            "Async functions cannot be defined in labelled statements",
-                        );
+                        self.syntax_error("Async functions cannot be defined in labelled statements");
                     }
                     _ => {}
                 }
@@ -974,8 +935,7 @@ impl Parser<'_> {
         };
 
         let is_iteration = body_starts_iteration || self.last_inner_label_is_iteration;
-        if !is_iteration && let Some(Some((line, col))) = self.labels_in_scope.get(label.as_slice())
-        {
+        if !is_iteration && let Some(Some((line, col))) = self.labels_in_scope.get(label.as_slice()) {
             self.syntax_error_at(
                 "labelled continue statement cannot use non iterating statement",
                 *line,
@@ -1046,18 +1006,27 @@ impl Parser<'_> {
     /// pattern when the LHS is an array or object expression.
     fn synthesize_for_in_of_lhs(&mut self, init: LocalForInit, init_start: Position) -> ForInOfLhs {
         match init {
-            LocalForInit::Declaration(declaration) => {
-                ForInOfLhs::Declaration(Box::new(declaration))
-            }
+            LocalForInit::Declaration(declaration) => ForInOfLhs::Declaration(Box::new(declaration)),
             LocalForInit::Expression(expression) => {
-                if Self::is_array_expression(&expression) || Self::is_object_expression(&expression)
-                {
+                if Self::is_array_expression(&expression) || Self::is_object_expression(&expression) {
                     let pattern = self.synthesize_binding_pattern(init_start);
 
                     let bound_names: Vec<_> = self.pattern_bound_names.drain(..).collect();
-                    for (name, id) in &bound_names {
-                        self.check_identifier_name_for_assignment_validity(name, false);
-                        self.scope_collector.register_identifier(id.clone(), None);
+                    for (name, _id) in &bound_names {
+                        let name_str = self.arena.strings[*name].clone();
+                        self.check_identifier_name_for_assignment_validity(name_str.as_slice(), false);
+                    }
+                    let Self {
+                        scope_collector, arena, ..
+                    } = self;
+                    for (_name, id) in &bound_names {
+                        scope_collector.register_identifier(
+                            *id,
+                            None,
+                            &mut arena.identifiers,
+                            &arena.strings,
+                            &mut arena.scopes,
+                        );
                     }
                     ForInOfLhs::Pattern(pattern)
                 } else {

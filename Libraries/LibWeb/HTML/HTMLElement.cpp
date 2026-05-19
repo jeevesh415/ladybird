@@ -9,7 +9,7 @@
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibWeb/ARIA/Roles.h>
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/HTMLElementPrototype.h>
+#include <LibWeb/Bindings/HTMLElement.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/Document.h>
@@ -73,7 +73,7 @@ void HTMLElement::initialize(JS::Realm& realm)
 void HTMLElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    HTMLOrSVGElement::visit_edges(visitor);
+    HTMLOrSVGOrMathMLElement::visit_edges(visitor);
     FormAssociatedElement::visit_edges(visitor);
     visitor.visit(m_labels);
     visitor.visit(m_attached_internals);
@@ -676,7 +676,7 @@ int HTMLElement::offset_width() const
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetWidth);
 
     // 1. If the element does not have any associated box return zero and terminate this algorithm.
-    auto const* box = paintable_box();
+    auto box = paintable_box();
     if (!box)
         return 0;
 
@@ -695,7 +695,7 @@ int HTMLElement::offset_height() const
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetHeight);
 
     // 1. If the element does not have any associated box return zero and terminate this algorithm.
-    auto const* box = paintable_box();
+    auto box = paintable_box();
     if (!box)
         return 0;
 
@@ -710,7 +710,7 @@ int HTMLElement::offset_height() const
 void HTMLElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
-    HTMLOrSVGElement::attribute_changed(name, old_value, value, namespace_);
+    HTMLOrSVGOrMathMLElement::attribute_changed(name, old_value, value, namespace_);
 
     if (name == HTML::AttributeNames::contenteditable) {
         if (!value.has_value()) {
@@ -793,14 +793,14 @@ void HTMLElement::set_subtree_inertness(bool is_inert)
 WebIDL::ExceptionOr<void> HTMLElement::cloned(Web::DOM::Node& copy, bool clone_children) const
 {
     TRY(Base::cloned(copy, clone_children));
-    TRY(HTMLOrSVGElement::cloned(copy, clone_children));
+    TRY(HTMLOrSVGOrMathMLElement::cloned(copy, clone_children));
     return {};
 }
 
 void HTMLElement::inserted()
 {
     Base::inserted();
-    HTMLOrSVGElement::inserted();
+    HTMLOrSVGOrMathMLElement::inserted();
 
     if (auto* parent_html_element = first_ancestor_of_type<HTMLElement>(); parent_html_element && parent_html_element->is_inert() && !has_attribute(HTML::AttributeNames::inert))
         set_subtree_inertness(true);
@@ -1197,10 +1197,10 @@ WebIDL::ExceptionOr<bool> HTMLElement::check_popover_validity(ExpectedToBeShowin
 }
 
 // https://html.spec.whatwg.org/multipage/popover.html#dom-showpopover
-WebIDL::ExceptionOr<void> HTMLElement::show_popover_for_bindings(ShowPopoverOptions const& options)
+WebIDL::ExceptionOr<void> HTMLElement::show_popover_for_bindings(Bindings::ShowPopoverOptions const& options)
 {
     // 1. Let source be options["source"] if it exists; otherwise, null.
-    auto source = options.source;
+    auto source = options.source.has_value() ? GC::Ptr<HTMLElement> { options.source->ptr() } : GC::Ptr<HTMLElement> {};
     // 2. Run show popover given this, true, and source.
     return show_popover(ThrowExceptions::Yes, source);
 }
@@ -1242,11 +1242,11 @@ WebIDL::ExceptionOr<void> HTMLElement::show_popover(ThrowExceptions throw_except
     //    initialized to true, the oldState attribute initialized to "closed", the newState attribute initialized to
     //    "open" at element, and the source attribute initialized to source at element is false,
     //    then run cleanupShowingFlag and return.
-    ToggleEventInit event_init {};
+    Bindings::ToggleEventInit event_init {};
     event_init.old_state = "closed"_string;
     event_init.new_state = "open"_string;
     event_init.cancelable = true;
-    event_init.source = source;
+    event_init.source = GC::make_root<DOM::Element>(source.ptr());
     if (!dispatch_event(ToggleEvent::create(realm(), HTML::EventNames::beforetoggle, move(event_init)))) {
         cleanup_showing_flag();
         return {};
@@ -1482,10 +1482,10 @@ WebIDL::ExceptionOr<void> HTMLElement::hide_popover(FocusPreviousElement focus_p
     if (fire_events == FireEvents::Yes) {
         // 1. Fire an event named beforetoggle, using ToggleEvent, with the oldState attribute initialized to "open",
         //    the newState attribute initialized to "closed", and the source attribute set to source at element.
-        ToggleEventInit event_init {};
+        Bindings::ToggleEventInit event_init {};
         event_init.old_state = "open"_string;
         event_init.new_state = "closed"_string;
-        event_init.source = source;
+        event_init.source = GC::make_root<DOM::Element>(source.ptr());
         dispatch_event(ToggleEvent::create(realm(), HTML::EventNames::beforetoggle, move(event_init)));
 
         // 2. If autoPopoverListContainsElement is true and document's showing auto popover list's last item is not
@@ -1570,11 +1570,12 @@ WebIDL::ExceptionOr<bool> HTMLElement::toggle_popover(TogglePopoverOptionsOrForc
         [&force](bool forceBool) {
             force = forceBool;
         },
-        [&force, &source](TogglePopoverOptions options) {
+        [&force, &source](Bindings::TogglePopoverOptions options) {
             // 3. Otherwise, if options["force"] exists, set force to options["force"].
             force = options.force;
             // 4. Let source be options["source"] if it exists; otherwise, null.
-            source = options.source;
+            if (options.source.has_value())
+                source = options.source->ptr();
         });
 
     // 5. If this's popover visibility state is showing, and force is null or false, then run the hide popover algorithm given this, true, true, true, false, and null.
@@ -1883,10 +1884,10 @@ void HTMLElement::queue_a_popover_toggle_event_task(String old_state, String new
     auto task_id = queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, old_state, new_state = move(new_state), source]() mutable {
         // 1. Fire an event named toggle at element, using ToggleEvent, with the oldState attribute initialized to
         //    oldState, the newState attribute initialized to newState, and the source attribute initialized to source.
-        ToggleEventInit event_init {};
+        Bindings::ToggleEventInit event_init {};
         event_init.old_state = move(old_state);
         event_init.new_state = move(new_state);
-        event_init.source = source;
+        event_init.source = GC::make_root<DOM::Element>(source.ptr());
 
         dispatch_event(ToggleEvent::create(realm(), HTML::EventNames::toggle, move(event_init)));
 
@@ -2039,36 +2040,59 @@ void HTMLElement::did_lose_focus()
     document().editing_host_manager()->set_active_contenteditable_element(nullptr);
 }
 
-void HTMLElement::removed_from(Node* old_parent, Node& old_root)
+// https://html.spec.whatwg.org/multipage/infrastructure.html#dom-trees:concept-node-remove-ext
+void HTMLElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, Node& old_root)
 {
-    Element::removed_from(old_parent, old_root);
+    Element::removed_from(is_subtree_root, old_ancestor, old_root);
 
-    // https://html.spec.whatwg.org/multipage/infrastructure.html#dom-trees:concept-node-remove-ext
-    // If removedNode's popover attribute is not in the No Popover state, then run the hide popover algorithm given removedNode, false, false, false, true, and null.
+    // FIXME: 1. Let document be removedNode's node document.
+    // FIXME: 2. If document's focused area is removedNode, then set document's focused area to document's viewport,
+    //   and set document's relevant global object's navigation API's focus changed during ongoing navigation to false.
+
+    // 3. If removedNode is an element whose namespace is the HTML namespace, and this standard defines HTML element
+    //    removing steps for removedNode's local name, then run the corresponding HTML element removing steps given
+    //    removedNode, isSubtreeRoot, and oldAncestor.
+    // NB: This is done by overriding removed_from() in subclasses.
+
+    // 4. If removedNode is a form-associated element with a non-null form owner and removedNode and its form owner are
+    //    no longer in the same tree, then reset the form owner of removedNode.
+    // FIXME: Follow the spec here.
+    if (is_form_associated_element()) {
+        form_node_was_removed();
+        form_associated_element_was_removed(old_ancestor);
+    }
+
+    // 5. If removedNode's popover attribute is not in the No Popover state, then run the hide popover algorithm given
+    //    removedNode, false, false, false, true, and null.
     if (popover().has_value())
         MUST(hide_popover(FocusPreviousElement::No, FireEvents::No, ThrowExceptions::No, IgnoreDomState::Yes, nullptr));
 
-    if (old_parent) {
-        auto* parent_html_element = as_if<HTMLElement>(old_parent);
+    // AD-HOC: Update inertness
+    if (old_ancestor) {
+        auto* parent_html_element = as_if<HTMLElement>(old_ancestor);
         if (!parent_html_element)
-            parent_html_element = old_parent->first_ancestor_of_type<HTMLElement>();
+            parent_html_element = old_ancestor->first_ancestor_of_type<HTMLElement>();
         if (parent_html_element && parent_html_element->is_inert() && !has_attribute(HTML::AttributeNames::inert))
             set_subtree_inertness(false);
     }
-
-    if (is_form_associated_element()) {
-        form_node_was_removed();
-        form_associated_element_was_removed(old_parent);
-    }
 }
 
-void HTMLElement::moved_from(GC::Ptr<DOM::Node> old_parent)
+// https://html.spec.whatwg.org/multipage/infrastructure.html#dom-trees:concept-node-move-ext
+void HTMLElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<DOM::Node> old_ancestor)
 {
-    Element::moved_from(old_parent);
+    Element::moved_from(is_subtree_root, old_ancestor);
 
+    // 1. If movedNode is an element whose namespace is the HTML namespace, and this standard defines HTML element
+    //    moving steps for movedNode's local name, then run the corresponding HTML element moving steps given
+    //    movedNode, isSubtreeRoot, and oldAncestor.
+    // NB: This is done by overriding moved_from() in subclasses.
+
+    // 2. If movedNode is a form-associated element with a non-null form owner and movedNode and its form owner are no
+    //    longer in the same tree, then reset the form owner of movedNode.
+    // FIXME: Follow the spec here.
     if (is_form_associated_element()) {
         form_node_was_moved();
-        form_associated_element_was_moved(old_parent);
+        form_associated_element_was_moved(old_ancestor);
     }
 }
 

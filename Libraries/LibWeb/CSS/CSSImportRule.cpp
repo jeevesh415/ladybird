@@ -10,7 +10,7 @@
 #include <AK/Debug.h>
 #include <AK/ScopeGuard.h>
 #include <LibTextCodec/Decoder.h>
-#include <LibWeb/Bindings/CSSImportRulePrototype.h>
+#include <LibWeb/Bindings/CSSImportRule.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSImportRule.h>
 #include <LibWeb/CSS/CSSLayerBlockRule.h>
@@ -164,7 +164,7 @@ void CSSImportRule::fetch()
             };
 
             // 1. If byteStream is not a byte stream, return.
-            auto byte_stream = maybe_byte_stream.template get_pointer<ByteBuffer>();
+            auto byte_stream = maybe_byte_stream.template get_pointer<Core::ImmutableBytes>();
             if (!byte_stream) {
                 // AD-HOC: This means the fetch failed, so we should report this as a load failure.
                 strong_this->set_loading_state(CSSStyleSheet::LoadingState::Error);
@@ -195,7 +195,7 @@ void CSSImportRule::fetch()
             // The environment encoding of an imported style sheet is the encoding of the style sheet that imported it. [css-syntax-3]
             // FIXME: Save encoding on Stylesheet to get it here
             Optional<StringView> environment_encoding;
-            auto decoded_or_error = css_decode_bytes(environment_encoding, mime_type_charset, *byte_stream);
+            auto decoded_or_error = css_decode_bytes(environment_encoding, mime_type_charset, byte_stream->bytes());
             if (decoded_or_error.is_error()) {
                 dbgln_if(CSS_LOADER_DEBUG, "CSSImportRule: Failed to decode CSS file: {}", url);
                 return;

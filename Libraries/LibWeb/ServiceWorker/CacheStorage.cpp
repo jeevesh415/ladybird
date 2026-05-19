@@ -6,7 +6,7 @@
  */
 
 #include <LibJS/Runtime/Array.h>
-#include <LibWeb/Bindings/CacheStoragePrototype.h>
+#include <LibWeb/Bindings/CacheStorage.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -35,7 +35,7 @@ void CacheStorage::visit_edges(Visitor& visitor)
 }
 
 // https://w3c.github.io/ServiceWorker/#cache-storage-match
-GC::Ref<WebIDL::Promise> CacheStorage::match(Fetch::RequestInfo request, MultiCacheQueryOptions options)
+GC::Ref<WebIDL::Promise> CacheStorage::match(Fetch::RequestInfo request, Bindings::MultiCacheQueryOptions options)
 {
     auto& realm = HTML::relevant_realm(*this);
 

@@ -124,9 +124,7 @@ pub fn field_type_info(ty: &str) -> FieldType {
         "Label" => ("Label", 4, 4, "label"),
         "Optional<Label>" => ("Option<Label>", 4, 8, "optional_label"),
         "IdentifierTableIndex" => ("IdentifierTableIndex", 4, 4, "u32_newtype"),
-        "Optional<IdentifierTableIndex>" => {
-            ("Option<IdentifierTableIndex>", 4, 4, "optional_u32_newtype")
-        }
+        "Optional<IdentifierTableIndex>" => ("Option<IdentifierTableIndex>", 4, 4, "optional_u32_newtype"),
         "PropertyKeyTableIndex" => ("PropertyKeyTableIndex", 4, 4, "u32_newtype"),
         "StringTableIndex" => ("StringTableIndex", 4, 4, "u32_newtype"),
         "Optional<StringTableIndex>" => ("Option<StringTableIndex>", 4, 4, "optional_u32_newtype"),
@@ -139,12 +137,12 @@ pub fn field_type_info(ty: &str) -> FieldType {
         "PutKind" => ("u32", 4, 4, "u32"),
         "ArgumentsKind" => ("u32", 4, 4, "u32"),
         "Value" => ("u64", 8, 8, "u64"),
-        // Cache pointer types: stored as u64, fixup pass replaces indices with pointers.
-        "PropertyLookupCache*"
-        | "GlobalVariableCache*"
-        | "TemplateObjectCache*"
-        | "ObjectShapeCache*"
-        | "ObjectPropertyIteratorCache*" => ("u64", 8, 8, "u64"),
+        "PropertyLookupCacheIndex"
+        | "GlobalVariableCacheIndex"
+        | "EnvironmentCoordinateCacheIndex"
+        | "TemplateObjectCacheIndex"
+        | "ObjectShapeCacheIndex"
+        | "ObjectPropertyIteratorCacheIndex" => ("u32", 4, 4, "u32"),
         _ => unreachable!("Unknown field type: {ty}"),
     }
     .into()
@@ -211,14 +209,16 @@ pub fn compute_layouts(ops: &[OpDef]) -> HashMap<String, OpLayout> {
             offset += info.size;
         }
 
-        // Array fields start at sizeof(*this), which is the fixed part rounded up
+        // Flexible array members start after the fixed fields with only the
+        // element's alignment. This can be before the struct's final tail
+        // padding on targets like MSVC.
         if has_array {
-            let sizeof_this = round_up(offset, STRUCT_ALIGN);
             for f in &op.fields {
                 if !f.is_array {
                     continue;
                 }
-                field_offsets.insert(f.name.clone(), sizeof_this);
+                let info = field_type_info(&f.ty);
+                field_offsets.insert(f.name.clone(), round_up(offset, info.align));
             }
         }
 
@@ -228,13 +228,7 @@ pub fn compute_layouts(ops: &[OpDef]) -> HashMap<String, OpLayout> {
             Some(round_up(offset, STRUCT_ALIGN))
         };
 
-        result.insert(
-            op.name.clone(),
-            OpLayout {
-                field_offsets,
-                size,
-            },
-        );
+        result.insert(op.name.clone(), OpLayout { field_offsets, size });
     }
 
     result

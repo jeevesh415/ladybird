@@ -79,6 +79,8 @@ public:
 
     void load(URL::URL const&);
     void load_html(StringView);
+    void load_navigation_error_page(StringView);
+
     void reload();
     void traverse_the_history_by_delta(int delta);
 
@@ -102,6 +104,7 @@ public:
     Optional<Core::SharedVersion> document_cookie_version(URL::URL const&) const;
 
     ByteString selected_text();
+    ByteString cut_selected_text();
     Optional<String> selected_text_with_whitespace_collapsed();
     void select_all();
     void find_in_page(String const& query, CaseSensitivity = CaseSensitivity::CaseInsensitive);
@@ -262,7 +265,7 @@ public:
     Menu& image_context_menu() { return *m_image_context_menu; }
     Menu& media_context_menu() { return *m_media_context_menu; }
 
-    void did_request_page_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position);
+    void did_request_page_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target);
     void did_request_link_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position, URL::URL url);
     void did_request_image_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position, URL::URL url, Optional<Gfx::ShareableBitmap> bitmap);
     void did_request_media_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position, Web::Page::MediaContextMenu menu);
@@ -290,6 +293,8 @@ protected:
     void set_url(URL::URL);
 
     virtual void update_zoom();
+    String current_host() const;
+    void apply_zoom_for_current_host();
 
     void handle_resize();
 
@@ -306,6 +311,7 @@ protected:
     void handle_web_content_process_crash(LoadErrorPage = LoadErrorPage::Yes);
 
     virtual void default_zoom_level_factor_changed() override;
+    virtual void zoom_per_host_changed(StringView host) override;
     virtual void languages_changed() override;
     virtual void browsing_behavior_changed() override;
     virtual void autoplay_settings_changed() override;
@@ -358,6 +364,7 @@ protected:
     RefPtr<Action> m_take_full_screenshot_action;
 
     RefPtr<Action> m_open_in_new_tab_action;
+    RefPtr<Action> m_open_in_new_window_action;
     RefPtr<Action> m_copy_url_action;
     URL::URL m_context_menu_url;
 

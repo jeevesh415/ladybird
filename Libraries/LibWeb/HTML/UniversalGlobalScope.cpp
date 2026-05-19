@@ -14,10 +14,10 @@
 #include <LibGC/Function.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibTextCodec/Decoder.h>
+#include <LibWeb/Bindings/MessagePort.h>
 #include <LibWeb/HTML/PromiseRejectionEvent.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
-#include <LibWeb/HTML/StructuredSerializeOptions.h>
 #include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -92,7 +92,7 @@ void UniversalGlobalScopeMixin::queue_microtask(WebIDL::CallbackType& callback)
 }
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#dom-structuredclone
-WebIDL::ExceptionOr<JS::Value> UniversalGlobalScopeMixin::structured_clone(JS::Value value, StructuredSerializeOptions const& options) const
+WebIDL::ExceptionOr<JS::Value> UniversalGlobalScopeMixin::structured_clone(JS::Value value, Bindings::StructuredSerializeOptions const& options) const
 {
     auto& realm = HTML::relevant_realm(this_impl());
 
@@ -185,8 +185,6 @@ bool UniversalGlobalScopeMixin::remove_from_about_to_be_notified_rejected_promis
 // https://html.spec.whatwg.org/multipage/webappapis.html#notify-about-rejected-promises
 void UniversalGlobalScopeMixin::notify_about_rejected_promises(Badge<EventLoop>)
 {
-    auto& realm = this_impl().realm();
-
     // 1. Let list be a copy of settings object's about-to-be-notified rejected promises list.
     auto list = m_about_to_be_notified_rejected_promises_list;
 
@@ -201,7 +199,7 @@ void UniversalGlobalScopeMixin::notify_about_rejected_promises(Badge<EventLoop>)
     auto& global = this_impl();
 
     // 5. Queue a global task on the DOM manipulation task source given global to run the following substep:
-    queue_global_task(Task::Source::DOMManipulation, global, GC::create_function(realm.heap(), [this, &global, list = move(list)] {
+    queue_global_task(Task::Source::DOMManipulation, global, GC::create_function(global.heap(), [this, &global, list = move(list)] {
         auto& realm = global.realm();
 
         // 1. For each promise p in list:
@@ -213,13 +211,13 @@ void UniversalGlobalScopeMixin::notify_about_rejected_promises(Badge<EventLoop>)
 
             // 2. Let notHandled be the result of firing an event named unhandledrejection at global, using PromiseRejectionEvent, with the cancelable attribute initialized to true,
             //    the promise attribute initialized to p, and the reason attribute initialized to the value of p's [[PromiseResult]] internal slot.
-            PromiseRejectionEventInit event_init {
+            Bindings::PromiseRejectionEventInit event_init {
                 {
                     .bubbles = false,
                     .cancelable = true,
                     .composed = false,
                 },
-                // Sadly we can't use .promise and .reason here, as we can't use the designator on the initialization of DOM::EventInit above.
+                // Sadly we can't use .promise and .reason here, as we can't use the designator on the initialization of Bindings::EventInit above.
                 /* .promise = */ *promise,
                 /* .reason = */ promise->result(),
             };

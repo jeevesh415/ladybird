@@ -10,7 +10,7 @@
 #include <AK/StringBuilder.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/HTMLFormElementPrototype.h>
+#include <LibWeb/Bindings/HTMLFormElement.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
@@ -163,7 +163,7 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
         // 6. Let shouldContinue be the result of firing an event named submit at form using SubmitEvent, with the
         //    submitter attribute initialized to submitterButton, the bubbles attribute initialized to true, and the
         //    cancelable attribute initialized to true.
-        SubmitEventInit event_init {};
+        Bindings::SubmitEventInit event_init {};
         event_init.submitter = submitter_button;
         auto submit_event = SubmitEvent::create(realm, EventNames::submit, event_init);
         submit_event->set_bubbles(true);
@@ -613,7 +613,7 @@ bool HTMLFormElement::interactively_validate_constraints()
     if (first_invalid_control.has_value()) {
         auto control = first_invalid_control.release_value();
         run_focusing_steps(control);
-        DOM::ScrollIntoViewOptions scroll_options;
+        Bindings::ScrollIntoViewOptions scroll_options;
         scroll_options.block = Bindings::ScrollLogicalPosition::Nearest;
         scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
         scroll_options.behavior = Bindings::ScrollBehavior::Instant;
@@ -1011,6 +1011,19 @@ Optional<JS::Value> HTMLFormElement::item_value(size_t index) const
     return {};
 }
 
+bool HTMLFormElement::is_supported_property_name(FlyString const& name) const
+{
+    // NB: This is a simplified version of ::supported_property_names() that does not require sorting or allocations.
+    for (auto const& candidate : m_associated_elements) {
+        if (is_form_control(*candidate, *this) || is<HTMLImageElement>(*candidate)) {
+            if (first_is_one_of(name, candidate->id(), candidate->name()))
+                return true;
+        }
+    }
+
+    return m_past_names_map.contains(name);
+}
+
 // https://html.spec.whatwg.org/multipage/forms.html#the-form-element:supported-property-names
 Vector<FlyString> HTMLFormElement::supported_property_names() const
 {
@@ -1075,10 +1088,9 @@ Vector<FlyString> HTMLFormElement::supported_property_names() const
     // 5. Sort sourced names by tree order of the element entry of each tuple, sorting entries with the same element by
     //    putting entries whose source is id first, then entries whose source is name, and finally entries whose source
     //    is past, and sorting entries with the same element and source by their age, oldest first.
-    // FIXME: Require less const casts here by changing the signature of DOM::Node::compare_document_position
     quick_sort(sourced_names, [](auto const& lhs, auto const& rhs) -> bool {
         if (lhs.element != rhs.element)
-            return const_cast<DOM::Element*>(lhs.element.ptr())->compare_document_position(const_cast<DOM::Element*>(rhs.element.ptr())) & DOM::Node::DOCUMENT_POSITION_FOLLOWING;
+            return lhs.element->is_before(*rhs.element);
         if (lhs.source != rhs.source)
             return lhs.source < rhs.source;
         return lhs.age < rhs.age;
@@ -1095,13 +1107,7 @@ Vector<FlyString> HTMLFormElement::supported_property_names() const
             continue;
         names.set(entry.name, AK::HashSetExistingEntryBehavior::Keep);
     }
-
-    Vector<FlyString> result;
-    result.ensure_capacity(names.size());
-    for (auto const& name : names)
-        result.unchecked_append(name);
-
-    return result;
+    return names.values();
 }
 
 // https://html.spec.whatwg.org/multipage/forms.html#dom-form-nameditem

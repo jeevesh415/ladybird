@@ -6,11 +6,13 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/HashTable.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/Result.h>
 #include <AK/Utf16FlyString.h>
+#include <LibCore/ImmutableBytes.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Root.h>
 #include <LibJS/ModuleEntry.h>
@@ -25,6 +27,9 @@
 namespace JS::FFI {
 
 struct ParsedProgram;
+struct CompiledProgram;
+struct CompiledFunction;
+struct DecodedBytecodeCacheBlob;
 
 }
 
@@ -89,16 +94,47 @@ JS_API bool rust_pipeline_available();
 // Parse a program (script or module) without GC interaction. Thread-safe.
 JS_API FFI::ParsedProgram* parse_program(u16 const* utf16_data, size_t length_in_code_units, ProgramType type, size_t line_number_offset = 0);
 
+// Compile a parsed program to bytecode without touching the VM or GC. Thread-safe.
+JS_API FFI::CompiledProgram* compile_parsed_program_off_thread(FFI::ParsedProgram* parsed, size_t length_in_code_units);
+
+// Fully compile a parsed program to bytecode without touching the VM or GC. Thread-safe.
+JS_API FFI::CompiledProgram* compile_parsed_program_fully_off_thread(FFI::ParsedProgram* parsed, size_t length_in_code_units);
+
 // Check if a parsed program has errors. Does not consume the program.
 JS_API bool parsed_program_has_errors(FFI::ParsedProgram const*);
 
 // Free a parsed program without compiling it.
 JS_API void free_parsed_program(FFI::ParsedProgram*);
 
+// Free a compiled program without materializing it.
+JS_API void free_compiled_program(FFI::CompiledProgram*);
+
+// Serialize a fully compiled program into a versioned bytecode cache blob.
+JS_API ByteBuffer serialize_compiled_program_for_bytecode_cache(FFI::CompiledProgram const&, ProgramType, ReadonlyBytes source_hash);
+
+// Decode a bytecode cache blob into an owned parser-free cache handle.
+JS_API FFI::DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(ReadonlyBytes, ProgramType, ReadonlyBytes source_hash);
+JS_API FFI::DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(Core::ImmutableBytes, ProgramType, ReadonlyBytes source_hash);
+
+// Free a decoded bytecode cache blob.
+JS_API void free_decoded_bytecode_cache_blob(FFI::DecodedBytecodeCacheBlob*);
+
+// Materialize a decoded script bytecode cache blob. Must be called on the main thread.
+// Consumes and frees the decoded blob.
+JS_API Optional<Result<ScriptResult, Vector<ParserError>>> materialize_bytecode_cache_script(FFI::DecodedBytecodeCacheBlob*, NonnullRefPtr<SourceCode const> source_code, Realm&);
+
+// Materialize a decoded module bytecode cache blob. Must be called on the main thread.
+// Consumes and frees the decoded blob.
+JS_API Optional<Result<ModuleResult, Vector<ParserError>>> materialize_bytecode_cache_module(FFI::DecodedBytecodeCacheBlob*, NonnullRefPtr<SourceCode const> source_code, Realm&);
+
 // Compile a previously parsed script. Must be called on the main thread.
 // Consumes and frees the Rust ParsedProgram.
 // Returns nullopt if Rust is not available.
 Optional<Result<ScriptResult, Vector<ParserError>>> compile_parsed_script(FFI::ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm& realm);
+
+// Materialize a previously compiled script. Must be called on the main thread.
+// Consumes and frees the Rust CompiledProgram.
+Optional<Result<ScriptResult, Vector<ParserError>>> materialize_compiled_script(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm);
 
 // Compile a script. Returns nullopt if Rust is not available.
 Optional<Result<ScriptResult, Vector<ParserError>>> compile_script(StringView source_text, Realm& realm, StringView filename, size_t line_number_offset);
@@ -114,6 +150,10 @@ Optional<Result<EvalResult, String>> compile_eval(
 // Consumes and frees the Rust ParsedProgram.
 // Returns nullopt if Rust is not available.
 Optional<Result<ModuleResult, Vector<ParserError>>> compile_parsed_module(FFI::ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm& realm);
+
+// Materialize a previously compiled module. Must be called on the main thread.
+// Consumes and frees the Rust CompiledProgram.
+Optional<Result<ModuleResult, Vector<ParserError>>> materialize_compiled_module(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm);
 
 // Compile a module. Returns nullopt if Rust is not available.
 Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(StringView source_text, Realm& realm, StringView filename);
@@ -131,6 +171,18 @@ Optional<Vector<GC::Root<SharedFunctionInstanceData>>> compile_builtin_file(
 // Compile a function body for lazy compilation.
 // Returns nullptr if Rust is not available or the SFD doesn't use Rust compilation.
 GC::Ptr<Bytecode::Executable> compile_function(VM& vm, SharedFunctionInstanceData& shared_data, bool builtin_abstract_operations_enabled);
+
+JS_API void* clone_function_ast(void const*);
+JS_API FFI::CompiledFunction* compile_function_off_thread(void* function_ast, size_t length_in_code_units, bool builtin_abstract_operations_enabled);
+// Attach a previously compiled function for lazy materialization.
+JS_API void materialize_compiled_function(FFI::CompiledFunction*, VM&, SourceCode const&, SharedFunctionInstanceData&);
+JS_API void free_compiled_function(FFI::CompiledFunction*);
+
+// Free a Rust decoded bytecode cache executable pointer. No-op if null.
+void free_cached_bytecode_executable(void*);
+
+// Free a Rust precompiled bytecode executable pointer. No-op if null.
+void free_precompiled_bytecode_executable(void*);
 
 // Free a Rust function AST pointer. No-op if Rust is not available.
 void free_function_ast(void* ast);

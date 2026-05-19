@@ -146,7 +146,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     m_toolbar->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Fixed);
     // This is a little awkward, but without this Qt shrinks the button to the size of the icon.
     // Note: toolButtonStyle="0" -> ToolButtonIconOnly.
-    m_toolbar->setStyleSheet("QToolButton[toolButtonStyle=\"0\"]{width:24px;height:24px}");
+    m_toolbar->setStyleSheet("QToolButton[toolButtonStyle=\"0\"]{padding:0px 4px 0px 4px;height:24px}");
 
     m_hamburger_button_action->setVisible(!Settings::the()->show_menubar());
 
@@ -485,9 +485,14 @@ void Tab::load_html(StringView html)
 
 void Tab::location_edit_return_pressed()
 {
-    if (m_location_edit->text().isEmpty())
+    auto text = m_location_edit->text();
+    if (text.isEmpty())
         return;
-    navigate(m_location_edit->url());
+
+    if (auto url = m_location_edit->url(); url.has_value())
+        navigate(*url);
+    else
+        view().load_navigation_error_page(ak_string_from_qstring(text));
 }
 
 void Tab::open_file()

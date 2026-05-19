@@ -14,6 +14,7 @@
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibGC/Heap.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
@@ -26,6 +27,7 @@
 #include <LibJS/Runtime/FunctionEnvironment.h>
 #include <LibJS/Runtime/Iterator.h>
 #include <LibJS/Runtime/NativeFunction.h>
+#include <LibJS/Runtime/NativeJavaScriptBackedFunction.h>
 #include <LibJS/Runtime/PromiseCapability.h>
 #include <LibJS/Runtime/Reference.h>
 #include <LibJS/Runtime/Symbol.h>
@@ -192,8 +194,10 @@ VM::VM(ErrorMessages error_messages)
 
         // The default implementation of HostResizeArrayBuffer is to return NormalCompletion(unhandled).
 
+        auto old_external_memory_size = buffer.external_memory_size();
         if (auto result = buffer.buffer().try_resize(new_byte_length, ByteBuffer::ZeroFillNewElements::Yes); result.is_error())
             return throw_completion<RangeError>(ErrorType::NotEnoughMemoryToAllocate, new_byte_length);
+        buffer.did_change_data_block_capacity(old_external_memory_size);
 
         return HandledByHost::Handled;
     };
@@ -236,6 +240,18 @@ VM::~VM()
 {
     --s_vm_count;
     VERIFY(s_vm_count == 0);
+}
+
+SharedFunctionInstanceData* VM::active_shared_function_data()
+{
+    auto* function = active_function_object();
+    if (!function)
+        return nullptr;
+    if (auto* ecmascript_function = as_if<ECMAScriptFunctionObject>(*function))
+        return &ecmascript_function->shared_data();
+    if (auto* native_javascript_backed_function = as_if<NativeJavaScriptBackedFunction>(*function))
+        return &native_javascript_backed_function->shared_data();
+    return nullptr;
 }
 
 Utf16String const& VM::error_message(ErrorMessage type) const
@@ -485,7 +501,9 @@ void VM::run_queued_finalization_registry_cleanup_jobs()
     while (!m_finalization_registry_cleanup_jobs.is_empty()) {
         auto registry = m_finalization_registry_cleanup_jobs.take_last();
         // FIXME: Handle any uncatched exceptions here.
-        (void)registry->cleanup();
+        auto result = registry->cleanup();
+        if (result.is_error() && registry->has_empty_cells())
+            m_finalization_registry_cleanup_jobs.append(registry);
     }
 }
 
@@ -518,8 +536,10 @@ void VM::dump_backtrace() const
 {
     for_each_execution_context_top_to_bottom([&](ExecutionContext const& frame) {
         if (frame.executable) {
-            auto source_range = frame.executable->source_range_at(frame.program_counter).realize();
-            dbgln("-> {} @ {}:{},{}", frame.function ? frame.function->name_for_call_stack() : ""_utf16, source_range.filename(), source_range.start.line, source_range.start.column);
+            if (auto source_range = frame.executable->source_range_at(frame.program_counter); source_range.has_value())
+                dbgln("-> {} @ {}:{},{}", frame.function ? frame.function->name_for_call_stack() : ""_utf16, source_range->filename(), source_range->start.line, source_range->start.column);
+            else
+                dbgln("-> {}", frame.function ? frame.function->name_for_call_stack() : ""_utf16);
         } else {
             dbgln("-> {}", frame.function ? frame.function->name_for_call_stack() : ""_utf16);
         }
@@ -737,14 +757,14 @@ void VM::load_imported_module(ImportedModuleReferrer referrer, ModuleRequest con
 
 #if JS_MODULE_DEBUG
     ByteString referencing_module_string = referrer.visit(
-        [&](Empty) -> ByteString {
-            return ".";
+        [&](GC::Ref<Script> const& script) {
+            return ByteString::formatted("Script @ {}", script.ptr());
         },
-        [&](auto& script_or_module) {
-            if constexpr (IsSame<Script*, decltype(script_or_module)>) {
-                return ByteString::formatted("Script @ {}", script_or_module.ptr());
-            }
-            return ByteString::formatted("Module @ {}", script_or_module.ptr());
+        [&](GC::Ref<CyclicModule> const& module) {
+            return ByteString::formatted("Module @ {}", module.ptr());
+        },
+        [&](GC::Ref<Realm> const& realm) {
+            return ByteString::formatted("Realm @ {}", realm.ptr());
         });
 
     dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module({}, {})", referencing_module_string, filename);

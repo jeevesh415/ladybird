@@ -5,6 +5,7 @@
  */
 
 #include <AK/Debug.h>
+#include <AK/Time.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/Environment.h>
 #include <LibCore/StandardPaths.h>
@@ -20,6 +21,7 @@
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/URL.h>
@@ -31,6 +33,10 @@
 #    include <LibIPC/MachBootstrapListener.h>
 #    include <LibIPC/Transport.h>
 #    include <LibIPC/TransportBootstrapMach.h>
+#endif
+
+#if !defined(AK_OS_WINDOWS)
+#    include <sys/wait.h>
 #endif
 
 namespace WebView {
@@ -163,7 +169,9 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool disable_scrollbar_painting = false;
+    bool disable_async_scrolling = false;
     bool file_scheme_urls_have_tuple_origins = false;
+    Optional<u64> style_invalidation_counter_dump_interval;
 
     Core::ArgsParser args_parser;
     args_parser.set_general_help("The Ladybird web browser :^)");
@@ -202,7 +210,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(disable_sql_database, "Disable SQL database", "disable-sql-database");
     args_parser.add_option(file_scheme_urls_have_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
     args_parser.add_option(Core::ArgsParser::Option {
-        .argument_mode = Core::ArgsParser::OptionArgumentMode::Optional,
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
         .help_string = "Wait for a debugger to attach to the given process name (WebContent, RequestServer, etc.)",
         .long_name = "debug-process",
         .value_name = "process-name",
@@ -233,12 +241,26 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation", 'g');
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical scrollbars on the main viewport", "disable-scrollbar-painting");
+    args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
     args_parser.add_option(dns_server_address, "Set the DNS server address", "dns-server", 0, "host|address");
     args_parser.add_option(dns_server_port, "Set the DNS server port", "dns-port", 0, "port (default: 53 or 853 if --dot)");
     args_parser.add_option(use_dns_over_tls, "Use DNS over TLS", "dot");
     args_parser.add_option(validate_dnssec_locally, "Validate DNSSEC locally", "dnssec");
     args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
     args_parser.add_option(resource_substitution_map_path, "Path to JSON file mapping URLs to local files", "resource-map", 0, "path");
+    args_parser.add_option(Core::ArgsParser::Option {
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
+        .help_string = "Dump style invalidation counters from WebContent after every N style invalidations",
+        .long_name = "dump-style-invalidation-counters",
+        .value_name = "N",
+        .accept_value = [&](StringView value) {
+            auto parsed_value = value.to_number<u64>();
+            if (!parsed_value.has_value() || parsed_value.value() == 0)
+                return false;
+            style_invalidation_counter_dump_interval = parsed_value.value();
+            return true;
+        },
+    });
 
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Optional,
@@ -292,7 +314,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         disable_site_isolation = true;
 
     m_browser_options = {
-        .urls = sanitize_urls(raw_urls, m_settings.new_tab_page_url()),
+        .urls = sanitize_urls(raw_urls),
         .raw_urls = move(raw_urls),
         .headless_mode = headless_mode,
         .new_window = new_window ? NewWindow::Yes : NewWindow::No,
@@ -334,8 +356,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     };
 
     m_web_content_options = {
-        .command_line = MUST(String::join(' ', m_arguments.strings)),
-        .executable_path = MUST(String::from_byte_string(MUST(Core::System::current_executable_path()))),
         .user_agent_preset = move(user_agent_preset),
         .is_test_mode = enable_test_mode ? IsTestMode::Yes : IsTestMode::No,
         .log_all_js_exceptions = log_all_js_exceptions ? LogAllJSExceptions::Yes : LogAllJSExceptions::No,
@@ -349,8 +369,10 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .enable_autoplay = enable_autoplay ? EnableAutoplay::Yes : EnableAutoplay::No,
         .collect_garbage_on_every_allocation = collect_garbage_on_every_allocation ? CollectGarbageOnEveryAllocation::Yes : CollectGarbageOnEveryAllocation::No,
         .paint_viewport_scrollbars = disable_scrollbar_painting ? PaintViewportScrollbars::No : PaintViewportScrollbars::Yes,
+        .enable_async_scrolling = disable_async_scrolling ? EnableAsyncScrolling::No : EnableAsyncScrolling::Yes,
         .file_scheme_urls_have_tuple_origins = file_scheme_urls_have_tuple_origins ? FileSchemeUrlsHaveTupleOrigins::Yes : FileSchemeUrlsHaveTupleOrigins::No,
         .default_time_zone = default_time_zone,
+        .style_invalidation_counter_dump_interval = style_invalidation_counter_dump_interval,
     };
 
     create_platform_options(m_browser_options, m_request_server_options, m_web_content_options);
@@ -383,6 +405,11 @@ void Application::open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML:
 {
     if (auto bookmark = m_bookmark_store.find_item_by_id(bookmark_id); bookmark.has_value() && bookmark->is_bookmark())
         open_url_in_new_tab(bookmark->bookmark().url, activate_tab);
+}
+
+void Application::open_url_in_new_window(URL::URL const& url)
+{
+    dbgln("open_url_in_new_window() is unsupported on this platform (url: {})", url);
 }
 
 static ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&> view)
@@ -454,8 +481,8 @@ ErrorOr<void> Application::launch_services()
     m_bookmark_store_observer = make<ApplicationBookmarkStoreObserver>();
 
     m_process_manager = make<ProcessManager>();
-    m_process_manager->on_process_exited = [this](Process&& process) {
-        process_did_exit(move(process));
+    m_process_manager->on_process_exited = [this](Process&& process, Optional<int> exit_status) {
+        process_did_exit(move(process), exit_status);
     };
 
     if (m_browser_options.disable_sql_database == DisableSQLDatabase::No) {
@@ -463,10 +490,19 @@ ErrorOr<void> Application::launch_services()
         auto database_path = ByteString::formatted("{}/Ladybird", Core::StandardPaths::user_data_directory());
 
         m_database = TRY(Database::Database::create(database_path, "Ladybird"sv));
+        m_history_database = TRY(Database::Database::create(database_path, "History"sv));
+
+        if (auto history_database_path = m_history_database->database_path(); history_database_path.has_value())
+            dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is enabled, using {}", history_database_path->string());
+
         m_cookie_jar = TRY(CookieJar::create(*m_database));
+        m_history_store = TRY(HistoryStore::create(*m_history_database));
         m_storage_jar = TRY(StorageJar::create(*m_database));
     } else {
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is disabled, disabling browsing history");
+
         m_cookie_jar = CookieJar::create();
+        m_history_store = HistoryStore::create_disabled();
         m_storage_jar = StorageJar::create();
     }
 
@@ -499,8 +535,17 @@ ErrorOr<void> Application::launch_request_server()
 {
     m_request_server_client = TRY(launch_request_server_process());
 
-    m_request_server_client->on_retrieve_http_cookie = [this](URL::URL const& url) {
-        return m_cookie_jar->get_cookie(url, HTTP::Cookie::Source::Http);
+    m_request_server_client->on_retrieve_http_cookie = [this](URL::URL const& url) -> String {
+        if constexpr (!REQUESTSERVER_WIRE_DEBUG)
+            return m_cookie_jar->get_cookie(url, HTTP::Cookie::Source::Http);
+        auto started_at = MonotonicTime::now();
+        auto cookie = m_cookie_jar->get_cookie(url, HTTP::Cookie::Source::Http);
+        auto elapsed_ms = (MonotonicTime::now() - started_at).to_milliseconds();
+        if (elapsed_ms > 5) {
+            dbgln("UI wire-cookie: get_cookie({}) took {} ms ({} bytes returned)",
+                url, elapsed_ms, cookie.bytes().size());
+        }
+        return cookie;
     };
 
     m_request_server_client->on_request_server_died = [this]() {
@@ -691,8 +736,12 @@ Optional<Process&> Application::find_process(pid_t pid)
     return m_process_manager->find_process(pid);
 }
 
-void Application::process_did_exit(Process&& process)
+void Application::process_did_exit(Process&& process, Optional<int> exit_status)
 {
+#if defined(AK_OS_WINDOWS)
+    (void)exit_status;
+#endif
+
     if (m_event_loop->was_exit_requested())
         return;
 
@@ -715,8 +764,13 @@ void Application::process_did_exit(Process&& process)
         }
         break;
     case ProcessType::WebContent:
-        if (auto client = process.client<WebContentClient>(); client.has_value())
+        if (auto client = process.client<WebContentClient>(); client.has_value()) {
+#if !defined(AK_OS_WINDOWS)
+            if (exit_status.has_value() && WIFEXITED(*exit_status) && WEXITSTATUS(*exit_status) == 0 && !client->has_views())
+                break;
+#endif
             client->notify_all_views_of_crash();
+        }
         break;
     case ProcessType::WebWorker:
         dbgln_if(WEBVIEW_PROCESS_DEBUG, "WebWorker {} died, not sure what to do.", process.pid());
@@ -806,6 +860,8 @@ NonnullRefPtr<Core::Promise<Application::BrowsingDataSizes>> Application::estima
 
 void Application::clear_browsing_data(ClearBrowsingDataOptions const& options)
 {
+    bool did_change_history = false;
+
     if (options.delete_cached_files == ClearBrowsingDataOptions::Delete::Yes) {
         m_request_server_client->async_remove_cache_entries_accessed_since(options.since);
 
@@ -818,10 +874,26 @@ void Application::clear_browsing_data(ClearBrowsingDataOptions const& options)
         });
     }
 
+    if (options.delete_history == ClearBrowsingDataOptions::Delete::Yes) {
+        m_history_store->remove_entries_accessed_since(options.since);
+        did_change_history = true;
+    }
+
     if (options.delete_site_data == ClearBrowsingDataOptions::Delete::Yes) {
         m_cookie_jar->expire_cookies_accessed_since(options.since);
         m_storage_jar->remove_items_accessed_since(options.since);
     }
+
+    if (did_change_history)
+        on_recently_closed_entries_changed();
+}
+
+void Application::clear_history()
+{
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Clearing browsing history");
+
+    m_history_store->clear();
+    on_recently_closed_entries_changed();
 }
 
 void Application::initialize_actions()
@@ -863,9 +935,16 @@ void Application::initialize_actions()
     });
 
     m_copy_selection_action = Action::create("Copy"sv, ActionID::CopySelection, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            if (!view->selected_text().is_empty())
-                insert_clipboard_entry({ view->selected_text(), "text/plain"_string });
+        if (auto view = active_web_view(); view.has_value()) {
+            if (auto text = view->selected_text(); !text.is_empty())
+                insert_clipboard_entry({ move(text), "text/plain"_string });
+        }
+    });
+    m_cut_selection_action = Action::create("Cut"sv, ActionID::CutSelection, [this]() {
+        if (auto view = active_web_view(); view.has_value()) {
+            if (auto text = view->cut_selected_text(); !text.is_empty())
+                insert_clipboard_entry({ move(text), "text/plain"_string });
+        }
     });
     m_paste_action = Action::create("Paste"sv, ActionID::Paste, [this]() {
         if (auto view = active_web_view(); view.has_value())

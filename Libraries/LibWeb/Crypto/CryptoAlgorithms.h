@@ -13,7 +13,7 @@
 #include <LibCrypto/BigInt/UnsignedBigInteger.h>
 #include <LibGC/Ptr.h>
 #include <LibJS/Forward.h>
-#include <LibWeb/Bindings/SubtleCryptoPrototype.h>
+#include <LibWeb/Bindings/SubtleCrypto.h>
 #include <LibWeb/Crypto/CryptoBindings.h>
 #include <LibWeb/Crypto/CryptoKey.h>
 #include <LibWeb/WebIDL/Buffers.h>
@@ -24,7 +24,7 @@ namespace Web::Crypto {
 
 using AlgorithmIdentifier = Variant<GC::Root<JS::Object>, String>;
 using NamedCurve = String;
-using KeyDataType = Variant<GC::Root<WebIDL::BufferSource>, Bindings::JsonWebKey>;
+using KeyDataType = Variant<GC::Root<WebIDL::BufferSource>, JsonWebKey>;
 
 // https://wicg.github.io/webcrypto-modern-algos/#encapsulation
 struct EncapsulatedKey {

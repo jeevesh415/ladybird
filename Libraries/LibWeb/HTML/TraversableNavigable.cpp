@@ -35,7 +35,10 @@ namespace Web::HTML {
 GC_DEFINE_ALLOCATOR(TraversableNavigable);
 
 TraversableNavigable::TraversableNavigable(GC::Ref<Page> page)
-    : Navigable(page, page->client().is_svg_page_client())
+    : Navigable(
+          page,
+          page->client().is_svg_page_client(),
+          Compositor::CompositorThread::PagePresentationRegistration::Yes)
     , m_storage_shed(StorageAPI::StorageShed::create(page->heap()))
     , m_session_history_traversal_queue(vm().heap().allocate<SessionHistoryTraversalQueue>())
 {
@@ -74,6 +77,7 @@ BrowsingContextAndDocument create_a_new_top_level_browsing_context_and_document(
 GC::Ref<TraversableNavigable> TraversableNavigable::create_a_new_top_level_traversable(GC::Ref<Page> page, GC::Ptr<HTML::BrowsingContext> opener, String target_name)
 {
     auto& vm = Bindings::main_thread_vm();
+    page->ensure_compositor_thread();
 
     // 1. Let document be null.
     GC::Ptr<DOM::Document> document = nullptr;
@@ -94,7 +98,7 @@ GC::Ref<TraversableNavigable> TraversableNavigable::create_a_new_top_level_trave
     // document: document (now owned by Navigable::m_active_document, not DocumentState)
 
     // initiator origin: null if opener is null; otherwise, document's origin
-    document_state->set_initiator_origin(opener ? Optional<URL::Origin> {} : document->origin());
+    document_state->set_initiator_origin(opener ? document->origin() : Optional<URL::Origin> {});
 
     // origin: document's origin
     document_state->set_origin(document->origin());
@@ -122,7 +126,11 @@ GC::Ref<TraversableNavigable> TraversableNavigable::create_a_new_top_level_trave
     traversable->m_session_history_entries.append(*initial_history_entry);
     traversable->set_has_session_history_entry_and_ready_for_navigation();
 
-    // FIXME: 10. If opener is non-null, then legacy-clone a traversable storage shed given opener's top-level traversable and traversable. [STORAGE]
+    // 10. If opener is non-null, then legacy-clone a traversable storage shed given opener's top-level traversable and traversable. [STORAGE]
+    if (opener) {
+        auto opener_traversable = opener->top_level_traversable();
+        traversable->storage_shed().legacy_clone(opener_traversable->storage_shed(), page);
+    }
 
     // 11. Append traversable to the user agent's top-level traversable set.
     user_agent_top_level_traversable_set().set(traversable);
@@ -599,6 +607,33 @@ void ApplyHistoryStepState::start()
     // 8. For each navigable of changingNavigables:
     auto changing_navigables = m_traversable->get_all_navigables_whose_current_session_history_entry_will_change_or_reload(m_target_step);
     for (auto& navigable : changing_navigables) {
+        // AD-HOC: For a synchronous (same-document) application of a history step, skip a navigable that has just
+        //         been claimed by a fresh ongoing navigation. Apply the history step would otherwise transition the
+        //         navigable's ongoing navigation through "traversal" and back to null, which informs the navigation
+        //         API about aborting (cancelling the in-flight navigation's navigate event) and then trips the
+        //         "ongoing navigation is no longer navigationId" bail-out in navigate's deferred steps, leaving the
+        //         in-flight navigation stranded.
+        //
+        //         The race shows up when a click capture handler calls history.replaceState and the link's
+        //         cross-document activation behavior runs in the same task: the replaceState's queued sync step
+        //         finalizes after the link nav has already entered begin_navigation, and wipes its id. Real-world
+        //         example: Shopify storefronts running hCaptcha (which hooks click and replaceStates to the current
+        //         URL for analytics). The page silently never moves.
+        //
+        //         No major engine reproduces this. Chromium runs sync same-document nav entirely in-task and never
+        //         enters a parallel traversal queue, WebKit doesn't track navigation IDs at all, and Gecko routes
+        //         sync replaceState directly through history without entering SetOngoingNavigation. The strictly
+        //         correct long-term fix is to bypass the traversal queue for sync same-document navigations to
+        //         match Chromium; until then, skipping the transient when the navigable is already mid-navigation
+        //         matches the observable behavior of all three.
+        //
+        //         Cross-document and traversal applications still process every changing navigable: the "traversal"
+        //         transition there is not transient. It precedes an actual document switch that takes ownership.
+        if (m_synchronous_navigation == TraversableNavigable::SynchronousNavigation::Yes
+            && navigable->ongoing_navigation().has<String>()) {
+            continue;
+        }
+
         // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
         auto target_entry = navigable->get_the_target_history_entry(m_target_step);
 
@@ -646,7 +681,13 @@ void ApplyHistoryStepState::start()
             changing_navigable_continuation->population_output = nullptr;
 
             // 4. If displayedEntry is targetEntry and targetEntry's document state's reload pending is false, then:
-            if (m_synchronous_navigation == TraversableNavigable::SynchronousNavigation::Yes && !target_entry->document_state()->reload_pending()) {
+            // AD-HOC: A synchronous same-document navigation has already updated the active entry by this point.
+            //         A later queued reload can additionally set reload pending on an already-active target entry
+            //         before that synchronous step is applied. The reload step owns that population work.
+            bool is_update_only = displayed_entry == target_entry && !target_entry->document_state()->reload_pending();
+            if (m_synchronous_navigation == TraversableNavigable::SynchronousNavigation::Yes)
+                is_update_only = !target_entry->document_state()->reload_pending() || displayed_entry == target_entry;
+            if (is_update_only) {
                 // 1. Set changingNavigableContinuation's update-only to true.
                 changing_navigable_continuation->update_only = true;
                 changing_navigable_continuation->resolved_document = navigable->active_document();
@@ -940,6 +981,15 @@ void ApplyHistoryStepState::process_continuations()
             // NOTE: We compare against the pre-activation displayed_document_id (not the current
             //       active entry) because activate_history_entry() has already updated the active entry above.
             if (target_entry->document_state()->document_id() == displayed_document_id) {
+                update_document();
+            }
+            // AD-HOC: When the document already has its parser pre-loaded with in-memory data (currently set up
+            //         only for about:srcdoc), perform updateDocument synchronously instead of queueing it.
+            //         updateDocument calls Document::set_ready_to_run_scripts(), which kicks off the deferred
+            //         parser. Running it in the same task as activation guarantees the body element exists before
+            //         script in the parent navigable can observe the new document — matching Chrome and Firefox
+            //         behavior for srcdoc iframes.
+            else if (resolved_document->has_deferred_parser_start()) {
                 update_document();
             }
             // 5. Otherwise, queue a global task on the navigation and traversal task source given targetEntry's document's relevant global object to perform updateDocument

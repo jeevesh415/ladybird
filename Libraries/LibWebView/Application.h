@@ -63,9 +63,11 @@ public:
     static ImageDecoderClient::Client& image_decoder_client() { return *the().m_image_decoder_client; }
 
     static BookmarkStore& bookmark_store() { return the().m_bookmark_store; }
+    static HistoryStore& history_store() { return *the().m_history_store; }
     void update_bookmark_action_for_current_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
     void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
+    void clear_history();
 
     virtual void show_bookmark_context_menu(Gfx::IntPoint, Optional<BookmarkItem const&>, [[maybe_unused]] Optional<String const&> target_folder_id) { }
 
@@ -84,6 +86,9 @@ public:
     virtual Optional<ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const { return {}; }
     void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const;
     void open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab) const;
+
+    Main::Arguments const& command_line_arguments() const { return m_arguments; }
+    virtual void open_url_in_new_window(URL::URL const& url);
 
     void add_child_process(Process&&);
 
@@ -122,12 +127,14 @@ public:
 
         UnixDateTime since { UnixDateTime::earliest() };
         Delete delete_cached_files { Delete::No };
+        Delete delete_history { Delete::No };
         Delete delete_site_data { Delete::No };
     };
     void clear_browsing_data(ClearBrowsingDataOptions const&);
 
     Action& reload_action() { return *m_reload_action; }
     Action& copy_selection_action() { return *m_copy_selection_action; }
+    Action& cut_selection_action() { return *m_cut_selection_action; }
     Action& paste_action() { return *m_paste_action; }
     Action& select_all_action() { return *m_select_all_action; }
 
@@ -165,7 +172,7 @@ protected:
 
     ErrorOr<void> initialize(Main::Arguments const&);
 
-    virtual void process_did_exit(Process&&);
+    virtual void process_did_exit(Process&&, Optional<int> exit_status);
 
     virtual void create_platform_arguments(Core::ArgsParser&) { }
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions&) { }
@@ -175,6 +182,7 @@ protected:
 
     virtual void rebuild_bookmarks_menu() const { }
     virtual void update_bookmarks_bar_display([[maybe_unused]] bool show_bookmarks_bar) const { }
+    virtual void on_recently_closed_entries_changed() const { }
 
     struct BookmarkID {
         String id;
@@ -257,6 +265,7 @@ private:
 
     BookmarkStore m_bookmark_store;
     OwnPtr<ApplicationBookmarkStoreObserver> m_bookmark_store_observer;
+    OwnPtr<HistoryStore> m_history_store;
 
     Main::Arguments m_arguments;
     BrowserOptions m_browser_options;
@@ -270,6 +279,7 @@ private:
     bool m_has_queued_task_to_launch_spare_web_content_process { false };
 
     RefPtr<Database::Database> m_database;
+    RefPtr<Database::Database> m_history_database;
     OwnPtr<CookieJar> m_cookie_jar;
     OwnPtr<StorageJar> m_storage_jar;
 
@@ -280,6 +290,7 @@ private:
 
     RefPtr<Action> m_reload_action;
     RefPtr<Action> m_copy_selection_action;
+    RefPtr<Action> m_cut_selection_action;
     RefPtr<Action> m_paste_action;
     RefPtr<Action> m_select_all_action;
 

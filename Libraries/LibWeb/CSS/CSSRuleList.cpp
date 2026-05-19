@@ -5,7 +5,8 @@
  */
 
 #include <AK/TypeCasts.h>
-#include <LibWeb/Bindings/CSSRuleListPrototype.h>
+#include <LibJS/Runtime/ExternalMemory.h>
+#include <LibWeb/Bindings/CSSRuleList.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSContainerRule.h>
 #include <LibWeb/CSS/CSSFontFaceRule.h>
@@ -51,6 +52,11 @@ void CSSRuleList::visit_edges(Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_rules);
     visitor.visit(m_owner_rule);
+}
+
+size_t CSSRuleList::external_memory_size() const
+{
+    return JS::saturating_add_external_memory_size(Base::external_memory_size(), JS::vector_external_memory_size(m_rules));
 }
 
 // AD-HOC: The spec doesn't include a declared_namespaces parameter, but we need it to handle parsing of namespaced selectors.
@@ -270,9 +276,13 @@ bool CSSRuleList::evaluate_media_queries(DOM::Document const& document)
         }
         case CSSRule::Type::Media: {
             auto& media_rule = as<CSSMediaRule>(*rule);
+            bool was_first_evaluation = !media_rule.did_evaluate();
             bool did_match = media_rule.condition_matches();
             bool now_matches = media_rule.evaluate(document);
-            if (did_match != now_matches)
+            // The first evaluation establishes the baseline. did_match defaults to false because each MediaQuery
+            // starts with m_matches=false, so a brand-new rule would otherwise look like a false->true flip the
+            // first time it gets evaluated against a matching state.
+            if (!was_first_evaluation && did_match != now_matches)
                 any_media_queries_changed_match_state = true;
             if (now_matches && media_rule.css_rules().evaluate_media_queries(document))
                 any_media_queries_changed_match_state = true;

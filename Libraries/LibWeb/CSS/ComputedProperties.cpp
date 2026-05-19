@@ -24,9 +24,8 @@
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FilterValueListStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FitContentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FontVariantAlternatesFunctionStyleValue.h>
+#include <LibWeb/CSS/StyleValues/FunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridAutoFlowStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridTemplateAreaStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridTrackPlacementStyleValue.h>
@@ -35,12 +34,12 @@
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
+#include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
 #include <LibWeb/CSS/StyleValues/OpenTypeTaggedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PositionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RectStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RepeatStyleStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ScrollFunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ScrollbarColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShadowStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
@@ -216,7 +215,8 @@ StyleValue const& ComputedProperties::property(PropertyID property_id, WithAnima
     VERIFY(property_id >= first_longhand_property_id && property_id <= last_longhand_property_id);
 
     // Important properties override animated but not transitioned properties
-    if ((!is_property_important(property_id) || is_animated_property_result_of_transition(property_id)) && return_animated_value == WithAnimationsApplied::Yes) {
+    if (!m_animated_property_values.is_empty() && return_animated_value == WithAnimationsApplied::Yes
+        && (!is_property_important(property_id) || is_animated_property_result_of_transition(property_id))) {
         if (auto animated_value = m_animated_property_values.get(property_id); animated_value.has_value())
             return *animated_value.value();
     }
@@ -417,12 +417,32 @@ Optional<int> ComputedProperties::z_index() const
 
 float ComputedProperties::opacity() const
 {
-    return property(PropertyID::Opacity).as_number().number();
+    return property(PropertyID::Opacity).as_opacity_value().resolved();
+}
+
+Optional<SVGPaint> ComputedProperties::fill(ColorResolutionContext const& color_resolution_context) const
+{
+    auto const& value = property(PropertyID::Fill);
+
+    if (value.to_keyword() == Keyword::None)
+        return {};
+
+    return SVGPaint::from_style_value(value, color_resolution_context);
 }
 
 float ComputedProperties::fill_opacity() const
 {
-    return property(PropertyID::FillOpacity).as_number().number();
+    return property(PropertyID::FillOpacity).as_opacity_value().resolved();
+}
+
+Optional<SVGPaint> ComputedProperties::stroke(ColorResolutionContext const& color_resolution_context) const
+{
+    auto const& value = property(PropertyID::Stroke);
+
+    if (value.to_keyword() == Keyword::None)
+        return {};
+
+    return SVGPaint::from_style_value(value, color_resolution_context);
 }
 
 Vector<Variant<LengthPercentage, float>> ComputedProperties::stroke_dasharray() const
@@ -480,12 +500,12 @@ double ComputedProperties::stroke_miterlimit() const
 
 float ComputedProperties::stroke_opacity() const
 {
-    return property(PropertyID::StrokeOpacity).as_number().number();
+    return property(PropertyID::StrokeOpacity).as_opacity_value().resolved();
 }
 
 float ComputedProperties::stop_opacity() const
 {
-    return property(PropertyID::StopOpacity).as_number().number();
+    return property(PropertyID::StopOpacity).as_opacity_value().resolved();
 }
 
 FillRule ComputedProperties::fill_rule() const
@@ -502,7 +522,7 @@ ClipRule ComputedProperties::clip_rule() const
 
 float ComputedProperties::flood_opacity() const
 {
-    return property(PropertyID::FloodOpacity).as_number().number();
+    return property(PropertyID::FloodOpacity).as_opacity_value().resolved();
 }
 
 FlexDirection ComputedProperties::flex_direction() const
@@ -1249,11 +1269,7 @@ Visibility ComputedProperties::visibility() const
 
 Display ComputedProperties::display() const
 {
-    auto const& value = property(PropertyID::Display);
-    if (value.is_display()) {
-        return value.as_display().display();
-    }
-    return Display::from_short(Display::Short::Inline);
+    return property(PropertyID::Display).as_display().display();
 }
 
 Vector<TextDecorationLine> ComputedProperties::text_decoration_line() const
@@ -1473,11 +1489,12 @@ Optional<FontVariantAlternates> ComputedProperties::font_variant_alternates() co
             continue;
         }
 
-        if (value->is_font_variant_alternates_function()) {
-            auto const& function = value->as_font_variant_alternates_function();
+        if (value->is_function()) {
+            auto function_type = font_feature_value_type_from_string(value->as_function().name()).release_value();
+            auto const& names = value->as_function().value()->as_value_list().values();
 
-            for (auto const& name : function.names())
-                alternates.font_feature_value_entries.append({ function.function_type(), string_from_style_value(name) });
+            for (auto const& name : names)
+                alternates.font_feature_value_entries.append({ function_type, string_from_style_value(name) });
 
             continue;
         }
@@ -1870,6 +1887,25 @@ Containment ComputedProperties::contain() const
     return containment;
 }
 
+Vector<FlyString> ComputedProperties::container_name() const
+{
+    auto const& value = property(PropertyID::ContainerName);
+    if (value.to_keyword() == Keyword::None)
+        return {};
+
+    Vector<FlyString> names;
+
+    if (value.is_value_list()) {
+        auto& values = value.as_value_list().values();
+        for (auto const& item : values)
+            names.append(item->as_custom_ident().custom_ident());
+    } else {
+        names.append(value.as_custom_ident().custom_ident());
+    }
+
+    return names;
+}
+
 ContainerType ComputedProperties::container_type() const
 {
     ContainerType container_type {};
@@ -1965,12 +2001,9 @@ Vector<ComputedProperties::AnimationProperties> ComputedProperties::animations(D
         auto duration = [&] -> Variant<double, String> {
             // auto
             if (animation_duration_style_value->to_keyword() == Keyword::Auto) {
-                // For time-driven animations, equivalent to 0s.
-                return 0;
-
-                // FIXME: For scroll-driven animations, equivalent to the duration necessary to fill the timeline in
-                //        consideration of animation-range, animation-delay, and animation-iteration-count. See
-                //        Scroll-driven Animations § 4.1 Finite Timeline Calculations.
+                // Preserve auto until the animation effect is associated with its timeline. Time-driven animations
+                // will resolve this to 0s, while scroll-driven animations fill the progress-based timeline.
+                return "auto"_string;
             }
 
             // <time [0s,∞]>
@@ -2018,15 +2051,23 @@ Vector<ComputedProperties::AnimationProperties> ComputedProperties::animations(D
             // <scroll()>
             // Use the scroll progress timeline indicated by the given scroll() function. See Scroll-driven Animations
             // § 2.2.1 The scroll() notation.
-            if (animation_timeline_style_value->is_scroll_function()) {
-                auto const& scroll_function = animation_timeline_style_value->as_scroll_function();
+            if (animation_timeline_style_value->is_function() && animation_timeline_style_value->as_function().name() == "scroll"_fly_string) {
+                auto const& arguments = animation_timeline_style_value->as_function().value()->as_tuple().tuple();
+
+                auto const& scroller = arguments[TupleStyleValue::Indices::ScrollFunction::Scroller]
+                    ? keyword_to_scroller(arguments[TupleStyleValue::Indices::ScrollFunction::Scroller]->to_keyword()).value()
+                    : Scroller::Nearest;
+
+                auto const& axis = arguments[TupleStyleValue::Indices::ScrollFunction::Axis]
+                    ? Animations::css_axis_to_bindings_scroll_axis(keyword_to_axis(arguments[TupleStyleValue::Indices::ScrollFunction::Axis]->to_keyword()).value())
+                    : Bindings::ScrollAxis::Block;
 
                 Animations::ScrollTimeline::AnonymousSource source {
-                    .scroller = scroll_function.scroller(),
+                    .scroller = scroller,
                     .target = abstract_element,
                 };
 
-                return Animations::ScrollTimeline::create(abstract_element.element().realm(), abstract_element.document(), source, Animations::css_axis_to_bindings_scroll_axis(scroll_function.axis()));
+                return Animations::ScrollTimeline::create(abstract_element.element().realm(), abstract_element.document(), source, axis);
             }
 
             //<view()>

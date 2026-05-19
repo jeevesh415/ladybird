@@ -416,8 +416,13 @@ Unicode::Segmenter& TextNode::grapheme_segmenter() const
 Unicode::Segmenter& TextNode::line_segmenter() const
 {
     if (!m_line_segmenter) {
-        m_line_segmenter = document().line_segmenter().clone();
-        m_line_segmenter->set_segmented_text(text_for_rendering());
+        auto const& text = text_for_rendering();
+        if (auto ascii = Unicode::Segmenter::try_create_for_ascii_line(text.utf16_view())) {
+            m_line_segmenter = ascii.release_nonnull();
+        } else {
+            m_line_segmenter = document().line_segmenter().clone();
+            m_line_segmenter->set_segmented_text(text);
+        }
     }
 
     return *m_line_segmenter;
@@ -631,18 +636,20 @@ bool TextNode::ChunkIterator::is_at_line_break_opportunity() const
     VERIFY_NOT_REACHED();
 }
 
-Gfx::Font const& TextNode::ChunkIterator::font_for_space(size_t at_index) const
+Gfx::Font const& TextNode::ChunkIterator::font_for_space(size_t at_index, u32 space_code_point) const
 {
+    auto has_glyph = [&](Gfx::Font const& font) { return font.contains_glyph(space_code_point); };
+
     // 1. Prefer the last non-whitespace font in this node/run.
-    if (m_last_non_whitespace_font && !m_last_non_whitespace_font->is_emoji_font())
+    if (m_last_non_whitespace_font && !m_last_non_whitespace_font->is_emoji_font() && has_glyph(*m_last_non_whitespace_font))
         return *m_last_non_whitespace_font;
 
     // 2. Look ahead to the next non-space to infer the base font of this run.
     for (size_t i = at_index; i < m_view.length_in_code_units();) {
         auto cp = m_view.code_point_at(i);
         if (!is_interword_space(cp) && cp != '\t' && cp != '\n') {
-            auto const& font = m_font_cascade_list.font_for_code_point(cp);
-            if (!font.is_emoji_font())
+            auto const& font = m_font_cascade_list.font_for_code_point(cp, Gfx::FontCascadeList::TriggerPendingLoads::Yes);
+            if (!font.is_emoji_font() && has_glyph(font))
                 return font;
             // Text is coming from an emoji face; we'll fall back to (3).
             break;
@@ -650,8 +657,8 @@ Gfx::Font const& TextNode::ChunkIterator::font_for_space(size_t at_index) const
         i = m_grapheme_segmenter.next_boundary(i).value_or(m_view.length_in_code_units());
     }
 
-    // 3. No text around (leading/trailing/all spaces) — pick the first *text* face in the cascade.
-    return m_font_cascade_list.first_text_face();
+    // 3. No text around (leading/trailing/all spaces) — pick a font with the glyph from the cascade.
+    return m_font_cascade_list.font_for_code_point(space_code_point, Gfx::FontCascadeList::TriggerPendingLoads::Yes);
 }
 
 Optional<TextNode::Chunk> TextNode::ChunkIterator::next_without_peek()
@@ -677,8 +684,8 @@ Optional<TextNode::Chunk> TextNode::ChunkIterator::next_without_peek()
 
     auto const& expected_font_for = [&](u32 cp) -> Gfx::Font const& {
         return is_interword_space(cp)
-            ? font_for_space(m_current_index)
-            : m_font_cascade_list.font_for_code_point(cp);
+            ? font_for_space(m_current_index, cp)
+            : m_font_cascade_list.font_for_code_point(cp, Gfx::FontCascadeList::TriggerPendingLoads::Yes);
     };
 
     auto const& font = expected_font_for(current_code_point());
@@ -749,7 +756,7 @@ Optional<TextNode::Chunk> TextNode::ChunkIterator::next_without_peek()
                 // Otherwise, commit the whitespace!
                 m_current_index = next_grapheme_boundary();
                 can_break_at_current_position = is_at_line_break_opportunity();
-                auto const& space_font = font_for_space(m_current_index);
+                auto const& space_font = font_for_space(m_current_index, code_point);
                 if (auto result = try_commit_chunk(start_of_chunk, m_current_index, false, broken_on_tab, false, space_font, text_type); result.has_value())
                     return result.release_value();
                 continue;
@@ -797,7 +804,7 @@ Optional<TextNode::Chunk> TextNode::ChunkIterator::try_commit_chunk(size_t start
     return {};
 }
 
-GC::Ptr<Painting::Paintable> TextNode::create_paintable() const
+RefPtr<Painting::Paintable> TextNode::create_paintable() const
 {
     return Painting::TextPaintable::create(*this);
 }

@@ -14,6 +14,7 @@
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Forward.h>
 
 namespace Web::CSS {
 
@@ -27,15 +28,13 @@ public:
     [[nodiscard]] RefPtr<StyleValue const> property(PropertyID) const;
     [[nodiscard]] PropertyID property_with_higher_priority(PropertyID, PropertyID) const;
     [[nodiscard]] GC::Ptr<CSSStyleDeclaration const> property_source(PropertyID) const;
+    [[nodiscard]] GC::Ptr<DOM::ShadowRoot const> property_source_shadow_root(PropertyID) const;
     [[nodiscard]] Optional<StyleProperty> style_property(PropertyID) const;
 
-    void set_property(PropertyID, NonnullRefPtr<StyleValue const>, Important, CascadeOrigin, Optional<FlyString> layer_name, GC::Ptr<CSS::CSSStyleDeclaration const> source);
-    void set_property_from_presentational_hint(PropertyID, NonnullRefPtr<StyleValue const>);
+    void set_property(PropertyID, NonnullRefPtr<StyleValue const>, Important, CascadeOrigin, Optional<FlyString> layer_name, GC::Ptr<CSS::CSSStyleDeclaration const> source, GC::Ptr<DOM::ShadowRoot const> source_shadow_root);
 
     void revert_property(PropertyID, Important, CascadeOrigin);
     void revert_layer_property(PropertyID, Important, Optional<FlyString> layer_name);
-
-    void resolve_unresolved_properties(DOM::AbstractElement);
 
 private:
     CascadedProperties();
@@ -48,6 +47,7 @@ private:
         CascadeOrigin origin;
         Optional<FlyString> layer_name;
         GC::Ptr<CSS::CSSStyleDeclaration const> source;
+        GC::Ptr<DOM::ShadowRoot const> source_shadow_root;
     };
     HashMap<PropertyID, Vector<Entry>> m_properties;
     size_t m_next_cascade_index { 0 };

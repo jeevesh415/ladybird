@@ -9,6 +9,9 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/NonnullRefPtr.h>
+#include <AK/RefPtr.h>
+#include <LibWeb/Bindings/CSSStyleSheet.h>
 #include <LibWeb/CSS/CSSNamespaceRule.h>
 #include <LibWeb/CSS/CSSRule.h>
 #include <LibWeb/CSS/CSSRuleList.h>
@@ -22,12 +25,9 @@
 namespace Web::CSS {
 
 class CSSImportRule;
-
-struct CSSStyleSheetInit {
-    Optional<String> base_url {};
-    Variant<GC::Root<MediaList>, String> media { String {} };
-    bool disabled { false };
-};
+class StyleScope;
+struct ShadowRootStylesheetEffects;
+struct StyleCache;
 
 // https://drafts.csswg.org/cssom-1/#cssstylesheet
 class WEB_API CSSStyleSheet final : public StyleSheet {
@@ -58,9 +58,9 @@ public:
     };
 
     [[nodiscard]] static GC::Ref<CSSStyleSheet> create(JS::Realm&, CSSRuleList&, MediaList&, Optional<::URL::URL> location);
-    static WebIDL::ExceptionOr<GC::Ref<CSSStyleSheet>> construct_impl(JS::Realm&, Optional<CSSStyleSheetInit> const& options = {});
+    static WebIDL::ExceptionOr<GC::Ref<CSSStyleSheet>> construct_impl(JS::Realm&, Optional<Bindings::CSSStyleSheetInit> const& options = {});
 
-    virtual ~CSSStyleSheet() override = default;
+    virtual ~CSSStyleSheet() override;
 
     GC::Ptr<CSSRule const> owner_rule() const { return m_owner_css_rule; }
     GC::Ptr<CSSRule> owner_rule() { return m_owner_css_rule; }
@@ -89,13 +89,14 @@ public:
     void for_each_effective_keyframes_at_rule(Function<void(CSSKeyframesRule const&)> const& callback) const;
     void for_each_effective_counter_style_at_rule(Function<void(CSSCounterStyleRule const&)> const& callback) const;
 
-    HashTable<GC::Ptr<DOM::Node>> owning_documents_or_shadow_roots() const { return m_owning_documents_or_shadow_roots; }
+    HashTable<GC::Ptr<DOM::Node>> const& owning_documents_or_shadow_roots() const { return m_owning_documents_or_shadow_roots; }
     void add_owning_document_or_shadow_root(DOM::Node& document_or_shadow_root);
     void remove_owning_document_or_shadow_root(DOM::Node& document_or_shadow_root);
-    void invalidate_owners(DOM::StyleInvalidationReason);
+    void invalidate_owners(DOM::StyleInvalidationReason, ShadowRootStylesheetEffects const* previous_sheet_effects = nullptr);
     GC::Ptr<DOM::Document> owning_document() const;
-    void set_disabled(bool);
+    virtual void set_disabled(bool) override;
     void for_each_owning_style_scope(Function<void(StyleScope&)> const&) const;
+    NonnullRefPtr<StyleCache> shared_single_constructed_sheet_style_cache(StyleScope&);
 
     Optional<FlyString> default_namespace() const;
     GC::Ptr<CSSNamespaceRule> default_namespace_rule() const { return m_default_namespace_rule; }
@@ -131,8 +132,10 @@ private:
 
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual size_t external_memory_size() const override;
 
     void recalculate_rule_caches();
+    void invalidate_shared_style_cache();
 
     void set_constructed(bool constructed) { m_constructed = constructed; }
     void set_disallow_modification(bool disallow_modification) { m_disallow_modification = disallow_modification; }
@@ -154,6 +157,7 @@ private:
     bool m_constructed { false };
     bool m_disallow_modification { false };
     Optional<bool> m_did_match;
+    RefPtr<StyleCache> m_shared_single_constructed_sheet_style_cache;
 
     Vector<Subresource&> m_critical_subresources;
 

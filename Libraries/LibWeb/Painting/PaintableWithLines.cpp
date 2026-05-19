@@ -20,26 +20,25 @@
 #include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/Painting/ShadowPainting.h>
+#include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/TextPaintable.h>
 #include <LibWeb/Selection/Selection.h>
 
 namespace Web::Painting {
-
-GC_DEFINE_ALLOCATOR(PaintableWithLines);
 
 static void paint_text_decoration(DisplayListRecordingContext&, TextPaintable const&, PaintableFragment::FragmentSpan const&);
 static Gfx::Path build_triangle_wave_path(Gfx::IntPoint from, Gfx::IntPoint to, float amplitude);
 static void compute_render_spans(PaintableFragment const&, Vector<PaintableFragment::FragmentSpan, 4>&);
 static void paint_text_fragment(DisplayListRecordingContext&, PaintableFragment::FragmentSpan const&);
 
-GC::Ref<PaintableWithLines> PaintableWithLines::create(Layout::BlockContainer const& block_container)
+NonnullRefPtr<PaintableWithLines> PaintableWithLines::create(Layout::BlockContainer const& block_container)
 {
-    return block_container.heap().allocate<PaintableWithLines>(block_container);
+    return adopt_ref(*new PaintableWithLines(block_container));
 }
 
-GC::Ref<PaintableWithLines> PaintableWithLines::create(Layout::InlineNode const& inline_node, size_t line_index)
+NonnullRefPtr<PaintableWithLines> PaintableWithLines::create(Layout::InlineNode const& inline_node, size_t line_index)
 {
-    return inline_node.heap().allocate<PaintableWithLines>(inline_node, line_index);
+    return adopt_ref(*new PaintableWithLines(inline_node, line_index));
 }
 
 PaintableWithLines::PaintableWithLines(Layout::BlockContainer const& layout_box)
@@ -183,43 +182,27 @@ TraversalDecision PaintableWithLines::hit_test_fragments(CSSPixelPoint position,
                 // To determine the best place, we first find the closest fragment horizontally to the cursor. If we could not
                 // find one, then find for the closest vertically above the cursor. If we knew the direction of selection, we
                 // would look above if selecting upward.
+                HitTestResult hit_test_result {
+                    .paintable = const_cast<Paintable&>(fragment.paintable()),
+                    .index_in_node = fragment.start_offset(),
+                };
                 if (fragment_absolute_rect.bottom() - 1 <= local_position.y()) { // fully below the fragment
-                    HitTestResult hit_test_result {
-                        .paintable = const_cast<Paintable&>(fragment.paintable()),
-                        .index_in_node = fragment.start_offset() + fragment.length_in_code_units(),
-                        .vertical_distance = local_position.y() - fragment_absolute_rect.bottom(),
-                    };
-                    if (callback(hit_test_result) == TraversalDecision::Break)
-                        return TraversalDecision::Break;
+                    hit_test_result.index_in_node += fragment.length_in_code_units();
+                    hit_test_result.vertical_distance = local_position.y() - fragment_absolute_rect.bottom();
                 } else if (local_position.y() < fragment_absolute_rect.top()) { // fully above the fragment
-                    HitTestResult hit_test_result {
-                        .paintable = const_cast<Paintable&>(fragment.paintable()),
-                        .index_in_node = fragment.start_offset(),
-                        .vertical_distance = fragment_absolute_rect.top() - local_position.y(),
-                    };
-                    if (callback(hit_test_result) == TraversalDecision::Break)
-                        return TraversalDecision::Break;
-                } else if (fragment_absolute_rect.top() <= local_position.y()) { // vertically within the fragment
+                    hit_test_result.vertical_distance = fragment_absolute_rect.top() - local_position.y();
+                } else { // vertically within the fragment
+                    hit_test_result.vertical_distance = 0;
                     if (local_position.x() < fragment_absolute_rect.left()) {
-                        HitTestResult hit_test_result {
-                            .paintable = const_cast<Paintable&>(fragment.paintable()),
-                            .index_in_node = fragment.start_offset(),
-                            .vertical_distance = 0,
-                            .horizontal_distance = fragment_absolute_rect.left() - local_position.x(),
-                        };
-                        if (callback(hit_test_result) == TraversalDecision::Break)
-                            return TraversalDecision::Break;
-                    } else if (local_position.x() > fragment_absolute_rect.right()) {
-                        HitTestResult hit_test_result {
-                            .paintable = const_cast<Paintable&>(fragment.paintable()),
-                            .index_in_node = fragment.start_offset() + fragment.length_in_code_units(),
-                            .vertical_distance = 0,
-                            .horizontal_distance = local_position.x() - fragment_absolute_rect.right(),
-                        };
-                        if (callback(hit_test_result) == TraversalDecision::Break)
-                            return TraversalDecision::Break;
+                        hit_test_result.horizontal_distance = fragment_absolute_rect.left() - local_position.x();
+                    } else {
+                        hit_test_result.index_in_node += fragment.length_in_code_units();
+                        hit_test_result.horizontal_distance = local_position.x() - fragment_absolute_rect.right();
                     }
                 }
+
+                if (callback(hit_test_result) == TraversalDecision::Break)
+                    return TraversalDecision::Break;
             }
         }
     }
@@ -304,8 +287,8 @@ void PaintableWithLines::paint(DisplayListRecordingContext& context, PaintPhase 
 
 void compute_render_spans(PaintableFragment const& fragment, Vector<PaintableFragment::FragmentSpan, 4>& spans)
 {
-    auto const* text_paintable = as_if<TextPaintable>(fragment.paintable());
-    if (!text_paintable) {
+    auto const* maybe_text_paintable = as_if<TextPaintable>(fragment.paintable());
+    if (!maybe_text_paintable) {
         // Non-text fragments still need shadow painting.
         spans.append({
             .fragment = fragment,
@@ -318,11 +301,12 @@ void compute_render_spans(PaintableFragment const& fragment, Vector<PaintableFra
         });
         return;
     }
+    auto const& text_paintable = *maybe_text_paintable;
 
-    if (!text_paintable->is_visible())
+    if (!text_paintable.is_visible())
         return;
 
-    auto text_color = text_paintable->computed_values().webkit_text_fill_color();
+    auto text_color = text_paintable.computed_values().webkit_text_fill_color();
     auto selection_offsets = fragment.selection_offsets();
 
     // No selection: single span with base styling.
@@ -340,7 +324,7 @@ void compute_render_spans(PaintableFragment const& fragment, Vector<PaintableFra
     }
 
     auto [selection_start, selection_end, _] = *selection_offsets;
-    auto selection_style = text_paintable->selection_style();
+    auto selection_style = text_paintable.selection_style();
     auto selection_text_color = selection_style.text_color.value_or(text_color);
 
     // Convert selection text decoration to fragment text decoration data.

@@ -13,16 +13,18 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGfx/ImmutableBitmap.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/RegExpObject.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/Bindings/HTMLInputElementPrototype.h>
+#include <LibWeb/Bindings/HTMLInputElement.h>
+#include <LibWeb/Bindings/InputEvent.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
+#include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -206,13 +208,7 @@ void HTMLInputElement::set_checked(bool checked)
 
     m_checked = checked;
 
-    invalidate_style(
-        DOM::StyleInvalidationReason::HTMLInputElementSetChecked,
-        {
-            { .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::Checked },
-            { .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::Unchecked },
-        },
-        {});
+    CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetChecked);
 
     set_needs_repaint();
 }
@@ -643,7 +639,7 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
         auto file_name = MUST(String::from_byte_string(selected_file.name()));
 
         // FIXME: Fill in other fields (e.g. last_modified).
-        FileAPI::FilePropertyBag options {};
+        Bindings::FilePropertyBag options {};
         options.type = mime_type.essence();
 
         auto file = MUST(FileAPI::File::create(realm(), { GC::make_root(blob) }, file_name, move(options)));
@@ -1204,12 +1200,12 @@ void HTMLInputElement::create_text_input_shadow_tree()
             },
             0, Utf16FlyString {}, &realm());
         auto mouseup_callback = realm().heap().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm());
-        DOM::AddEventListenerOptions mouseup_listener_options;
+        Bindings::AddEventListenerOptions mouseup_listener_options;
         mouseup_listener_options.once = true;
 
         auto up_callback_function = JS::NativeFunction::create(
             realm(), [this](JS::VM&) {
-                if (is_mutable()) {
+                if (type_state() == TypeAttributeState::Number && is_mutable() && allowed_value_step().has_value()) {
                     MUST(step_up());
                     user_interaction_did_change_input_value();
                 }
@@ -1238,7 +1234,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
 
         auto down_callback_function = JS::NativeFunction::create(
             realm(), [this](JS::VM&) {
-                if (is_mutable()) {
+                if (type_state() == TypeAttributeState::Number && is_mutable() && allowed_value_step().has_value()) {
                     MUST(step_down());
                     user_interaction_did_change_input_value();
                 }
@@ -1361,7 +1357,14 @@ void HTMLInputElement::create_range_input_shadow_tree()
 
     auto keydown_callback_function = JS::NativeFunction::create(
         realm(), [this](JS::VM& vm) {
-            auto key = MUST(vm.argument(0).get(vm, "key"_utf16_fly_string)).as_string().utf8_string();
+            if (type_state() != TypeAttributeState::Range)
+                return JS::js_undefined();
+            if (!allowed_value_step().has_value())
+                return JS::js_undefined();
+            auto key_value = MUST(vm.argument(0).get(vm, "key"_utf16_fly_string));
+            if (!key_value.is_string())
+                return JS::js_undefined();
+            auto key = key_value.as_string().utf8_string();
 
             if (key == "ArrowLeft" || key == "ArrowDown")
                 MUST(step_down());
@@ -1382,8 +1385,14 @@ void HTMLInputElement::create_range_input_shadow_tree()
 
     auto wheel_callback_function = JS::NativeFunction::create(
         realm(), [this](JS::VM& vm) {
-            auto delta_y = MUST(vm.argument(0).get(vm, "deltaY"_utf16_fly_string)).as_i32();
-            if (delta_y > 0) {
+            if (type_state() != TypeAttributeState::Range)
+                return JS::js_undefined();
+            if (!allowed_value_step().has_value())
+                return JS::js_undefined();
+            auto delta_y_value = MUST(vm.argument(0).get(vm, "deltaY"_utf16_fly_string));
+            if (!delta_y_value.is_finite_number())
+                return JS::js_undefined();
+            if (delta_y_value.as_double() > 0) {
                 MUST(step_down());
             } else {
                 MUST(step_up());
@@ -1396,10 +1405,19 @@ void HTMLInputElement::create_range_input_shadow_tree()
     add_event_listener_without_options(UIEvents::EventNames::wheel, DOM::IDLEventListener::create(realm(), wheel_callback));
 
     auto update_slider_by_mouse = [this](JS::VM& vm) {
-        auto client_x = MUST(vm.argument(0).get(vm, "clientX"_utf16_fly_string)).as_double();
+        if (type_state() != TypeAttributeState::Range)
+            return;
+        auto client_x_value = MUST(vm.argument(0).get(vm, "clientX"_utf16_fly_string));
+        if (!client_x_value.is_finite_number())
+            return;
+        auto client_x = client_x_value.as_double();
         auto rect = get_bounding_client_rect();
+        if (rect.width().to_double() <= 0)
+            return;
         double minimum = *min();
         double maximum = *max();
+        if (minimum > maximum)
+            return;
         // FIXME: Snap new value to input steps
         MUST(set_value_as_number(clamp(round(((client_x - rect.left().to_double()) / rect.width().to_double()) * (maximum - minimum) + minimum), minimum, maximum)));
         user_interaction_did_change_input_value();
@@ -1428,7 +1446,7 @@ void HTMLInputElement::create_range_input_shadow_tree()
                 },
                 0, Utf16FlyString {}, &realm());
             auto mouseup_callback = realm().heap().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm());
-            DOM::AddEventListenerOptions mouseup_listener_options;
+            Bindings::AddEventListenerOptions mouseup_listener_options;
             mouseup_listener_options.once = true;
             window.add_event_listener(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(realm(), mouseup_callback), mouseup_listener_options);
 
@@ -1448,10 +1466,10 @@ void HTMLInputElement::user_interaction_did_change_input_value(FlyString const& 
     // given the input element to fire an event named input at the input element, with the bubbles and composed attributes initialized to true
     queue_an_element_task(HTML::Task::Source::UserInteraction, [this, input_type, data] {
         // https://w3c.github.io/uievents/#event-type-input
-        UIEvents::InputEventInit input_event_init;
+        Bindings::InputEventInit input_event_init;
         input_event_init.bubbles = true;
         input_event_init.composed = true;
-        input_event_init.input_type = input_type;
+        input_event_init.input_type = input_type.to_string();
         input_event_init.data = data;
         auto input_event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, input_event_init);
         dispatch_event(*input_event);
@@ -1574,13 +1592,7 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
     auto old_value_attribute_mode = value_attribute_mode_for_type_state(old_state);
 
     if (checked_applies(old_state) != checked_applies(new_state)) {
-        invalidate_style(
-            DOM::StyleInvalidationReason::HTMLInputElementSetType,
-            {
-                { .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::Checked },
-                { .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::Unchecked },
-            },
-            {});
+        CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetType);
     }
 
     // 1. If the previous state of the element's type attribute put the value IDL attribute in the value mode, and the element's
@@ -2061,9 +2073,9 @@ bool HTMLInputElement::is_presentational_hint(FlyString const& name) const
         HTML::AttributeNames::width);
 }
 
-void HTMLInputElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperties> cascaded_properties) const
+void HTMLInputElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
-    Base::apply_presentational_hints(cascaded_properties);
+    Base::apply_presentational_hints(properties);
 
     if (type_state() != TypeAttributeState::ImageButton)
         return;
@@ -2071,42 +2083,42 @@ void HTMLInputElement::apply_presentational_hints(GC::Ref<CSS::CascadedPropertie
     for_each_attribute([&](auto& name, auto& value) {
         if (name == HTML::AttributeNames::align) {
             if (value.equals_ignoring_ascii_case("center"sv))
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::TextAlign, CSS::KeywordStyleValue::create(CSS::Keyword::Center));
+                properties.append({ .property_id = CSS::PropertyID::TextAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Center) });
             else if (value.equals_ignoring_ascii_case("middle"sv))
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::TextAlign, CSS::KeywordStyleValue::create(CSS::Keyword::Middle));
+                properties.append({ .property_id = CSS::PropertyID::TextAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Middle) });
         } else if (name == HTML::AttributeNames::border) {
             if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
                 auto width_style_value = CSS::LengthStyleValue::create(CSS::Length::make_px(*parsed_value));
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderTopWidth, width_style_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderRightWidth, width_style_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderBottomWidth, width_style_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderLeftWidth, width_style_value);
+                properties.append({ .property_id = CSS::PropertyID::BorderTopWidth, .value = width_style_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderRightWidth, .value = width_style_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderBottomWidth, .value = width_style_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderLeftWidth, .value = width_style_value });
 
                 auto border_style_value = CSS::KeywordStyleValue::create(CSS::Keyword::Solid);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderTopStyle, border_style_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderRightStyle, border_style_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderBottomStyle, border_style_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderLeftStyle, border_style_value);
+                properties.append({ .property_id = CSS::PropertyID::BorderTopStyle, .value = border_style_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderRightStyle, .value = border_style_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderBottomStyle, .value = border_style_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderLeftStyle, .value = border_style_value });
             }
         } else if (name == HTML::AttributeNames::height) {
             if (auto parsed_value = parse_dimension_value(value)) {
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Height, *parsed_value);
+                properties.append({ .property_id = CSS::PropertyID::Height, .value = *parsed_value });
             }
         }
         // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images:maps-to-the-dimension-property
         else if (name == HTML::AttributeNames::hspace) {
             if (auto parsed_value = parse_dimension_value(value)) {
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginLeft, *parsed_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginRight, *parsed_value);
+                properties.append({ .property_id = CSS::PropertyID::MarginLeft, .value = *parsed_value });
+                properties.append({ .property_id = CSS::PropertyID::MarginRight, .value = *parsed_value });
             }
         } else if (name == HTML::AttributeNames::vspace) {
             if (auto parsed_value = parse_dimension_value(value)) {
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginTop, *parsed_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginBottom, *parsed_value);
+                properties.append({ .property_id = CSS::PropertyID::MarginTop, .value = *parsed_value });
+                properties.append({ .property_id = CSS::PropertyID::MarginBottom, .value = *parsed_value });
             }
         } else if (name == HTML::AttributeNames::width) {
             if (auto parsed_value = parse_dimension_value(value)) {
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Width, *parsed_value);
+                properties.append({ .property_id = CSS::PropertyID::Width, .value = *parsed_value });
             }
         }
     });
@@ -2278,11 +2290,11 @@ Optional<CSSPixelFraction> HTMLInputElement::intrinsic_aspect_ratio() const
     return {};
 }
 
-RefPtr<Gfx::ImmutableBitmap> HTMLInputElement::current_image_bitmap_sized(Gfx::IntSize size) const
+Optional<Gfx::DecodedImageFrame> HTMLInputElement::current_image_frame_sized(Gfx::IntSize size) const
 {
     if (auto image_data = this->image_data())
-        return image_data->bitmap(0, size);
-    return nullptr;
+        return image_data->frame(0, size);
+    return {};
 }
 
 void HTMLInputElement::set_visible_in_viewport(bool)
@@ -2365,7 +2377,7 @@ WebIDL::UnsignedLong HTMLInputElement::height() const
         return 0;
 
     // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto* paintable_box = this->paintable_box())
+    if (auto paintable_box = this->paintable_box())
         return paintable_box->content_height().to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -2375,7 +2387,7 @@ WebIDL::UnsignedLong HTMLInputElement::height() const
     }
 
     // ...or else the natural height and height of the image, in CSS pixels, if an image is available but not being rendered
-    if (auto bitmap = current_image_bitmap())
+    if (auto bitmap = current_image_frame(); bitmap.has_value())
         return bitmap->height();
 
     // ...or else 0, if the image is not available or does not have intrinsic dimensions.
@@ -2400,7 +2412,7 @@ WebIDL::UnsignedLong HTMLInputElement::width() const
         return 0;
 
     // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto* paintable_box = this->paintable_box())
+    if (auto paintable_box = this->paintable_box())
         return paintable_box->content_width().to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -2410,7 +2422,7 @@ WebIDL::UnsignedLong HTMLInputElement::width() const
     }
 
     // ...or else the natural width and height of the image, in CSS pixels, if an image is available but not being rendered
-    if (auto bitmap = current_image_bitmap())
+    if (auto bitmap = current_image_frame(); bitmap.has_value())
         return bitmap->width();
 
     // ...or else 0, if the image is not available or does not have intrinsic dimensions.
@@ -3837,7 +3849,7 @@ void HTMLInputElement::set_is_open(bool is_open)
         return;
 
     m_is_open = is_open;
-    invalidate_style(DOM::StyleInvalidationReason::HTMLInputElementSetIsOpen);
+    CSS::Invalidation::invalidate_style_after_input_open_state_change(*this);
 }
 
 bool HTMLInputElement::is_mutable() const

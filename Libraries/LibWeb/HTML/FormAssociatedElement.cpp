@@ -407,7 +407,7 @@ bool FormAssociatedElement::report_validity_steps()
         // FIXME: Does this align with other browsers?
         if (report && element.check_visibility({})) {
             run_focusing_steps(&element);
-            DOM::ScrollIntoViewOptions scroll_options;
+            Bindings::ScrollIntoViewOptions scroll_options;
             scroll_options.block = Bindings::ScrollLogicalPosition::Nearest;
             scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
             scroll_options.behavior = Bindings::ScrollBehavior::Instant;
@@ -592,7 +592,7 @@ bool FormAssociatedElement::suffering_from_a_custom_error() const
     return !m_custom_validity_error_message.is_empty();
 }
 
-void FormAssociatedElement::set_face_validity_flags(Badge<ElementInternals>, ValidityStateFlags const& value)
+void FormAssociatedElement::set_face_validity_flags(Badge<ElementInternals>, Bindings::ValidityStateFlags const& value)
 {
     m_face_validity_flags = value;
 }
@@ -1118,7 +1118,7 @@ void FormAssociatedTextControlElement::scroll_cursor_into_view()
     if (!text_node)
         return;
 
-    auto* paintable = text_node->paintable();
+    auto paintable = text_node->paintable();
     if (!paintable)
         return;
 
@@ -1140,7 +1140,7 @@ void FormAssociatedTextControlElement::selection_was_changed(SelectionSource sou
     if (!text_node)
         return;
     // NB: Called during selection change handling, layout may be stale.
-    auto* text_paintable = text_node->unsafe_paintable();
+    auto text_paintable = text_node->unsafe_paintable();
     if (!text_paintable)
         return;
 
@@ -1354,6 +1354,26 @@ GC::Ptr<DOM::Position> FormAssociatedTextControlElement::cursor_position() const
 GC::Ref<JS::Cell> FormAssociatedTextControlElement::as_cell()
 {
     return text_control_to_html_element();
+}
+
+}
+
+namespace Web::DOM {
+
+template<>
+HTML::FormAssociatedTextControlElement* Node::fast_as<HTML::FormAssociatedTextControlElement>()
+{
+    if (auto* input = as_if<HTML::HTMLInputElement>(*this))
+        return input;
+    if (auto* textarea = as_if<HTML::HTMLTextAreaElement>(*this))
+        return textarea;
+    return nullptr;
+}
+
+template<>
+HTML::FormAssociatedTextControlElement const* Node::fast_as<HTML::FormAssociatedTextControlElement>() const
+{
+    return const_cast<Node&>(*this).fast_as<HTML::FormAssociatedTextControlElement>();
 }
 
 }

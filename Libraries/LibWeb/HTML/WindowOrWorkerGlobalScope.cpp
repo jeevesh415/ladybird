@@ -13,12 +13,13 @@
 #include <AK/Vector.h>
 #include <LibGC/Function.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/ImmutableBitmap.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/ScalingMode.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/TypedArray.h>
-#include <LibWeb/Bindings/ImageBitmapPrototype.h>
+#include <LibWeb/Bindings/ImageBitmap.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/Bindings/PerformanceObserver.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/Fetch/FetchMethod.h>
@@ -125,19 +126,19 @@ bool WindowOrWorkerGlobalScopeMixin::cross_origin_isolated() const
 }
 
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-createimagebitmap
-GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::create_image_bitmap(ImageBitmapSource image, Optional<ImageBitmapOptions> options) const
+GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::create_image_bitmap(ImageBitmapSource image, Optional<Bindings::ImageBitmapOptions> options) const
 {
     return create_image_bitmap_impl(image, {}, {}, {}, {}, options);
 }
 
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-createimagebitmap
-GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::create_image_bitmap(ImageBitmapSource image, WebIDL::Long sx, WebIDL::Long sy, WebIDL::Long sw, WebIDL::Long sh, Optional<ImageBitmapOptions> options) const
+GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::create_image_bitmap(ImageBitmapSource image, WebIDL::Long sx, WebIDL::Long sy, WebIDL::Long sw, WebIDL::Long sh, Optional<Bindings::ImageBitmapOptions> options) const
 {
     return create_image_bitmap_impl(image, sx, sy, sw, sh, options);
 }
 
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#cropped-to-the-source-rectangle-with-formatting
-static ErrorOr<NonnullRefPtr<Gfx::Bitmap>> crop_to_the_source_rectangle_with_formatting(RefPtr<Gfx::Bitmap const> input, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, Optional<ImageBitmapOptions> const& options)
+static ErrorOr<NonnullRefPtr<Gfx::Bitmap>> crop_to_the_source_rectangle_with_formatting(RefPtr<Gfx::Bitmap const> input, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, Optional<Bindings::ImageBitmapOptions> const& options)
 {
     // 1. Let input be the bitmap data being transformed.
 
@@ -262,7 +263,7 @@ static ErrorOr<NonnullRefPtr<Gfx::Bitmap>> crop_to_the_source_rectangle_with_for
     return output;
 }
 
-GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(ImageBitmapSource& image, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, Optional<ImageBitmapOptions>& options) const
+GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(ImageBitmapSource& image, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, Optional<Bindings::ImageBitmapOptions>& options) const
 {
     auto& realm = this_impl().realm();
 
@@ -462,20 +463,20 @@ GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::create_image_bitmap_imp
                 [&](auto const& image_element) {
                     // 1. If image's media data has no natural dimensions (e.g., it's a vector graphic with no specified content size) and options's resizeWidth or options's resizeHeight is not present, then return a promise rejected with an "InvalidStateError" DOMException.
                     auto const has_natural_dimensions = image_element->intrinsic_width().has_value() && image_element->intrinsic_height().has_value();
-                    if (!has_natural_dimensions && (!options.has_value() || !options->resize_width.has_value() || !options->resize_width.has_value())) {
+                    if (!has_natural_dimensions && (!options.has_value() || !options->resize_width.has_value() || !options->resize_height.has_value())) {
                         WebIDL::reject_promise(realm, *p, WebIDL::InvalidStateError::create(image_bitmap->realm(), "Image data is detached"_utf16));
                         return;
                     }
 
                     // 2. If image's media data has no natural dimensions (e.g., it's a vector graphic with no specified content size), it should be rendered to a bitmap of the size specified by the resizeWidth and the resizeHeight options.
                     // 3. Set imageBitmap's bitmap data to a copy of image's media data, cropped to the source rectangle with formatting. If this is an animated image, imageBitmap's bitmap data must only be taken from the default image of the animation (the one that the format defines is to be used when animation is not supported or is disabled), or, if there is no such image, the first frame of the animation.
-                    RefPtr<Gfx::ImmutableBitmap> immutable_bitmap;
+                    Optional<Gfx::DecodedImageFrame> decoded_frame;
                     if (has_natural_dimensions) {
-                        immutable_bitmap = image_element->default_image_bitmap_sized(Gfx::IntSize { *image_element->intrinsic_width(), *image_element->intrinsic_height() });
+                        decoded_frame = image_element->default_image_frame_sized(Gfx::IntSize { *image_element->intrinsic_width(), *image_element->intrinsic_height() });
                     } else {
-                        immutable_bitmap = image_element->default_image_bitmap_sized(Gfx::IntSize { *options->resize_width, *options->resize_height });
+                        decoded_frame = image_element->default_image_frame_sized(Gfx::IntSize { *options->resize_width, *options->resize_height });
                     }
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(immutable_bitmap->bitmap(), sx, sy, sw, sh, options);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(decoded_frame->bitmap(), sx, sy, sw, sh, options);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -499,7 +500,7 @@ GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::create_image_bitmap_imp
     return p;
 }
 
-GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::fetch(Fetch::RequestInfo const& input, Fetch::RequestInit const& init) const
+GC::Ref<WebIDL::Promise> WindowOrWorkerGlobalScopeMixin::fetch(Fetch::RequestInfo const& input, Bindings::RequestInit const& init) const
 {
     auto& vm = this_impl().vm();
     return Fetch::fetch(vm, input, init);
@@ -727,7 +728,7 @@ void WindowOrWorkerGlobalScopeMixin::queue_performance_entry(GC::Ref<Performance
     for (auto const& registered_observer : m_registered_performance_observer_objects) {
         // 1. If regObs's options list contains a PerformanceObserverInit options whose entryTypes member includes entryType
         //    or whose type member equals to entryType:
-        auto iterator = registered_observer->options_list().find_if([&entry_type](PerformanceTimeline::PerformanceObserverInit const& entry) {
+        auto iterator = registered_observer->options_list().find_if([&entry_type](Bindings::PerformanceObserverInit const& entry) {
             if (entry.entry_types.has_value())
                 return entry.entry_types->contains_slow(entry_type.to_string());
 
@@ -1070,7 +1071,7 @@ void WindowOrWorkerGlobalScopeMixin::forcibly_close_all_event_sources()
 void WindowOrWorkerGlobalScopeMixin::close_all_idb_connections()
 {
     IndexedDB::Database::for_each_database([&](IndexedDB::Database& database) {
-        for (auto& connection : database.associated_connections_as_root_vector()) {
+        for (auto& connection : database.associated_connections_as_root_vector(this_impl().heap())) {
             if (connection->close_pending())
                 continue;
             if (&as<WindowOrWorkerGlobalScopeMixin>(relevant_global_object(*connection)) == this)
@@ -1245,7 +1246,7 @@ void WindowOrWorkerGlobalScopeMixin::report_an_exception(JS::Value exception, Om
         // 2. If global implements EventTarget, then set notHandled to the result of firing an event named
         //    error at global, using ErrorEvent, with the cancelable attribute initialized to true, and
         //    additional attributes initialized according to errorInfo.
-        ErrorEventInit event_init = {};
+        Bindings::ErrorEventInit event_init = {};
         event_init.cancelable = true;
         event_init.message = error_info.message;
         event_init.filename = error_info.filename;

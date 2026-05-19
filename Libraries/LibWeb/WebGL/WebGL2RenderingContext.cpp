@@ -10,7 +10,7 @@
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/WebGL2RenderingContextPrototype.h>
+#include <LibWeb/Bindings/WebGL2RenderingContext.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Painting/Paintable.h>
@@ -34,7 +34,7 @@ JS::ThrowCompletionOr<GC::Ptr<WebGL2RenderingContext>> WebGL2RenderingContext::c
     // We should be coming here from getContext being called on a wrapped <canvas> element.
     auto context_attributes = TRY(convert_value_to_context_attributes_dictionary(canvas_element.vm(), options));
 
-    auto skia_backend_context = Gfx::SkiaBackendContext::the();
+    auto skia_backend_context = Gfx::SkiaBackendContext::the_main_thread_context();
     if (!skia_backend_context) {
         fire_webgl_context_creation_error(canvas_element);
         return GC::Ptr<WebGL2RenderingContext> { nullptr };

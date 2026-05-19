@@ -21,6 +21,7 @@
 #include <LibTextCodec/Encoder.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Bindings/Transformer.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
@@ -50,6 +51,7 @@
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
@@ -66,7 +68,6 @@
 #include <LibWeb/Streams/TransformStream.h>
 #include <LibWeb/Streams/TransformStreamDefaultController.h>
 #include <LibWeb/Streams/TransformStreamOperations.h>
-#include <LibWeb/Streams/Transformer.h>
 #include <LibWeb/WebIDL/DOMException.h>
 
 namespace Web::Fetch::Fetching {
@@ -228,13 +229,28 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
         //    response: set fetchParams’s preloaded response candidate to response.
         auto on_preloaded_response_available = GC::create_function(realm.heap(), [fetch_params](GC::Ref<Infrastructure::Response> response) {
             fetch_params->set_preloaded_response_candidate(response);
+
+            // NB: main fetch may already be parked on this preload result.
+            // Resolve that waiter here instead of spinning the event loop.
+            auto controller = fetch_params->controller();
+            if (auto pending_preloaded_response = controller->pending_preloaded_response()) {
+                controller->set_pending_preloaded_response(nullptr);
+                pending_preloaded_response->resolve(response);
+            }
         });
 
-        // FIXME: 3. Let foundPreloadedResource be the result of invoking consume a preloaded resource for request’s
+        // 3. Let foundPreloadedResource be the result of invoking consume a preloaded resource for request’s
         //    window, given request’s URL, request’s destination, request’s mode, request’s credentials mode,
         //    request’s integrity metadata, and onPreloadedResponseAvailable.
-        auto found_preloaded_resource = false;
-        (void)on_preloaded_response_available;
+        auto& window = as<HTML::Window>(request.client()->global_object());
+        auto found_preloaded_resource = HTML::consume_a_preloaded_resource(
+            window,
+            request.url(),
+            request.destination(),
+            request.mode(),
+            request.credentials_mode(),
+            request.integrity_metadata(),
+            on_preloaded_response_available);
 
         // 4. If foundPreloadedResource is true and fetchParams’s preloaded response candidate is null, then set
         //    fetchParams’s preloaded response candidate to "pending".
@@ -267,7 +283,10 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
             // -> "image"
             case Infrastructure::Request::Destination::Image:
                 // `image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5`
-                value = "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"sv;
+                // AD-HOC: The spec default omits AVIF and WebP, which causes CDNs that perform format negotiation to
+                //         potentially fall back to non alpha-preserving formats.
+                //         Spec issue: https://github.com/whatwg/fetch/issues/1740
+                value = "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"sv;
                 break;
             // -> "json"
             case Infrastructure::Request::Destination::JSON:
@@ -293,7 +312,10 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
     //     (`Accept-Language, an appropriate header value) to request’s header list.
     if (!request.header_list()->contains("Accept-Language"sv)) {
         StringBuilder accept_language;
-        accept_language.join(","sv, ResourceLoader::the().preferred_languages());
+        if (ResourceLoader::is_initialized())
+            accept_language.join(","sv, ResourceLoader::the().preferred_languages());
+        else
+            accept_language.append("en-US"sv);
 
         auto header = HTTP::Header::isomorphic_encode("Accept-Language"sv, accept_language.string_view());
         request.header_list()->append(move(header));
@@ -445,10 +467,22 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
 
         // -> fetchParams’s preloaded response candidate is not null
         if (!fetch_params.preloaded_response_candidate().has<Empty>()) {
-            // 1. Wait until fetchParams’s preloaded response candidate is not "pending".
-            HTML::main_thread_event_loop().spin_until(GC::create_function(vm.heap(), [&] {
-                return !fetch_params.preloaded_response_candidate().has<Infrastructure::FetchParams::PreloadedResponseCandidatePendingTag>();
-            }));
+            // 1. Wait until fetchParams's preloaded response candidate is not "pending".
+            if (fetch_params.preloaded_response_candidate().has<Infrastructure::FetchParams::PreloadedResponseCandidatePendingTag>()) {
+                // NB: The spec says to wait here. Spinning the main-thread event
+                // loop strands the queued preload callback behind nested work,
+                // so we park a PendingResponse and let that callback resolve it.
+                auto controller = fetch_params.controller();
+
+                // NB: Reuse the parked response if this branch is re-entered
+                // before the preload callback runs.
+                if (auto pending_preloaded_response = controller->pending_preloaded_response())
+                    return *pending_preloaded_response;
+
+                auto pending_preloaded_response = PendingResponse::create(vm, request);
+                controller->set_pending_preloaded_response(pending_preloaded_response);
+                return pending_preloaded_response;
+            }
 
             // 2. Assert: fetchParams’s preloaded response candidate is a response.
             VERIFY(fetch_params.preloaded_response_candidate().has<GC::Ref<Infrastructure::Response>>());
@@ -886,28 +920,35 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
     }
 
     // 8. If fetchParams’s process response consume body is non-null, then:
-    if (fetch_params.algorithms()->process_response_consume_body()) {
+    auto algorithms = fetch_params.algorithms();
+    if (algorithms->process_response_consume_body()) {
         // 1. Let processBody given nullOrBytes be this step: run fetchParams’s process response consume body given
         //    response and nullOrBytes.
-        auto process_body = GC::create_function(vm.heap(), [&fetch_params, &response](ByteBuffer bytes) {
-            (fetch_params.algorithms()->process_response_consume_body())(response, move(bytes));
+        auto process_body = GC::create_function(vm.heap(), [algorithms, &response](ByteBuffer bytes) {
+            if (response.body()) {
+                if (auto const* source_bytes = response.body()->source().get_pointer<Core::ImmutableBytes>()) {
+                    (algorithms->process_response_consume_body())(response, *source_bytes);
+                    return;
+                }
+            }
+            (algorithms->process_response_consume_body())(response, Core::ImmutableBytes::adopt(move(bytes)));
         });
 
         // 2. Let processBodyError be this step: run fetchParams’s process response consume body given response and
         //    failure.
-        auto process_body_error = GC::create_function(vm.heap(), [&fetch_params, &response, setup_report_timing_steps](JS::Value) {
+        auto process_body_error = GC::create_function(vm.heap(), [algorithms, &response, setup_report_timing_steps](JS::Value) {
             // AD-HOC: See comment on setup_report_timing_steps above.
             setup_report_timing_steps();
-            (fetch_params.algorithms()->process_response_consume_body())(response, Infrastructure::FetchAlgorithms::ConsumeBodyFailureTag {});
+            (algorithms->process_response_consume_body())(response, Infrastructure::FetchAlgorithms::ConsumeBodyFailureTag {});
         });
 
         // 3. If internalResponse's body is null, then queue a fetch task to run processBody given null, with
         //    fetchParams’s task destination.
         if (!internal_response->body()) {
-            Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.task_destination(), GC::create_function(vm.heap(), [&fetch_params, &response]() {
+            Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.task_destination(), GC::create_function(vm.heap(), [algorithms, &response]() {
                 // NOTE: We have to provide `fully_read` a callback which accepts a ByteBuffer. Since that is not
                 //       nullable, we just invoke `process_response_consume_body` with a null value manually here.
-                (fetch_params.algorithms()->process_response_consume_body())(response, Empty {});
+                (algorithms->process_response_consume_body())(response, Empty {});
             }));
         }
         // 4. Otherwise, fully read internalResponse body given processBody, processBodyError, and fetchParams’s task
@@ -1502,9 +1543,11 @@ GC::Ptr<PendingResponse> http_redirect_fetch(JS::Realm& realm, Infrastructure::F
     if (!request->body().has<Empty>()) {
         auto const& source = request->body().get<GC::Ref<Infrastructure::Body>>()->source();
         // NOTE: BodyInitOrReadableBytes is a superset of Body::SourceType
-        auto converted_source = source.has<ByteBuffer>()
-            ? BodyInitOrReadableBytes { source.get<ByteBuffer>() }
-            : BodyInitOrReadableBytes { source.get<GC::Ref<FileAPI::Blob>>() };
+        auto converted_source = source.visit(
+            [](ByteBuffer const& byte_buffer) -> BodyInitOrReadableBytes { return byte_buffer.bytes(); },
+            [](Core::ImmutableBytes const& bytes) -> BodyInitOrReadableBytes { return bytes; },
+            [](GC::Ref<FileAPI::Blob> const& blob) -> BodyInitOrReadableBytes { return GC::make_root(blob); },
+            [](Empty) -> BodyInitOrReadableBytes { VERIFY_NOT_REACHED(); });
         auto [body, _] = safely_extract_body(realm, converted_source);
         request->set_body(body);
     }
@@ -1762,7 +1805,7 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
         //       more details.
         //
         // https://w3c.github.io/gpc/#the-sec-gpc-header-field-for-http-requests
-        if (ResourceLoader::the().enable_global_privacy_control() && !http_request->header_list()->contains("Sec-GPC"sv))
+        if (ResourceLoader::is_initialized() && ResourceLoader::the().enable_global_privacy_control() && !http_request->header_list()->contains("Sec-GPC"sv))
             http_request->header_list()->append({ "Sec-GPC"sv, "1"sv });
 
         // 21. If includeCredentials is true, then:
@@ -1919,13 +1962,32 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
 
         // 14. If response’s status is 401, httpRequest’s response tainting is not "cors", includeCredentials is true,
         //     and request’s traversable for user prompts is a traversable navigable:
+        // AD-HOC: Only enter the 401 handling path if the server is requesting an authentication
+        //         scheme we can handle with a username/password prompt (Basic or Digest).
+        //         Other schemes like PrivateToken (RFC 9577) are not user-prompt-based and should
+        //         not trigger credential prompting or request retries.
+        auto www_authenticate_has_credential_based_scheme = [&] {
+            auto www_authenticate = response->header_list()->get("WWW-Authenticate"sv);
+            if (!www_authenticate.has_value())
+                return false;
+            // The value is a comma-separated list of challenges. Each challenge starts with a scheme name.
+            // We check if any of the schemes are ones we can handle with a username/password prompt.
+            auto value = *www_authenticate;
+            for (auto challenge : value.view().split_view(',')) {
+                auto trimmed = challenge.trim_whitespace();
+                auto space_index = trimmed.find(' ');
+                auto scheme = space_index.has_value() ? trimmed.substring_view(0, *space_index) : trimmed;
+                if (scheme.equals_ignoring_ascii_case("Basic"sv) || scheme.equals_ignoring_ascii_case("Digest"sv))
+                    return true;
+            }
+            return false;
+        };
+
         if (response->status() == 401
             && http_request->response_tainting() != Infrastructure::Request::ResponseTainting::CORS
             && include_credentials == HTTP::Cookie::IncludeCredentials::Yes
             && request->traversable_for_user_prompts().has<GC::Ptr<HTML::TraversableNavigable>>()
-            // AD-HOC: Require at least one WWW-Authenticate header to be set before automatically retrying an authenticated
-            //         request (see rule 1 below). See: https://github.com/whatwg/fetch/issues/1766
-            && response->header_list()->contains("WWW-Authenticate"sv)) {
+            && www_authenticate_has_credential_based_scheme()) {
             // 1. Needs testing: multiple `WWW-Authenticate` headers, missing, parsing issues.
             // (Red box in the spec, no-op)
 
@@ -1940,9 +2002,11 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
                 // 2. Set request’s body to the body of the result of safely extracting request’s body’s source.
                 auto const& source = request->body().get<GC::Ref<Infrastructure::Body>>()->source();
                 // NOTE: BodyInitOrReadableBytes is a superset of Body::SourceType
-                auto converted_source = source.has<ByteBuffer>()
-                    ? BodyInitOrReadableBytes { source.get<ByteBuffer>() }
-                    : BodyInitOrReadableBytes { source.get<GC::Ref<FileAPI::Blob>>() };
+                auto converted_source = source.visit(
+                    [](ByteBuffer const& byte_buffer) -> BodyInitOrReadableBytes { return byte_buffer.bytes(); },
+                    [](Core::ImmutableBytes const& bytes) -> BodyInitOrReadableBytes { return bytes; },
+                    [](GC::Ref<FileAPI::Blob> const& blob) -> BodyInitOrReadableBytes { return GC::make_root(blob); },
+                    [](Empty) -> BodyInitOrReadableBytes { VERIFY_NOT_REACHED(); });
                 auto [body, _] = safely_extract_body(realm, converted_source);
                 request->set_body(body);
             }
@@ -2096,8 +2160,11 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
             [&](ByteBuffer const& byte_buffer) {
                 load_request.set_body(MUST(ByteBuffer::copy(byte_buffer)));
             },
-            [&](GC::Root<FileAPI::Blob> const& blob_handle) {
-                load_request.set_body(MUST(ByteBuffer::copy(blob_handle->raw_bytes())));
+            [&](Core::ImmutableBytes const& bytes) {
+                load_request.set_body(MUST(bytes.copy_to_byte_buffer()));
+            },
+            [&](GC::Ref<FileAPI::Blob> const& blob) {
+                load_request.set_body(MUST(ByteBuffer::copy(blob->raw_bytes())));
             },
             [](Empty) {
             });
@@ -2110,6 +2177,11 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
         log_load_request(load_request);
     }
 
+    if (!ResourceLoader::is_initialized()) {
+        pending_response->resolve(Infrastructure::Response::network_error(vm, "ResourceLoader is not initialized"_string));
+        return pending_response;
+    }
+
     HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
     // 10. Let stream be a new ReadableStream.
@@ -2119,16 +2191,13 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     auto fetched_data_receiver = realm.create<FetchedDataReceiver>(fetch_params, stream, move(http_cache));
 
     // 11. Let pullAlgorithm be the following steps:
-    auto pull_algorithm = GC::create_function(realm.heap(), [&realm, fetched_data_receiver]() {
+    auto pull_algorithm = GC::create_function(realm.heap(), [&realm]() {
         // 1. Let promise be a new promise.
-        auto promise = WebIDL::create_promise(realm);
-
         // 2. Run the following steps in parallel:
-        // NOTE: This is handled by FetchedDataReceiver.
-        fetched_data_receiver->set_pending_promise(promise);
+        // NOTE: This is handled by FetchedDataReceiver, which pushes bytes into the controller as they arrive.
 
         // 3. Return promise.
-        return promise;
+        return WebIDL::create_resolved_promise(realm, JS::js_undefined());
     });
 
     // 12. Let cancelAlgorithm be an algorithm that aborts fetchParams’s controller with reason, given reason.
@@ -2140,7 +2209,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     // 13. Set up stream with byte reading support with pullAlgorithm set to pullAlgorithm, cancelAlgorithm set to cancelAlgorithm.
     stream->set_up_with_byte_reading_support(pull_algorithm, cancel_algorithm);
 
-    auto on_headers_received = GC::create_function(vm.heap(), [&vm, pending_response, stream, request, fetched_data_receiver](HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase) {
+    auto on_headers_received = GC::create_function(vm.heap(), [&vm, pending_response, stream, request, fetched_data_receiver](HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key) {
         if (pending_response->is_resolved()) {
             // RequestServer will send us the response headers twice, the second time being for HTTP trailers. This
             // fetch algorithm is not interested in trailers, so just drop them here.
@@ -2152,6 +2221,8 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
 
         if (reason_phrase.has_value())
             response->set_status_message(reason_phrase->to_byte_string());
+        response->set_javascript_bytecode_cache(move(javascript_bytecode));
+        response->set_javascript_bytecode_cache_vary_key(javascript_bytecode_cache_vary_key);
 
         (void)request;
         if constexpr (WEB_FETCH_DEBUG) {
@@ -2179,8 +2250,12 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
 
     // 16. Run these steps in parallel:
     //     FIXME: 1. Run these steps, but abort when fetchParams is canceled:
-    auto on_data_received = GC::create_function(vm.heap(), [fetched_data_receiver](ReadonlyBytes bytes) {
-        fetched_data_receiver->handle_network_bytes(bytes, FetchedDataReceiver::NetworkState::Ongoing);
+    auto on_data_received = GC::create_function(vm.heap(), [fetched_data_receiver](Requests::ResponseData data) {
+        fetched_data_receiver->handle_network_data(move(data), FetchedDataReceiver::NetworkState::Ongoing);
+    });
+
+    auto on_cached_body_available = GC::create_function(vm.heap(), [fetched_data_receiver](Core::ImmutableBytes data) {
+        fetched_data_receiver->set_cached_response_body(move(data));
     });
 
     auto on_complete = GC::create_function(vm.heap(), [&vm, &realm, pending_response, stream, fetched_data_receiver](bool success, Requests::RequestTimingInfo const&, Optional<StringView> error_message) {
@@ -2188,7 +2263,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         if (success) {
-            fetched_data_receiver->handle_network_bytes({}, FetchedDataReceiver::NetworkState::Complete);
+            fetched_data_receiver->handle_network_data(Requests::ResponseData::from_bytes({}), FetchedDataReceiver::NetworkState::Complete);
         } else {
             // 16.1.2.2. Otherwise, if stream is readable, error stream with a TypeError.
             auto error = MUST(String::formatted("Load failed: {}", error_message.value_or("Unknown error"sv)));
@@ -2201,7 +2276,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
         }
     });
 
-    auto network_request = ResourceLoader::the().load(load_request, on_headers_received, on_data_received, on_complete);
+    auto network_request = ResourceLoader::the().load(load_request, on_headers_received, on_data_received, on_cached_body_available, on_complete);
     fetch_params.controller()->set_pending_request(network_request);
 
     return pending_response;

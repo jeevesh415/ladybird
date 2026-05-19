@@ -9,12 +9,12 @@
 
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/WebGLCompressedTextureS3tcSrgbPrototype.h>
+#include <LibWeb/Bindings/WebGLCompressedTextureS3tcSrgb.h>
 #include <LibWeb/WebGL/Extensions/WebGLCompressedTextureS3tcSrgb.h>
 #include <LibWeb/WebGL/OpenGLContext.h>
 #include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
 GC_DEFINE_ALLOCATOR(WebGLCompressedTextureS3tcSrgb);
 

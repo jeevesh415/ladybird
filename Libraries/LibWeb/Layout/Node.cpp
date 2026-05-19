@@ -11,10 +11,13 @@
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/BorderRadiusStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/IntegerStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
+#include <LibWeb/CSS/StyleValues/OverflowClipMarginStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PositionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RatioStyleValue.h>
@@ -37,6 +40,7 @@
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
 
@@ -56,9 +60,6 @@ void Node::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_dom_node);
-    for (auto const& paintable : m_paintable) {
-        visitor.visit(GC::Ptr { &paintable });
-    }
     visitor.visit(m_containing_block);
     visitor.visit(m_inline_containing_block_if_applicable);
     visitor.visit(m_pseudo_element_generator);
@@ -318,8 +319,18 @@ void Node::recompute_containing_block(Badge<DOM::Document>)
                 if (!layout_node || !is<InlineNode>(*layout_node))
                     continue;
 
-                // Check if this inline establishes an absolute positioning containing block.
-                if (layout_node->computed_values_establish_absolute_positioning_containing_block()) {
+                // Restrict the per-property trigger set to those that actually apply to
+                // non-atomic inlines: `position` and filter/backdrop-filter. transform,
+                // contain, perspective and friends from
+                // computed_values_establish_absolute_positioning_containing_block()
+                // explicitly do not apply to non-atomic inlines per their respective specs.
+                auto const& computed_values = layout_node->computed_values();
+                auto const& will_change = computed_values.will_change();
+                bool const inline_establishes_cb = layout_node->is_positioned()
+                    || will_change.has_property(CSS::PropertyID::Position)
+                    || computed_values.filter().has_filters() || will_change.has_property(CSS::PropertyID::Filter)
+                    || computed_values.backdrop_filter().has_filters() || will_change.has_property(CSS::PropertyID::BackdropFilter);
+                if (inline_establishes_cb) {
                     m_inline_containing_block_if_applicable = const_cast<InlineNode*>(static_cast<InlineNode const*>(layout_node.ptr()));
                     break;
                 }
@@ -580,16 +591,89 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, NonnullOw
     m_is_body = node && node == document.body();
 }
 
+NodeWithStyle::ImageObserver::ImageObserver(NodeWithStyle& owner, NonnullRefPtr<CSS::ImageStyleValue const> image)
+    : CSS::ImageStyleValue::Client(*image)
+    , m_owner(owner)
+    , m_image(move(image))
+{
+}
+
+NodeWithStyle::ImageObserver::~ImageObserver()
+{
+    image_style_value_finalize();
+}
+
+void NodeWithStyle::ImageObserver::image_style_value_did_update(CSS::ImageStyleValue&)
+{
+    VERIFY(m_owner);
+
+    for (auto& paintable : m_owner->paintables())
+        paintable->set_needs_repaint();
+
+    // The body's background propagates to the root element's paintable, which holds the cached draw commands.
+    if (m_owner->is_body()) {
+        auto* html_element = m_owner->document().html_element();
+        if (html_element) {
+            if (auto html_layout_node = html_element->unsafe_layout_node()) {
+                if (html_element->should_use_body_background_properties()) {
+                    for (auto& paintable : html_layout_node->paintables())
+                        paintable->set_needs_repaint();
+                }
+            }
+        }
+    }
+}
+
+void NodeWithStyle::ImageObserver::visit_edges(JS::Cell::Visitor& visitor) const
+{
+    m_image->visit_edges(visitor);
+}
+
+void NodeWithStyle::finalize()
+{
+    Base::finalize();
+    m_image_observers.clear();
+}
+
+void NodeWithStyle::rebuild_image_observers()
+{
+    auto add_observer_for = [&](CSS::AbstractImageStyleValue const* abstract_image, Vector<NonnullOwnPtr<ImageObserver>>& observers) {
+        if (!abstract_image)
+            return;
+        CSS::ImageStyleValue const* image_to_observe = nullptr;
+        if (abstract_image->is_image()) {
+            image_to_observe = &abstract_image->as_image();
+        } else if (abstract_image->is_image_set()) {
+            if (auto const* selected = abstract_image->as_image_set().selected_image(); selected && selected->is_image())
+                image_to_observe = &selected->as_image();
+        }
+        if (!image_to_observe)
+            return;
+        observers.append(make<ImageObserver>(*this, *image_to_observe));
+    };
+
+    Vector<NonnullOwnPtr<ImageObserver>> new_observers;
+    for (auto const& layer : computed_values().background_layers())
+        add_observer_for(layer.background_image.ptr(), new_observers);
+    add_observer_for(m_list_style_image.ptr(), new_observers);
+    add_observer_for(computed_values().mask_image().ptr(), new_observers);
+
+    m_image_observers = move(new_observers);
+}
+
 void NodeWithStyle::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
     for (auto const& layer : computed_values().background_layers())
         layer.background_image->visit_edges(visitor);
 
-    if (m_list_style_image && m_list_style_image->is_image())
-        m_list_style_image->as_image().visit_edges(visitor);
+    if (m_list_style_image)
+        m_list_style_image->visit_edges(visitor);
 
     m_computed_values->visit_edges(visitor);
+
+    for (auto const& image_observer : m_image_observers)
+        image_observer->visit_edges(visitor);
 }
 
 void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
@@ -622,7 +706,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     auto background_layers = computed_style.background_layers();
 
     for (auto const& layer : background_layers)
-        const_cast<CSS::AbstractImageStyleValue&>(*layer.background_image).load_any_resources(document());
+        const_cast<CSS::AbstractImageStyleValue&>(*layer.background_image).load_any_resources(*this);
 
     computed_values.set_background_layers(move(background_layers));
 
@@ -719,7 +803,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     auto const& list_style_image = computed_style.property(CSS::PropertyID::ListStyleImage);
     if (list_style_image.is_abstract_image()) {
         m_list_style_image = list_style_image.as_abstract_image();
-        const_cast<CSS::AbstractImageStyleValue&>(*m_list_style_image).load_any_resources(document());
+        const_cast<CSS::AbstractImageStyleValue&>(*m_list_style_image).load_any_resources(*this);
     }
 
     computed_values.set_text_decoration_color(computed_style.color(CSS::PropertyID::TextDecorationColor, color_resolution_context));
@@ -745,7 +829,25 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_inset(computed_style.length_box(CSS::PropertyID::Left, CSS::PropertyID::Top, CSS::PropertyID::Right, CSS::PropertyID::Bottom, CSS::LengthPercentageOrAuto::make_auto()));
     computed_values.set_margin(computed_style.length_box(CSS::PropertyID::MarginLeft, CSS::PropertyID::MarginTop, CSS::PropertyID::MarginRight, CSS::PropertyID::MarginBottom, CSS::Length::make_px(0)));
     computed_values.set_padding(computed_style.length_box(CSS::PropertyID::PaddingLeft, CSS::PropertyID::PaddingTop, CSS::PropertyID::PaddingRight, CSS::PropertyID::PaddingBottom, CSS::Length::make_px(0)));
-    computed_values.set_overflow_clip_margin(computed_style.length_box(CSS::PropertyID::OverflowClipMarginLeft, CSS::PropertyID::OverflowClipMarginTop, CSS::PropertyID::OverflowClipMarginRight, CSS::PropertyID::OverflowClipMarginBottom, CSS::Length::make_px(0)));
+    {
+        auto extract_side = [&](CSS::PropertyID property_id) -> CSS::OverflowClipMarginSide {
+            auto const& value = computed_style.property(property_id);
+            if (value.is_overflow_clip_margin()) {
+                auto const& overflow_clip_margin = value.as_overflow_clip_margin();
+                CSS::Length offset = CSS::Length::make_px(0);
+                if (overflow_clip_margin.offset().is_length())
+                    offset = overflow_clip_margin.offset().as_length().length();
+                return { overflow_clip_margin.visual_box(), offset };
+            }
+            return {};
+        };
+        CSS::OverflowClipMarginData data;
+        data.left = extract_side(CSS::PropertyID::OverflowClipMarginLeft);
+        data.top = extract_side(CSS::PropertyID::OverflowClipMarginTop);
+        data.right = extract_side(CSS::PropertyID::OverflowClipMarginRight);
+        data.bottom = extract_side(CSS::PropertyID::OverflowClipMarginBottom);
+        computed_values.set_overflow_clip_margin(data);
+    }
 
     computed_values.set_box_shadow(computed_style.box_shadow(*this));
 
@@ -823,24 +925,8 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_x(CSS::LengthPercentage::from_style_value(computed_style.property(CSS::PropertyID::X)));
     computed_values.set_y(CSS::LengthPercentage::from_style_value(computed_style.property(CSS::PropertyID::Y)));
 
-    auto extract_paint_fallback_color = [&](CSS::URLStyleValue const& url_value) -> Optional<Color> {
-        if (auto const& fallback = url_value.paint_fallback()) {
-            if (fallback->has_color())
-                return fallback->to_color(color_resolution_context);
-        }
-        return {};
-    };
-
-    auto const& fill = computed_style.property(CSS::PropertyID::Fill);
-    if (fill.has_color())
-        computed_values.set_fill(fill.to_color(color_resolution_context).value());
-    else if (fill.is_url())
-        computed_values.set_fill(CSS::SVGPaint(fill.as_url().url(), extract_paint_fallback_color(fill.as_url())));
-    auto const& stroke = computed_style.property(CSS::PropertyID::Stroke);
-    if (stroke.has_color())
-        computed_values.set_stroke(stroke.to_color(color_resolution_context).value());
-    else if (stroke.is_url())
-        computed_values.set_stroke(CSS::SVGPaint(stroke.as_url().url(), extract_paint_fallback_color(stroke.as_url())));
+    computed_values.set_fill(computed_style.fill(color_resolution_context));
+    computed_values.set_stroke(computed_style.stroke(color_resolution_context));
 
     computed_values.set_stop_color(computed_style.color(CSS::PropertyID::StopColor, color_resolution_context));
 
@@ -871,7 +957,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     } else if (mask_image.is_abstract_image()) {
         auto const& abstract_image = mask_image.as_abstract_image();
         computed_values.set_mask_image(abstract_image);
-        const_cast<CSS::AbstractImageStyleValue&>(abstract_image).load_any_resources(document());
+        const_cast<CSS::AbstractImageStyleValue&>(abstract_image).load_any_resources(*this);
     }
 
     computed_values.set_mask_type(computed_style.mask_type());
@@ -973,6 +1059,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_mix_blend_mode(computed_style.mix_blend_mode());
     computed_values.set_view_transition_name(computed_style.view_transition_name());
     computed_values.set_contain(computed_style.contain());
+    computed_values.set_container_name(computed_style.container_name());
     computed_values.set_container_type(computed_style.container_type());
     computed_values.set_shape_rendering(computed_values.shape_rendering());
     computed_values.set_will_change(computed_style.will_change());
@@ -985,26 +1072,17 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
 
     if (auto* box_node = as_if<NodeWithStyleAndBoxModelMetrics>(*this))
         box_node->propagate_style_along_continuation(computed_style);
+
+    rebuild_image_observers();
 }
 
 CSS::StyleScope const& NodeWithStyle::style_scope() const
 {
-    auto resolve_style_scope = [](DOM::Node const& dom_node) -> CSS::StyleScope const& {
-        auto const& root = dom_node.root();
-        if (root.is_shadow_root()) {
-            auto const& shadow_root = static_cast<DOM::ShadowRoot const&>(root);
-            if (shadow_root.uses_document_style_sheets())
-                return root.document().style_scope();
-            return shadow_root.style_scope();
-        }
-        return root.document().style_scope();
-    };
-
     if (auto const* dom_node = this->dom_node())
-        return resolve_style_scope(*dom_node);
+        return dom_node->style_scope();
 
     if (is_generated_for_pseudo_element())
-        return resolve_style_scope(*pseudo_element_generator());
+        return pseudo_element_generator()->style_scope();
 
     if (auto const* parent = this->parent())
         return parent->style_scope();
@@ -1144,6 +1222,13 @@ void NodeWithStyle::reset_table_box_computed_values_used_by_wrapper_to_init_valu
     mutable_computed_values.set_float(CSS::InitialValues::float_());
     mutable_computed_values.set_clear(CSS::InitialValues::clear());
     mutable_computed_values.set_inset(CSS::InitialValues::inset());
+    mutable_computed_values.set_grid_column_end(CSS::InitialValues::grid_column_end());
+    mutable_computed_values.set_grid_column_start(CSS::InitialValues::grid_column_start());
+    mutable_computed_values.set_grid_row_end(CSS::InitialValues::grid_row_end());
+    mutable_computed_values.set_grid_row_start(CSS::InitialValues::grid_row_start());
+    mutable_computed_values.set_align_self(CSS::InitialValues::align_self());
+    mutable_computed_values.set_justify_self(CSS::InitialValues::justify_self());
+    mutable_computed_values.set_order(CSS::InitialValues::order());
     mutable_computed_values.set_margin(CSS::InitialValues::margin());
     // AD-HOC:
     // To match other browsers, z-index needs to be moved to the wrapper box as well,
@@ -1167,6 +1252,15 @@ void NodeWithStyle::transfer_table_box_computed_values_to_wrapper_computed_value
     mutable_wrapper_computed_values.set_inset(computed_values().inset());
     mutable_wrapper_computed_values.set_float(computed_values().float_());
     mutable_wrapper_computed_values.set_clear(computed_values().clear());
+    // CSS 2 moves table-root positioning and margins to the wrapper. The wrapper is also the grid item for
+    // display:table, so grid placement, self-alignment, and order need to move there as well.
+    mutable_wrapper_computed_values.set_grid_column_end(computed_values().grid_column_end());
+    mutable_wrapper_computed_values.set_grid_column_start(computed_values().grid_column_start());
+    mutable_wrapper_computed_values.set_grid_row_end(computed_values().grid_row_end());
+    mutable_wrapper_computed_values.set_grid_row_start(computed_values().grid_row_start());
+    mutable_wrapper_computed_values.set_align_self(computed_values().align_self());
+    mutable_wrapper_computed_values.set_justify_self(computed_values().justify_self());
+    mutable_wrapper_computed_values.set_order(computed_values().order());
     mutable_wrapper_computed_values.set_margin(computed_values().margin());
     // AD-HOC:
     // To match other browsers, z-index needs to be moved to the wrapper box as well,
@@ -1201,7 +1295,7 @@ bool NodeWithStyle::is_scroll_container() const
         || overflow_value_makes_box_a_scroll_container(computed_values().overflow_y());
 }
 
-void Node::add_paintable(GC::Ptr<Painting::Paintable> paintable)
+void Node::add_paintable(RefPtr<Painting::Paintable> paintable)
 {
     if (!paintable)
         return;
@@ -1210,10 +1304,14 @@ void Node::add_paintable(GC::Ptr<Painting::Paintable> paintable)
 
 void Node::clear_paintables()
 {
+    for (auto& paintable : m_paintable) {
+        if (paintable->parent())
+            paintable->remove();
+    }
     m_paintable.clear();
 }
 
-GC::Ptr<Painting::Paintable> Node::create_paintable() const
+RefPtr<Painting::Paintable> Node::create_paintable() const
 {
     return nullptr;
 }
